@@ -24,6 +24,19 @@ from torch.utils.cpp_extension import (
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_blackwell_gencode():
+    for parent in Path(__file__).resolve().parents:
+        helper = parent / "tools/reproduction/native_build.py"
+        if helper.is_file():
+            sys.path.insert(0, str(parent))
+            from tools.reproduction.native_build import blackwell_gencode
+            return blackwell_gencode
+    raise RuntimeError("Cannot locate the MambaPose Blackwell build policy")
+
+
+blackwell_gencode = load_blackwell_gencode()
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
@@ -41,30 +54,16 @@ MODES = ["core", "ndstate", "oflex"]
 # MODES = ["core", "ndstate", "oflex", "nrow"]
 
 def get_ext():
-    cc_flag = []
-
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     print("\n\nCUDA_HOME = {}\n\n".format(CUDA_HOME))
 
-    # Check, if CUDA11 is installed for compute capability 8.0
-    multi_threads = True
-    gencode_sm90 = False
-    if CUDA_HOME is not None:
-        _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
-        print("CUDA version: ", bare_metal_version, flush=True)
-        if bare_metal_version >= Version("11.8"):
-            gencode_sm90 = True
-        if bare_metal_version < Version("11.6"):
-            warnings.warn("CUDA version ealier than 11.6 may leads to performance mismatch.")
-        if bare_metal_version < Version("11.2"):
-            multi_threads = False
-            
-    cc_flag.extend(["-gencode", "arch=compute_70,code=sm_70"])
-    cc_flag.extend(["-gencode", "arch=compute_80,code=sm_80"])
-    if gencode_sm90:
-        cc_flag.extend(["-gencode", "arch=compute_90,code=sm_90"])
-    if multi_threads:
-        cc_flag.extend(["--threads", "4"])
+    if CUDA_HOME is None:
+        raise RuntimeError("selective_scan requires CUDA_HOME and nvcc")
+    _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
+    print("CUDA version: ", bare_metal_version, flush=True)
+    cc_flag = blackwell_gencode(
+        (bare_metal_version.major, bare_metal_version.minor))
+    cc_flag.extend(["--threads", "4"])
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI

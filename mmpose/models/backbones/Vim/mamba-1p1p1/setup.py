@@ -32,6 +32,19 @@ with open("README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
+
+def load_blackwell_gencode():
+    for parent in Path(__file__).resolve().parents:
+        helper = parent / "tools/reproduction/native_build.py"
+        if helper.is_file():
+            sys.path.insert(0, str(parent))
+            from tools.reproduction.native_build import blackwell_gencode
+            return blackwell_gencode
+    raise RuntimeError("Cannot locate the MambaPose Blackwell build policy")
+
+
+blackwell_gencode = load_blackwell_gencode()
+
 PACKAGE_NAME = "mamba_ssm"
 
 BASE_WHEEL_URL = "https://github.com/state-spaces/mamba/releases/download/{tag_name}/{wheel_name}"
@@ -95,23 +108,11 @@ if not SKIP_CUDA_BUILD:
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
     check_if_cuda_home_none(PACKAGE_NAME)
-    # Check, if CUDA11 is installed for compute capability 8.0
-    cc_flag = []
-    if CUDA_HOME is not None:
-        _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
-        if bare_metal_version < Version("11.6"):
-            raise RuntimeError(
-                f"{PACKAGE_NAME} is only supported on CUDA 11.6 and above.  "
-                "Note: make sure nvcc has a supported version by running nvcc -V."
-            )
-
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_70,code=sm_70")
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_80,code=sm_80")
-    if bare_metal_version >= Version("11.8"):
-        cc_flag.append("-gencode")
-        cc_flag.append("arch=compute_90,code=sm_90")
+    if CUDA_HOME is None:
+        raise RuntimeError(f"{PACKAGE_NAME} requires CUDA_HOME and nvcc")
+    _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
+    cc_flag = blackwell_gencode(
+        (bare_metal_version.major, bare_metal_version.minor))
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
