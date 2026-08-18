@@ -37,7 +37,7 @@ The primary matrix contains five training runs and two test-dev exports:
 | `coco-testdev-s-v1` | COCO 2017 test-dev | checkpoint from `coco-s-v1` | AP 72.4, APM 69.5, APL 77.7 | validated submission JSON only |
 | `coco-testdev-s-v2` | COCO 2017 test-dev | checkpoint from `coco-s-v2` | AP 73.5, APM 70.5, APL 78.8 | validated submission JSON only |
 
-All training runs use the paper's 256x192 input, six Transformer layers, ImageNet-pretrained VMamba-T, 300 epochs, Adam with learning rate `1e-3`, and step reductions to `1e-4` and `1e-5` at epochs 200 and 260. Validation uses flip testing and the paper-comparable top-down detection boxes.
+All training runs use the paper's 256x192 input, six Transformer layers, ImageNet-pretrained VMamba-T, 300 epochs, learning rate `1e-3`, and step reductions to `1e-4` and `1e-5` at epochs 200 and 260. The paper omits the optimizer, so the repository's Adam setting supplies it. Neither source fixes a seed; the primary matrix therefore uses the explicit assumption `seed=0`, records it in every resolved config, and does not search seeds for a favorable score. Validation uses flip testing and the paper-comparable top-down detection boxes.
 
 The ablation matrix adds four training runs. The corresponding full-PIF S-V1 runs above are reused as baselines:
 
@@ -63,11 +63,13 @@ The existing COCO configs map to the three paper architectures. The CrowdPose S-
 
 The default is `full`, so existing configs retain their behavior. Scan index construction and reconstruction are isolated into small functions for COCO's 17 and CrowdPose's 14 keypoints. Unit tests assert index bounds, output ordering, mode behavior, and output shapes before training.
 
+Paper Eq. (9) describes concatenating `topk(pi, P)` with the original keypoint token, while the active implementation selects five indices from self-similarity and does not append a separate sixth token. Because the diagonal self-similarity normally retains the original token, the primary reproduction preserves the active author implementation but records this wording/code ambiguity. It is not silently "corrected" without empirical or author evidence.
+
 ## Isolated RTX 5090 Environment
 
 The repository contains a real `.venv` prefix created with a repo-local Micromamba bootstrap and Python 3.11. The target stack is PyTorch 2.7.1 and torchvision 0.22.1 from the official CUDA 12.8 wheel index, plus a CUDA 12.8 compiler toolchain in the same environment. NumPy stays on the 1.x ABI for the older OpenMMLab and COCO packages.
 
-MMPose 1.3.1 requires the MMCV 2.x family. The reproduction uses `mmcv-lite==2.1.0` because this model path does not require MMCV CUDA ops; the required custom GPU ops come from the repository's bundled Mamba sources. `mmengine`, the runtime requirements, `timm`, `fvcore`, `easydict`, and the bundled compatible `causal_conv1d` and `mamba_ssm` packages are pinned in a generated lock/inventory.
+MMPose 1.3.1 requires the MMCV 2.x family. The reproduction uses `mmcv-lite==2.1.0` because this model path does not require MMCV CUDA ops; unused heads/backbones that eagerly import `mmcv.ops` or unrelated native modules are made optional without suppressing errors on the selected MambaPose path. The required custom GPU ops come from the repository's bundled Mamba sources. `mmengine`, the runtime requirements, `timm==0.9.16`, `fvcore`, `easydict`, and compatible `causal_conv1d` and `mamba_ssm` packages are pinned in a generated lock/inventory. The conflicting historical Vim requirements file is not installed wholesale.
 
 Three bundled extension builds are required:
 
@@ -75,13 +77,15 @@ Three bundled extension builds are required:
 2. `mmpose/models/backbones/Vim/mamba-1p1p1`
 3. `mmpose/models/backbones/Vmamba/kernels/selective_scan`
 
-Their setup scripts currently hard-code `sm_70`, `sm_80`, and `sm_90`. A shared build policy targets only `compute_120/sm_120` on this machine, checks that `nvcc` is at least 12.8, and records compiler and ABI details. CPU reference comparisons validate forward and backward numerical behavior for each selective-scan extension before any dataset run.
+Their setup scripts currently hard-code `sm_70`, `sm_80`, and `sm_90`. A shared build policy targets only `compute_120/sm_120` on this machine, checks that `nvcc` is at least 12.8, disables guessed prebuilt-wheel URLs, and records compiler and PyTorch C++ ABI details. The bundled causal-conv1d identifies as 1.0.0 even though the bundled Mamba calls the 1.1.0 five/seven-argument bindings; the compatible upstream 1.1.0 implementation is vendored or backported in full rather than changing only a version string. Built wheels and their hashes are retained locally. FP32/FP16/BF16 reference comparisons validate forward and backward numerical behavior for causal convolution, Mamba selective scan, and all VMamba `core`/`ndstate`/`oflex` modules before any dataset run.
 
 The repository itself is made importable without depending on an absent root `README.md`; setup and verification must not accidentally import the user-global Python packages.
 
 ## Data and Weight Preparation
 
 Downloads are resumable, staged to a partial name, verified, and atomically renamed. The inventory records source URL, retrieval time, byte count, and SHA-256. A preflight refuses to start training if any required file, image count, JSON schema, image reference, or checkpoint key inventory is invalid.
+
+The inventory distinguishes official data from derived interoperability artifacts: COCO images/annotations come from COCO; detector JSON files and CrowdPose MMPose-format annotations come from the documented MMPose/OpenMMLab preparation assets; CrowdPose images come from the official CrowdPose distribution. Authentication, redistribution/license uncertainty, or an interactive Google Drive quota page is a permanent `manual_review_required` state, never a background credential prompt. Downloads use range-resumable `.part` files, archive safety/integrity checks, bounded jittered retries for transient errors, and permanent failure for authentication, missing resources, repeated checksum mismatch, or schema mismatch. Existing preprocessing scripts that delete source archives are not used unchanged.
 
 COCO layout:
 
@@ -112,6 +116,8 @@ data/crowdpose/
 
 The VMamba-T checkpoint is stored under `pretrained/` with an inventory. A load audit records exact matched, missing, unexpected, and shape-mismatched keys. Training is blocked if the expected VMamba backbone is not substantially loaded; a filename alone is not accepted as evidence.
 
+Resolved CrowdPose configs use `data/crowdpose/` instead of the repository's inconsistent `crowdpose/` root. COCO test-dev exports use a dedicated evaluator with `CocoMetric(format_only=True, outfile_prefix=...)`; they never point the annotation-free image-info file at the normal ground-truth evaluation path. Submission JSON is schema-, cardinality-, image-ID-, keypoint-shape-, score-, and finite-value-validated locally.
+
 ## Single-GPU Batch Fidelity
 
 The paper does not state GPU count or per-GPU batch size, so repo configs supply the intended effective batch size. A calibration job probes the largest stable FP32 micro-batch on the RTX 5090 with the real model, resolution, optimizer, and one forward/backward step.
@@ -122,11 +128,11 @@ If the config batch does not fit, gradient accumulation preserves its effective 
 
 A manifest-driven orchestrator runs one GPU job at a time in this order: environment verification, data verification, batch calibration, five primary trainings, four ablation trainings, local evaluations, and two test-dev exports.
 
-Each run has a stable ID and work directory. The orchestrator uses an exclusive `flock`, writes state atomically, and considers a stage complete only when its declared artifacts validate. Re-entry skips validated stages and resumes an interrupted training run with MMPose `--resume auto` from `last_checkpoint`.
+Each run has a stable ID and work directory. The orchestrator uses an exclusive `flock`, a single atomic state writer, append-only events/results, UTC timestamps, and boot IDs, and considers a stage complete only when its declared artifacts validate. Re-entry skips validated stages and resumes an interrupted training run only when checkpoint load, resolved config, repository revision, environment lock, and dataset provenance still match. Checkpoints are saved every epoch so the recovery-point objective is bounded to one epoch; the two newest resume candidates are validated with `torch.load`, and a corrupt newest checkpoint falls back only to the most recent validated predecessor.
 
-A checked-in user-systemd service links to the absolute repository path and runs the orchestrator. It uses `Restart=on-failure`, a delay between retries, and systemd start-rate limiting. Download and transient network failures receive bounded exponential retries; deterministic config, schema, CUDA, OOM-after-calibration, and data-integrity failures stop for diagnosis instead of looping forever.
+A checked-in user-systemd service links to the absolute repository path and runs the orchestrator. Persistent state records per-stage attempt count, failure fingerprint, next retry time, and an explicit retry budget. Transient failures exit 75 and receive bounded exponential retries; deterministic config, schema, CUDA, OOM-after-calibration, and data-integrity failures exit 78 and are protected by `RestartPreventExitStatus=78`. A progress/checkpoint watchdog escalates a genuinely hung process, while repeated identical failures exhaust a finite budget instead of relying on systemd start-rate limiting as a retry counter.
 
-A systemd timer invokes a read-only monitor periodically. The monitor writes `work_dirs/reproduction/status.json` and appends health history containing:
+A systemd timer invokes a non-controlling observer periodically. It may write observability artifacts but cannot launch, stop, retry, or mark stages complete. The observer writes `work_dirs/reproduction/status.json` atomically and appends health history containing:
 
 - active stage and experiment ID;
 - PID, start time, last progress time, restart count, and last exit code;
@@ -135,7 +141,7 @@ A systemd timer invokes a read-only monitor periodically. The monitor writes `wo
 - GPU utilization, memory use, temperature, and free disk space;
 - a health state of `starting`, `running`, `stalled`, `failed`, or `complete` with a reason.
 
-The service survives Codex, terminal, SSH, and network disconnection because it is owned by the user systemd manager. This host currently has `Linger=no`; a complete user logout or reboot requires a later login to start the enabled user unit unless the user separately runs `sudo loginctl enable-linger vicchen`.
+The service survives Codex, terminal, and network disconnection while the user systemd manager remains active. This host currently has `Linger=no`, so a last-session logout and unattended reboot survival cannot be claimed. The requested Codex/network-disconnect scope is tested directly; full logout/reboot durability is reported as blocked until the user runs `sudo loginctl enable-linger vicchen` and a logout/reboot smoke test passes.
 
 ## Testing and Admission Gates
 
@@ -143,13 +149,13 @@ No full training is admitted until all earlier gates pass:
 
 1. Dependency resolver check and isolated-import check.
 2. PyTorch CUDA tensor operation on device capability `(12, 0)`.
-3. Native `sm_120` extension import and forward/backward comparison.
-4. MambaPose config load and registry construction for every resolved config.
+3. Native artifact inspection proves `sm_120` SASS, followed by causal-conv and Mamba/VMamba forward/backward/reference comparisons across their target modes and dtypes.
+4. `mmcv-lite` import isolation, MambaPose registry construction, and config load for every resolved config without importing unused MMCV ops.
 5. VMamba-T checkpoint load audit.
 6. Dataset and detection-box preflight.
 7. Synthetic end-to-end model loss and optimizer step.
 8. Real-data short smoke run, checkpoint creation, interruption, and automatic resume.
-9. Background service disconnect test and monitor freshness check.
+9. Background service Codex/terminal disconnect test, bounded-retry test, stalled-process test, checkpoint-corruption fallback test, and observer freshness check.
 
 Tests are written before the corresponding model or orchestration change. All gate outputs are retained beneath `work_dirs/reproduction/evidence/`.
 
