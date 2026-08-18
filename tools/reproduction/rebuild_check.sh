@@ -42,6 +42,7 @@ export PATH="${REBUILD_PREFIX}/bin:${PATH}"
 "${REBUILD_PREFIX}/bin/python" -m pip check
 
 "${REBUILD_PREFIX}/bin/python" - \
+    "${REPO_ROOT}/.venv/bin/python" \
     "${REPO_ROOT}/work_dirs/reproduction/evidence/environment.json" \
     "${REBUILD_EVIDENCE}/environment.json" \
     "${REPO_ROOT}/work_dirs/reproduction/evidence/native.json" \
@@ -50,9 +51,10 @@ export PATH="${REBUILD_PREFIX}/bin:${PATH}"
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import subprocess
 import sys
 
-primary_env_path, rebuilt_env_path, primary_native_path, rebuilt_native_path, output_path = map(Path, sys.argv[1:])
+primary_python, primary_env_path, rebuilt_env_path, primary_native_path, rebuilt_native_path, output_path = map(Path, sys.argv[1:])
 primary_env = json.loads(primary_env_path.read_text())
 rebuilt_env = json.loads(rebuilt_env_path.read_text())
 environment_keys = [
@@ -71,14 +73,29 @@ rebuilt_hashes = {
     item['module']: item['sha256'] for item in rebuilt_native['artifacts']
 }
 native_match = primary_hashes == rebuilt_hashes
+
+def package_versions(python):
+    output = subprocess.run(
+        [str(python), '-m', 'pip', 'list', '--format=json'],
+        check=True, capture_output=True, text=True).stdout
+    return {
+        package['name'].lower(): package['version']
+        for package in json.loads(output)
+    }
+
+primary_packages = package_versions(primary_python)
+rebuilt_packages = package_versions(sys.executable)
+package_versions_match = primary_packages == rebuilt_packages
 evidence = {
     'verified_at': datetime.now(timezone.utc).isoformat(),
     'environment_match': environment_match,
     'native_artifact_match': native_match,
+    'package_versions_match': package_versions_match,
     'environment_keys': environment_keys,
     'native_sha256': rebuilt_hashes,
+    'package_versions': rebuilt_packages,
 }
-if not environment_match or not native_match:
+if not environment_match or not native_match or not package_versions_match:
     raise SystemExit(f'rebuild mismatch: {evidence}')
 output_path.parent.mkdir(parents=True, exist_ok=True)
 temporary = output_path.with_suffix('.json.tmp')

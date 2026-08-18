@@ -41,7 +41,8 @@ fi
 if [[ ! -x "${ENV_PREFIX}/bin/python" ]]; then
     "${MICROMAMBA_BIN}" create --yes --prefix "${ENV_PREFIX}" \
         --channel nvidia --channel conda-forge --strict-channel-priority \
-        python=3.11 cuda-nvcc=12.8 cuda-cudart-dev=12.8 cuda-cccl=12.8 pip
+        python=3.11.15 cuda-nvcc=12.8.93 \
+        cuda-cudart-dev=12.8.90 cuda-cccl=12.8.90 pip=26.2.1
 fi
 
 export CUDA_HOME="${ENV_PREFIX}"

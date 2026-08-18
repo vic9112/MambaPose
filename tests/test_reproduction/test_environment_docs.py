@@ -19,6 +19,7 @@ def test_rebuild_uses_a_temporary_prefix_and_local_native_wheels():
     assert 'work_dirs/reproduction/wheelhouse' in text
     assert 'verify_environment.py' in text
     assert 'verify_native.py' in text
+    assert 'package_versions_match' in text
 
 
 def test_bootstrap_applies_the_exact_transitive_constraints():
@@ -26,5 +27,9 @@ def test_bootstrap_applies_the_exact_transitive_constraints():
     constraints = (
         ROOT / 'requirements/reproduction-constraints.txt').read_text()
     assert 'reproduction-constraints.txt' in bootstrap
+    assert 'python=3.11.15' in bootstrap
+    assert 'cuda-nvcc=12.8.93' in bootstrap
+    assert 'cuda-cudart-dev=12.8.90' in bootstrap
+    assert 'pip=26.2.1' in bootstrap
     assert 'torch==2.7.1+cu128' in constraints
     assert 'nvidia-cudnn-cu12==9.7.1.26' in constraints

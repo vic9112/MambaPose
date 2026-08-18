@@ -40,7 +40,8 @@ the source-built wheels plus SHA-256 manifest are retained below
   evaluation batch after data preflight and before formal training.
 - **E8 — clean rebuild:** `rebuild_check.sh` creates a second temporary prefix,
   installs the pinned stack and local wheels, reruns E0–E6, compares native
-  hashes, and removes only that validated temporary prefix.
+  hashes and every installed distribution version, and removes only that
+  validated temporary prefix.
 
 The native sources still emit upstream PyTorch deprecation warnings for the
 legacy `torch.cuda.amp.custom_fwd/custom_bwd` API. They are not admission

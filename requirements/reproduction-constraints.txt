@@ -1,5 +1,6 @@
 # Exact transitive resolution observed for the RTX 5090 reproduction stack.
 addict==2.4.0
+argparse==1.4.0
 attrs==26.1.0
 Automat==25.4.16
 buildtools==1.0.6
