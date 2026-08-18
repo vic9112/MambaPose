@@ -226,10 +226,18 @@ def _completion_valid(work_dir: Path, provenance: dict[str, str]) -> bool:
         return False
     if completion.get('provenance') != provenance:
         return False
-    return all(
-        (REPO_ROOT / artifact['path']).is_file()
-        and _sha256(REPO_ROOT / artifact['path']) == artifact['sha256']
-        for artifact in completion.get('artifacts', []))
+    artifacts = completion.get('artifacts')
+    if not isinstance(artifacts, list) or not artifacts:
+        return False
+    try:
+        for artifact in artifacts:
+            path = (REPO_ROOT / artifact['path']).resolve()
+            if (not path.is_relative_to(REPO_ROOT) or not path.is_file()
+                    or _sha256(path) != artifact['sha256']):
+                return False
+    except (KeyError, OSError, TypeError):
+        return False
+    return True
 
 
 class CampaignExecutor:
