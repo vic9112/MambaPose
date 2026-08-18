@@ -1,0 +1,32 @@
+# MambaPose ICME 2025 reproduction stack for RTX 5090 (sm_120).
+# PyTorch and torchvision are installed from the official cu128 index by
+# tools/reproduction/bootstrap_env.sh before this file is resolved.
+torch==2.7.1
+torchvision==0.22.1
+numpy==1.26.4
+
+# OpenMMLab runtime.  The selected MambaPose path does not use mmcv.ops.
+mmengine==0.10.7
+mmcv-lite==2.1.0
+
+# Model/runtime dependencies used by VMamba, Vim, TokenPose, and MMPose.
+timm==0.9.16
+einops==0.7.0
+fvcore==0.1.5.post20221221
+easydict==1.13
+transformers==4.35.2
+json-tricks==3.17.3
+matplotlib==3.9.2
+munkres==1.1.4
+opencv-python-headless==4.10.0.84
+Pillow==10.4.0
+scipy==1.13.1
+xtcocotools==1.14.3
+
+# Reproducible native builds and verification.
+setuptools==75.1.0
+wheel==0.44.0
+packaging==24.1
+ninja==1.11.1.4
+pytest==8.3.3
+xdoctest==1.2.0

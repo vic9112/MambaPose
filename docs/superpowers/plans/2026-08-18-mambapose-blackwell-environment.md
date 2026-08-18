@@ -59,6 +59,8 @@ Expected: FAIL because the reproduction requirements/bootstrap files do not exis
 
 `bootstrap_env.sh` must download a pinned Micromamba artifact to `.tools/`, verify its declared SHA-256, create `.venv` with Python 3.11 plus CUDA 12.8 compiler/development packages, install the exact cu128 Torch wheels, and install the pinned runtime list with `python -m pip`. `verify_environment.py` must emit JSON containing Python/Torch/torchvision/CUDA/driver/nvcc/GCC/ABI/device capability and fail unless the required versions and `(12, 0)` match.
 
+The native build helper pin is `ninja==1.11.1.4`; the older 1.11.1.1 wheel advertises only legacy manylinux tags and fails `pip check` under this Python/pip stack.
+
 - [ ] **Step 4: Run the contract and real bootstrap gates**
 
 Run: `python3 -m pytest tests/test_reproduction/test_environment_contract.py -q`
