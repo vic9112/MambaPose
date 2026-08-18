@@ -33,3 +33,8 @@ def test_bootstrap_applies_the_exact_transitive_constraints():
     assert 'pip=26.2.1' in bootstrap
     assert 'torch==2.7.1+cu128' in constraints
     assert 'nvidia-cudnn-cu12==9.7.1.26' in constraints
+
+
+def test_environment_verifier_resolves_prefix_local_nvcc():
+    verifier = (ROOT / 'tools/reproduction/verify_environment.py').read_text()
+    assert "Path(sys.executable).parent / 'nvcc'" in verifier

@@ -26,7 +26,8 @@ def _command(*args: str) -> str:
 
 
 def _nvcc_version() -> str:
-    output = _command('nvcc', '--version')
+    prefix_nvcc = Path(sys.executable).parent / 'nvcc'
+    output = _command(str(prefix_nvcc), '--version')
     match = re.search(r'release\s+(\d+\.\d+)', output)
     if match is None:
         raise RuntimeError(f'Cannot parse nvcc version from: {output}')
