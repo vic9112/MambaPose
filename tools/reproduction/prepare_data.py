@@ -72,7 +72,8 @@ def acquire_all() -> list[dict]:
             if _source_status(source) != 'already_present':
                 print(f'asset={source["id"]} extracting={archive}', flush=True)
                 extracted = extract_archive(
-                    archive, REPO_ROOT / source['extract_to'])
+                    archive, REPO_ROOT / source['extract_to'],
+                    strip_components=source.get('strip_components', 0))
                 print(
                     f'asset={source["id"]} extracted_files={extracted}',
                     flush=True)

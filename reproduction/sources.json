@@ -125,7 +125,8 @@
       "sha256": null,
       "archive": "tar",
       "download_path": "work_dirs/reproduction/downloads/crowdpose_annotations.tar",
-      "extract_to": "data/crowdpose",
+      "extract_to": "data/crowdpose/annotations",
+      "strip_components": 1,
       "required_paths": [
         "data/crowdpose/annotations/mmpose_crowdpose_trainval.json",
         "data/crowdpose/annotations/mmpose_crowdpose_test.json",

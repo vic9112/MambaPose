@@ -32,7 +32,8 @@ def load_sources(path: Path | str) -> list[dict[str, Any]]:
         'id', 'url', 'source_class', 'license_status', 'terms_url', 'auth',
         'expected_bytes', 'sha256', 'archive', 'required_paths'
     }
-    allowed = required | {'download_path', 'extract_to', 'target'}
+    allowed = required | {
+        'download_path', 'extract_to', 'target', 'strip_components'}
     ids: set[str] = set()
     for index, source in enumerate(raw['sources']):
         unknown = set(source) - allowed
@@ -48,6 +49,9 @@ def load_sources(path: Path | str) -> list[dict[str, Any]]:
         if source['archive'] != 'file' and not {
                 'download_path', 'extract_to'} <= set(source):
             raise ValueError(f'archive source {source["id"]} needs paths')
+        if source.get('strip_components', 0) not in {0, 1}:
+            raise ValueError(
+                f'source {source["id"]} has invalid strip_components')
     return raw['sources']
 
 

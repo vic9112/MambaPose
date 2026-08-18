@@ -94,3 +94,20 @@ def test_safe_zip_extraction_publishes_files(tmp_path):
     extracted = extract_archive(archive, tmp_path / 'out')
     assert (tmp_path / 'out/annotations/example.json').read_text() == '{}'
     assert extracted == 1
+
+
+def test_safe_extraction_can_strip_one_declared_wrapper_directory(tmp_path):
+    from mambapose_repro.download import extract_archive
+
+    archive = tmp_path / 'wrapped.zip'
+    with zipfile.ZipFile(archive, 'w') as stream:
+        stream.writestr('crowdpose_annotations/train.json', '{}')
+        stream.writestr('crowdpose_annotations/test.json', '{}')
+
+    extracted = extract_archive(
+        archive, tmp_path / 'annotations', strip_components=1)
+
+    assert (tmp_path / 'annotations/train.json').is_file()
+    assert (tmp_path / 'annotations/test.json').is_file()
+    assert not (tmp_path / 'annotations/crowdpose_annotations').exists()
+    assert extracted == 2

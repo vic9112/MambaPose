@@ -158,8 +158,12 @@ def _merge_tree(source: Path, destination: Path) -> int:
     return published
 
 
-def extract_archive(archive: Path | str, destination: Path | str) -> int:
+def extract_archive(
+        archive: Path | str, destination: Path | str, *,
+        strip_components: int = 0) -> int:
     """Validate all members, extract to a staging tree, then publish."""
+    if strip_components not in {0, 1}:
+        raise ValueError('only zero or one stripped component is supported')
     archive = Path(archive)
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
@@ -192,7 +196,13 @@ def extract_archive(archive: Path | str, destination: Path | str) -> int:
         else:
             raise PermanentDownloadError(
                 f'unsupported or corrupt archive: {archive}')
-        return _merge_tree(staging, destination)
+        publish_root = staging
+        if strip_components == 1:
+            roots = list(staging.iterdir())
+            if len(roots) != 1 or not roots[0].is_dir():
+                raise UnsafeArchiveError(
+                    'strip_components=1 requires one wrapper directory')
+            publish_root = roots[0]
+        return _merge_tree(publish_root, destination)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-
