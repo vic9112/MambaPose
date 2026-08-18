@@ -16,7 +16,9 @@ randomness = dict(seed=0, deterministic=False)
 model = dict(
     backbone=dict(
         depths=[2, 2, 5, 2],
-        pretrained='pretrained/vssm_tiny_0230_ckpt_epoch_262.pth'),
+        pretrained='pretrained/vssm_tiny_0230_ckpt_epoch_262.pth',
+        pretrained_strict=True,
+        minimum_pretrained_tensors=100),
     head=dict(tokenpose_cfg=dict(pif_mode='full')))
 default_hooks = dict(
     checkpoint=dict(
@@ -25,4 +27,3 @@ default_hooks = dict(
         save_last=True,
         save_best='coco/AP',
         rule='greater'))
-

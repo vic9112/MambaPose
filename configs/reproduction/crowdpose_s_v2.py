@@ -16,7 +16,9 @@ model = dict(
     backbone=dict(
         # Paper Table II overrides the repository's conflicting [1,2,3,1].
         depths=[1, 2, 3, 2],
-        pretrained='pretrained/vssm_tiny_0230_ckpt_epoch_262.pth'),
+        pretrained='pretrained/vssm_tiny_0230_ckpt_epoch_262.pth',
+        pretrained_strict=True,
+        minimum_pretrained_tensors=100),
     head=dict(tokenpose_cfg=dict(pif_mode='full')))
 default_hooks = dict(
     checkpoint=dict(
@@ -38,4 +40,3 @@ test_dataloader = val_dataloader
 val_evaluator = dict(
     ann_file='data/crowdpose/annotations/mmpose_crowdpose_test.json')
 test_evaluator = val_evaluator
-

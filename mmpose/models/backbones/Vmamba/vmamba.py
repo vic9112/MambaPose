@@ -3,6 +3,7 @@ import time
 import math
 import copy
 from functools import partial
+from pathlib import Path
 from typing import Optional, Callable, Any
 from collections import OrderedDict
 
@@ -1442,7 +1443,9 @@ class VSSM(nn.Module):
 
 @MODELS.register_module()
 class Backbone_VSSM(VSSM):
-    def __init__(self, out_indices=(0, 1, 2, 3), pretrained=None, norm_layer="ln", **kwargs):
+    def __init__(self, out_indices=(0, 1, 2, 3), pretrained=None,
+                 pretrained_strict=False, minimum_pretrained_tensors=1,
+                 norm_layer="ln", **kwargs):
         kwargs.update(norm_layer=norm_layer)
         super().__init__(**kwargs)
         self.channel_first = (norm_layer.lower() in ["bn", "ln2d"])
@@ -1459,20 +1462,58 @@ class Backbone_VSSM(VSSM):
             layer_name = f'outnorm{i}'
             self.add_module(layer_name, layer)
 
+        self.pretrained_strict = pretrained_strict
+        self.minimum_pretrained_tensors = minimum_pretrained_tensors
+        self.pretrained_load_report = None
         del self.classifier
         self.load_pretrained(pretrained)
 
     def load_pretrained(self, ckpt=None, key="model"):
         if ckpt is None:
             return
-        
+
+        checkpoint_path = Path(ckpt)
         try:
-            _ckpt = torch.load(open(ckpt, "rb"), map_location=torch.device("cpu"))
-            print(f"Successfully load ckpt {ckpt}")
-            incompatibleKeys = self.load_state_dict(_ckpt[key], strict=False)
-            print(incompatibleKeys)        
+            _ckpt = torch.load(
+                checkpoint_path, map_location=torch.device("cpu"))
+            if not isinstance(_ckpt, dict) or key not in _ckpt:
+                raise KeyError(
+                    f'checkpoint {checkpoint_path} has no {key!r} mapping')
+            if not isinstance(_ckpt[key], dict):
+                raise TypeError(
+                    f'checkpoint {checkpoint_path} {key!r} is not a mapping')
+            incompatible_keys = self.load_state_dict(_ckpt[key], strict=False)
+            compatible_tensors = (
+                len(self.state_dict()) - len(incompatible_keys.missing_keys))
+            minimum = int(getattr(
+                self, 'minimum_pretrained_tensors', 1))
+            if compatible_tensors < minimum:
+                raise RuntimeError(
+                    f'checkpoint {checkpoint_path} loaded only '
+                    f'{compatible_tensors} compatible tensors; '
+                    f'minimum is {minimum}')
+            report = {
+                'status': 'loaded',
+                'checkpoint': str(checkpoint_path),
+                'key': key,
+                'compatible_tensors': compatible_tensors,
+                'missing_tensors': len(incompatible_keys.missing_keys),
+                'unexpected_tensors': len(incompatible_keys.unexpected_keys),
+            }
+            self.pretrained_load_report = report
+            print(f"Successfully load ckpt {checkpoint_path}: {report}")
+            return report
         except Exception as e:
-            print(f"Failed loading checkpoint form {ckpt}: {e}")
+            self.pretrained_load_report = {
+                'status': 'failed',
+                'checkpoint': str(checkpoint_path),
+                'key': key,
+                'error': f'{type(e).__name__}: {e}',
+            }
+            if getattr(self, 'pretrained_strict', False):
+                raise
+            print(f"Failed loading checkpoint from {checkpoint_path}: {e}")
+            return self.pretrained_load_report
 
     def forward(self, x):
         def layer_forward(l, x):
@@ -1495,4 +1536,3 @@ class Backbone_VSSM(VSSM):
             return x
         
         return outs
-
