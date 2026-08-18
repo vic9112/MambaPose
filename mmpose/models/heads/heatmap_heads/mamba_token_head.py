@@ -56,7 +56,9 @@ class MambaTokenHead(BaseHead):
                                            heatmap_size=tokenpose_cfg.heatmap_size,
                                            patch_dim=in_channels,
                                            pos_embedding_type=tokenpose_cfg.pos_embedding_type,
-                                           apply_init=tokenpose_cfg.apply_init)
+                                           apply_init=tokenpose_cfg.apply_init,
+                                           pif_mode=tokenpose_cfg.get(
+                                               'pif_mode', 'full'))
 
     def forward(self, x):
         # (b,32,64,48)

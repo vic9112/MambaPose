@@ -19,6 +19,8 @@ from mmengine.structures import PixelData
 from torch import Tensor, nn
 from functools import partial
 
+from .pif import PoseInteraction
+
 MIN_NUM_PATCHES = 16
 BN_MOMENTUM = 0.1
 
@@ -347,7 +349,8 @@ class Transformer_sd(nn.Module):
 class TokenPose_TB_base(nn.Module):
     def __init__(self, *, feature_size, patch_size, num_keypoints, dim, depth, heads,
                  mlp_ratio, apply_init=False, apply_multi=True, heatmap_size=[64, 48],
-                 patch_dim=0, dropout=0., emb_dropout=0., pos_embedding_type="learnable"):
+                 patch_dim=0, dropout=0., emb_dropout=0.,
+                 pos_embedding_type="learnable", pif_mode='full'):
         """
         TokenPose base head, heatmap-based prediction head.
         """
@@ -380,16 +383,11 @@ class TokenPose_TB_base(nn.Module):
         self.patch_to_embedding = nn.Linear(patch_dim, dim)
         self.dropout = nn.Dropout(emb_dropout)
 
-        self.MambaBlock = create_block(d_model=256)
-        self.MambaBlock2 = create_block(d_model=256)
-        self.within_dropout = nn.Dropout(0.1)
-        self.within_norm = nn.LayerNorm(256)
-
-        self.within_dropout_2 = nn.Dropout(0.1)
-        self.within_norm_2 = nn.LayerNorm(256)
-        self.Mamba_selfScanBlock = create_block(d_model=256)
-
-        self.param = nn.Parameter(torch.tensor(0.1))
+        self.pose_interaction = PoseInteraction(
+            dim=dim,
+            num_keypoints=num_keypoints,
+            mode=pif_mode,
+            block_factory=create_block)
 
         # transformer
         self.transformer = Transformer(dim, depth, heads, mlp_dim, dropout,
@@ -513,49 +511,7 @@ class TokenPose_TB_base(nn.Module):
         kpt_token = x[:, 0:self.num_keypoints]
         vis_token = x[:, self.num_keypoints:]
 
-        # y = torch.cat((kpt_token, vis_token), dim=1)
-        y = kpt_token  # mamba_tokenpose_coco_256x192_300ep_3Back_selfscan
-        similarity = torch.matmul(kpt_token, y.transpose(1, 2))  # y 是 (batchsize, 100, 256)
-        topk_num = 5
-        # 获取 topk 相似度的值和索引
-        topk_values, topk_indices = torch.topk(similarity, k=topk_num, dim=-1)
-        batch_indices = torch.arange(x.size(0)).view(-1, 1, 1)
-        expanded_y = y[batch_indices, topk_indices]
-        # print(expanded_y.shape)
-        expanded_y = expanded_y.view(-1, topk_num, y.size(2))
-        result, residual = self.Mamba_selfScanBlock(torch.flip(expanded_y, [1]), None, inference_params=None)
-        result = result.view(x.size(0), -1, y.size(2))
-        expanded_y_new = torch.flip(result, [1])[:, 0::topk_num, :]
-        kpt_token = kpt_token + self.param * self.within_dropout_2(expanded_y_new)
-        kpt_token = self.within_norm_2(kpt_token)
-
-        mean_tensor = kpt_token.mean(dim=1, keepdim=True)
-        # 将平均张量与原始张量拼接
-        kpt_token = torch.cat((mean_tensor, kpt_token), dim=1)
-
-        if self.num_keypoints == 14:
-            scann_indices = [0, 14, 13, 14, 0,
-                             1, 3, 5, 3, 1, 0,
-                             7, 9, 11, 9, 7, 0,
-                             8, 10, 12, 10, 8, 0,
-                             2, 4, 6, 4, 2, 0]
-            return_indices = [28, 9, 23, 8, 24, 7, 25, 11, 17, 12, 18, 13, 19, 2, 3]
-        else:  # 新扫描路径
-            scann_indices = [0, 7, 5, 3, 1, 2, 4, 6, 0,
-                             6, 8, 10, 8, 6, 0,
-                             12, 14, 16, 14, 12, 0,
-                             13, 15, 17, 15, 13, 0,
-                             7, 9, 11, 9, 7, 0]
-            return_indices = [32, 4, 5, 3, 6, 2, 13, 27, 12, 28, 11, 29, 19, 21, 18, 22, 17, 23]
-
-        hidden_states = kpt_token[:, scann_indices, :]
-        hidden_states_normal, residual = self.MambaBlock(hidden_states, None, inference_params=None)
-        hidden_states_filp, residual = self.MambaBlock2(torch.flip(hidden_states, [1]), None, inference_params=None)
-        hidden_states = hidden_states_normal + torch.flip(hidden_states_filp, [1])
-        hidden_states = hidden_states[:, return_indices, :]
-        kpt_token = kpt_token + self.within_dropout(hidden_states)
-        kpt_token = self.within_norm(kpt_token)
-        kpt_token = kpt_token[:, 1:, :]
+        kpt_token = self.pose_interaction(kpt_token)
 
         x = self.to_keypoint_token(kpt_token)
         x = self.mlp_head(x)
@@ -733,5 +689,3 @@ class TokenPose_TB_base(nn.Module):
     #     )
     #
     #     return output
-
-
