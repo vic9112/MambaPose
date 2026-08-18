@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "backend": "docling",
+  "input_pdf": "reference/pdf/icme-2025-mambapose.pdf",
+  "output_md": "reference/fragments/icme-2025-mambapose/whole-document.md",
+  "assets_dir": "reference/fragments/icme-2025-mambapose/whole-document_assets",
+  "pages": 6,
+  "mode_flags": {
+    "ocr": true,
+    "ocr_lang": "eng",
+    "force_full_page_ocr": false,
+    "tables": true,
+    "image_mode": "referenced",
+    "image_scale": 3.0,
+    "timeout_seconds": 90
+  },
+  "status": "ConversionStatus.SUCCESS"
+}
