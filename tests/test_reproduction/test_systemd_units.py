@@ -13,6 +13,7 @@ def test_campaign_unit_has_bounded_restart_and_permanent_stop():
     assert 'StartLimitBurst=3' in unit
     assert 'KillMode=control-group' in unit
     assert 'PYTHONNOUSERSITE=1' in unit
+    assert 'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1' in unit
     assert '/home/vicchen/workspace/MambaPose/.venv/bin/python' in unit
     assert 'tools/reproduction/run_campaign.py --run' in unit
 

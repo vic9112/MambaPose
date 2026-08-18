@@ -47,3 +47,8 @@ The native sources still emit upstream PyTorch deprecation warnings for the
 legacy `torch.cuda.amp.custom_fwd/custom_bwd` API. They are not admission
 failures because the numerical and model-level gates exercise the actual
 forward/backward paths on CUDA 12.8 and Blackwell.
+
+MMEngine 0.10.7 checkpoint call sites predate PyTorch 2.6's restricted
+`torch.load` default. Campaign children set
+`TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1` only for locally generated, hash-checked
+MambaPose checkpoints; downloaded pose checkpoints are never admitted.

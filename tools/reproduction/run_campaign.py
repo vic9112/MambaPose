@@ -146,6 +146,7 @@ def _run_command(
     environment.update({
         'PYTHONNOUSERSITE': '1',
         'CUDA_VISIBLE_DEVICES': '0',
+        'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1',
     })
     with log_path.open('a', encoding='utf-8') as log:
         log.write(

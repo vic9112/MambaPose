@@ -37,3 +37,12 @@ def test_completion_requires_nonempty_hashed_in_repository_artifacts(
         }],
     }))
     assert not run_campaign._completion_valid(work_dir, provenance)
+
+
+def test_campaign_children_enable_trusted_mmengine_checkpoint_loading():
+    from pathlib import Path
+
+    campaign_source = Path('tools/reproduction/run_campaign.py').read_text()
+    gates_source = Path('mambapose_repro/gates.py').read_text()
+    assert "'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1'" in campaign_source
+    assert "'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1'" in gates_source

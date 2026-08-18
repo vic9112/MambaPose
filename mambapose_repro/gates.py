@@ -78,6 +78,7 @@ class GateRunner:
         environment.update({
             'PYTHONNOUSERSITE': '1',
             'CUDA_VISIBLE_DEVICES': '0',
+            'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1',
         })
         with log.open('a', encoding='utf-8') as stream:
             stream.write(f'command={json.dumps(command)}\n')

@@ -10,6 +10,7 @@ Type=exec
 WorkingDirectory=/home/vicchen/workspace/MambaPose
 Environment=PYTHONNOUSERSITE=1
 Environment=CUDA_VISIBLE_DEVICES=0
+Environment=TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 ExecStart=/home/vicchen/workspace/MambaPose/.venv/bin/python /home/vicchen/workspace/MambaPose/tools/reproduction/run_campaign.py --run
 Restart=on-failure
 RestartPreventExitStatus=78
@@ -22,4 +23,3 @@ UMask=0027
 
 [Install]
 WantedBy=default.target
-
