@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TOOLS_DIR="${REPO_ROOT}/.tools"
-ENV_PREFIX="${REPO_ROOT}/.venv"
+ENV_PREFIX="${MAMBAPOSE_ENV_PREFIX:-${REPO_ROOT}/.venv}"
 MAMBA_ROOT_PREFIX="${TOOLS_DIR}/micromamba-root"
 MICROMAMBA_VERSION="2.3.2"
 MICROMAMBA_URL="https://micro.mamba.pm/api/micromamba/linux-64/${MICROMAMBA_VERSION}"
@@ -51,8 +51,10 @@ export PATH="${ENV_PREFIX}/bin:${PATH}"
     --index-url https://download.pytorch.org/whl/cu128 \
     'torch==2.7.1' 'torchvision==0.22.1'
 "${ENV_PREFIX}/bin/python" -m pip install --disable-pip-version-check \
+    --constraint "${REPO_ROOT}/requirements/reproduction-constraints.txt" \
     --no-build-isolation 'chumpy==0.70'
 "${ENV_PREFIX}/bin/python" -m pip install --disable-pip-version-check \
+    --constraint "${REPO_ROOT}/requirements/reproduction-constraints.txt" \
     --requirement "${REPO_ROOT}/requirements/reproduction.in"
 
 "${ENV_PREFIX}/bin/python" "${SCRIPT_DIR}/verify_environment.py"

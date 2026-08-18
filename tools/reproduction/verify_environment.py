@@ -14,7 +14,9 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_OUTPUT = REPO_ROOT / 'work_dirs/reproduction/evidence/environment.json'
+DEFAULT_OUTPUT = Path(os.environ.get(
+    'MAMBAPOSE_EVIDENCE_OUTPUT',
+    REPO_ROOT / 'work_dirs/reproduction/evidence/environment.json'))
 
 
 def _command(*args: str) -> str:
