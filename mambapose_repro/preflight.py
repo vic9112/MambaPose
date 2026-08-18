@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -191,7 +192,11 @@ def preflight_pretrained(
                 if isinstance(value, torch.Tensor)}
                if isinstance(model, dict) else {})
     report.facts['model_tensors'] = len(tensors)
-    report.facts['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+            digest.update(block)
+    report.facts['sha256'] = digest.hexdigest()
     report.facts['bytes'] = path.stat().st_size
     if len(tensors) < minimum_tensors:
         report.fail(
@@ -199,3 +204,78 @@ def preflight_pretrained(
             f'minimum is {minimum_tensors}')
     return report
 
+
+def preflight_backbone_load(config_path: Path | str) -> PreflightReport:
+    """Build the formal backbone and require its strict load report."""
+    from mmengine.config import Config
+    from mmpose.registry import MODELS
+    from mmpose.utils import register_all_modules
+
+    report = PreflightReport()
+    try:
+        register_all_modules()
+        config = Config.fromfile(config_path)
+        backbone = MODELS.build(config.model.backbone)
+        load_report = getattr(backbone, 'pretrained_load_report', None)
+        if not isinstance(load_report, dict):
+            report.fail('formal backbone produced no pretrained load report')
+        else:
+            report.facts.update(load_report)
+            if (load_report.get('status') != 'loaded'
+                    or load_report.get('compatible_tensors', 0) < 100):
+                report.fail(
+                    'formal backbone did not load at least 100 compatible '
+                    'pretrained tensors')
+        del backbone
+    except Exception as error:
+        report.fail(
+            f'cannot build formal backbone from {config_path}: '
+            f'{type(error).__name__}: {error}')
+    return report
+
+
+def _atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    try:
+        with temporary.open('w', encoding='utf-8') as stream:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _main() -> int:
+    import argparse
+    from dataclasses import asdict
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--all', action='store_true', required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    repository = Path(__file__).resolve().parents[1]
+    reports = {
+        'coco': preflight_coco(repository / 'data/coco'),
+        'crowdpose': preflight_crowdpose(repository / 'data/crowdpose'),
+        'pretrained': preflight_pretrained(
+            repository / 'pretrained/vssm_tiny_0230_ckpt_epoch_262.pth'),
+        'backbone_load': preflight_backbone_load(
+            repository / 'configs/reproduction/coco_s_v1.py'),
+    }
+    value = {
+        'schema_version': 1,
+        'status': (
+            'ok' if all(report.status == 'ok' for report in reports.values())
+            else 'permanent_failure'),
+        'reports': {name: asdict(report) for name, report in reports.items()},
+    }
+    _atomic_json(args.output, value)
+    print(json.dumps(value, indent=2, sort_keys=True))
+    return 0 if value['status'] == 'ok' else 78
+
+
+if __name__ == '__main__':
+    raise SystemExit(_main())

@@ -29,6 +29,8 @@ from mambapose_repro.orchestrator import (
     AttemptOutcome, CampaignLock, PERMANENT_EXIT, PermanentFailure,
     RetryExhausted, TRANSIENT_EXIT, failure_fingerprint,
     run_until_terminal)
+from mambapose_repro.calibration import materialize_resolved_configs
+from mambapose_repro.gates import GateError, GateRunner
 from mambapose_repro.state import StateStore
 
 
@@ -366,10 +368,42 @@ def main() -> int:
     action.add_argument('--run', action='store_true')
     action.add_argument('--status', action='store_true')
     action.add_argument('--diagnose-current', action='store_true')
+    action.add_argument(
+        '--gate', choices=(
+            'real-data-smoke', 'resume-smoke', 'calibrate',
+            'resolved-smoke'))
+    action.add_argument('--resolve-configs', action='store_true')
     parser.add_argument('--require-complete', action='store_true')
+    parser.add_argument('--dtype', choices=('fp32',), default='fp32')
+    parser.add_argument('--interrupt-after-checkpoint', action='store_true')
     args = parser.parse_args()
     if args.status or args.diagnose_current:
         return _render_status(args.require_complete)
+    if args.gate:
+        gates = GateRunner(REPO_ROOT)
+        try:
+            if args.gate == 'real-data-smoke':
+                result = gates.real_data_smoke()
+            elif args.gate == 'resume-smoke':
+                result = gates.resume_smoke()
+            elif args.gate == 'calibrate':
+                result = gates.calibrate()
+            else:
+                result = gates.resolved_smoke()
+        except GateError as error:
+            print(str(error), file=sys.stderr)
+            return PERMANENT_EXIT
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.resolve_configs:
+        report = materialize_resolved_configs(
+            MANIFEST_PATH,
+            CAMPAIGN_DIR / 'evidence/calibration.json',
+            CAMPAIGN_DIR / 'resolved_configs')
+        _atomic_json(
+            CAMPAIGN_DIR / 'evidence/resolved-configs.json', report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
     store = StateStore(CAMPAIGN_DIR)
     executor = CampaignExecutor()
     try:
