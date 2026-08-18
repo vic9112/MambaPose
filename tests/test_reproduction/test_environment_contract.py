@@ -23,6 +23,7 @@ def test_bootstrap_uses_python311_cuda128_and_disables_user_site():
     assert 'PYTHONNOUSERSITE=1' in text
     assert 'python=3.11' in text
     assert 'cuda-nvcc=12.8' in text
+    assert "--no-build-isolation 'chumpy==0.70'" in text
 
 
 def test_environment_verifier_records_required_evidence_fields():

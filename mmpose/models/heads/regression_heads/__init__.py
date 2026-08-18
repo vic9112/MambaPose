@@ -8,10 +8,20 @@ from .temporal_regression_head import TemporalRegressionHead
 from .trajectory_regression_head import TrajectoryRegressionHead
 from .poseur_head import PoseurHead
 from .positional_encoding import SinePositionalEncoding
-from .transformer_poseur import PoseurTransformer
+
+OPTIONAL_IMPORT_ERRORS = {}
+
+try:
+    from .transformer_poseur import PoseurTransformer
+except ModuleNotFoundError as error:
+    if error.name != 'mmcv._ext' and not error.name.startswith('mmcv.ops'):
+        raise
+    OPTIONAL_IMPORT_ERRORS['PoseurTransformer'] = str(error)
 
 __all__ = [
     'RegressionHead', 'IntegralRegressionHead', 'DSNTHead', 'RLEHead',
     'TemporalRegressionHead', 'TrajectoryRegressionHead',
-    'MotionRegressionHead', 'PoseurHead', 'SinePositionalEncoding','PoseurTransformer'
+    'MotionRegressionHead', 'PoseurHead', 'SinePositionalEncoding'
 ]
+if 'PoseurTransformer' in locals():
+    __all__.append('PoseurTransformer')

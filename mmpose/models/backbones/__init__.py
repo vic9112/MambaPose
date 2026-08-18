@@ -29,8 +29,18 @@ from .v2v_net import V2VNet
 from .vgg import VGG
 from .vipnas_mbv3 import ViPNAS_MobileNetV3
 from .vipnas_resnet import ViPNAS_ResNet
-from .Vim.vim.models_mamba import VisionMamba
 from .Vmamba.vmamba import Backbone_VSSM
+
+OPTIONAL_IMPORT_ERRORS = {}
+
+try:
+    from .Vim.vim.models_mamba import VisionMamba
+except ModuleNotFoundError as error:
+    if error.name != 'mamba_ssm' and not error.name.startswith('mamba_ssm.'):
+        raise
+    OPTIONAL_IMPORT_ERRORS['VisionMamba'] = str(error)
+else:
+    __all_optional__ = ['VisionMamba']
 
 __all__ = [
     'AlexNet', 'HourglassNet', 'HourglassAENet', 'HRNet', 'MobileNetV2',
@@ -39,5 +49,7 @@ __all__ = [
     'MSPN', 'ResNeSt', 'VGG', 'TCN', 'ViPNAS_ResNet', 'ViPNAS_MobileNetV3',
     'LiteHRNet', 'V2VNet', 'HRFormer', 'PyramidVisionTransformer',
     'PyramidVisionTransformerV2', 'SwinTransformer', 'DSTFormer', 'CSPDarknet',
-    'CSPNeXt','VisionMamba','Backbone_VSSM'
+    'CSPNeXt', 'Backbone_VSSM'
 ]
+
+__all__ += locals().get('__all_optional__', [])

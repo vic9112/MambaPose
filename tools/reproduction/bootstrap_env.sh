@@ -51,6 +51,8 @@ export PATH="${ENV_PREFIX}/bin:${PATH}"
     --index-url https://download.pytorch.org/whl/cu128 \
     'torch==2.7.1' 'torchvision==0.22.1'
 "${ENV_PREFIX}/bin/python" -m pip install --disable-pip-version-check \
+    --no-build-isolation 'chumpy==0.70'
+"${ENV_PREFIX}/bin/python" -m pip install --disable-pip-version-check \
     --requirement "${REPO_ROOT}/requirements/reproduction.in"
 
 "${ENV_PREFIX}/bin/python" "${SCRIPT_DIR}/verify_environment.py"

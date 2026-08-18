@@ -59,7 +59,7 @@ Expected: FAIL because the reproduction requirements/bootstrap files do not exis
 
 `bootstrap_env.sh` must download a pinned Micromamba artifact to `.tools/`, verify its declared SHA-256, create `.venv` with Python 3.11 plus CUDA 12.8 compiler/development packages, install the exact cu128 Torch wheels, and install the pinned runtime list with `python -m pip`. `verify_environment.py` must emit JSON containing Python/Torch/torchvision/CUDA/driver/nvcc/GCC/ABI/device capability and fail unless the required versions and `(12, 0)` match.
 
-The native build helper pin is `ninja==1.11.1.4`; the older 1.11.1.1 wheel advertises only legacy manylinux tags and fails `pip check` under this Python/pip stack.
+The native build helper pin is `ninja==1.11.1.4`; the older 1.11.1.1 wheel advertises only legacy manylinux tags and fails `pip check` under this Python/pip stack. `chumpy==0.70` remains installed only because MMPose 1.3.1 declares it in package metadata; the MambaPose path does not import it.
 
 - [ ] **Step 4: Run the contract and real bootstrap gates**
 

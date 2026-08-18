@@ -4,6 +4,7 @@ import platform
 import shutil
 import sys
 import warnings
+from pathlib import Path
 from setuptools import find_packages, setup
 
 try:
@@ -14,9 +15,10 @@ except ImportError:
 
 
 def readme():
-    with open('README.md', encoding='utf-8') as f:
-        content = f.read()
-    return content
+    readme_path = Path(__file__).resolve().with_name('README.md')
+    if not readme_path.is_file():
+        return 'MMPose 1.3.1 with the MambaPose research implementation.'
+    return readme_path.read_text(encoding='utf-8')
 
 
 version_file = 'mmpose/version.py'
