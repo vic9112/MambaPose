@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "reproduction_id": "mambapose-icme2025-rtx5090-seed0",
+  "paper": {
+    "path": "reference/pdf/icme-2025-mambapose.pdf",
+    "sha256": "5bb5baba66a21e7c80aa7f99ddfa18bc4b10ff816f6ed637c8b996a27efe86b5",
+    "title": "MambaPose: A Mamba-based Network for Human Pose Estimation"
+  },
+  "runs": [
+    {
+      "id": "coco-s-v1",
+      "kind": "train",
+      "config": "configs/reproduction/coco_s_v1.py",
+      "work_dir": "work_dirs/reproduction/runs/coco-s-v1",
+      "depends_on": [],
+      "artifacts": ["checkpoint", "metrics"],
+      "max_attempts": 3
+    },
+    {
+      "id": "coco-s-v2",
+      "kind": "train",
+      "config": "configs/reproduction/coco_s_v2.py",
+      "work_dir": "work_dirs/reproduction/runs/coco-s-v2",
+      "depends_on": [],
+      "artifacts": ["checkpoint", "metrics"],
+      "max_attempts": 3
+    },
+    {
+      "id": "coco-b",
+      "kind": "train",
+      "config": "configs/reproduction/coco_b.py",
+      "work_dir": "work_dirs/reproduction/runs/coco-b",
+      "depends_on": [],
+      "artifacts": ["checkpoint", "metrics"],
+      "max_attempts": 3
+    },
+    {
+      "id": "crowdpose-s-v1",
+      "kind": "train",
+      "config": "configs/reproduction/crowdpose_s_v1.py",
+      "work_dir": "work_dirs/reproduction/runs/crowdpose-s-v1",
+      "depends_on": [],
+      "artifacts": ["checkpoint", "metrics"],
+      "max_attempts": 3
+    },
+    {
+      "id": "crowdpose-s-v2",
+      "kind": "train",
+      "config": "configs/reproduction/crowdpose_s_v2.py",
+      "work_dir": "work_dirs/reproduction/runs/crowdpose-s-v2",
+      "depends_on": [],
+      "artifacts": ["checkpoint", "metrics"],
+      "max_attempts": 3
+    },
+    {
+      "id": "coco-s-v1-no-pif",
+      "kind": "train",
+      "config": "configs/reproduction/ablations/coco_s_v1_no_pif.py",
+      "work_dir": "work_dirs/reproduction/runs/coco-s-v1-no-pif",
+      "depends_on": [],
+      "artifacts": ["checkpoint", "metrics"],
+      "max_attempts": 3
+    },
+    {
+      "id": "crowdpose-s-v1-no-pif",
+      "kind": "train",
+      "config": "configs/reproduction/ablations/crowdpose_s_v1_no_pif.py",
+      "work_dir": "work_dirs/reproduction/runs/crowdpose-s-v1-no-pif",
+      "depends_on": [],
+      "artifacts": ["checkpoint", "metrics"],
+      "max_attempts": 3
+    },
+    {
+      "id": "crowdpose-s-v1-no-prior",
+      "kind": "train",
+      "config": "configs/reproduction/ablations/crowdpose_s_v1_no_prior.py",
+      "work_dir": "work_dirs/reproduction/runs/crowdpose-s-v1-no-prior",
+      "depends_on": [],
+      "artifacts": ["checkpoint", "metrics"],
+      "max_attempts": 3
+    },
+    {
+      "id": "crowdpose-s-v1-no-cycling",
+      "kind": "train",
+      "config": "configs/reproduction/ablations/crowdpose_s_v1_no_cycling.py",
+      "work_dir": "work_dirs/reproduction/runs/crowdpose-s-v1-no-cycling",
+      "depends_on": [],
+      "artifacts": ["checkpoint", "metrics"],
+      "max_attempts": 3
+    },
+    {
+      "id": "coco-testdev-s-v1",
+      "kind": "export",
+      "config": "configs/reproduction/coco_testdev_s_v1.py",
+      "work_dir": "work_dirs/reproduction/runs/coco-testdev-s-v1",
+      "depends_on": ["coco-s-v1"],
+      "artifacts": ["submission"],
+      "max_attempts": 3
+    },
+    {
+      "id": "coco-testdev-s-v2",
+      "kind": "export",
+      "config": "configs/reproduction/coco_testdev_s_v2.py",
+      "work_dir": "work_dirs/reproduction/runs/coco-testdev-s-v2",
+      "depends_on": ["coco-s-v2"],
+      "artifacts": ["submission"],
+      "max_attempts": 3
+    }
+  ]
+}
