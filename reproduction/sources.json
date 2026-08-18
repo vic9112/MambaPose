@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "id": "coco-train2017",
+      "url": "http://images.cocodataset.org/zips/train2017.zip",
+      "source_class": "official",
+      "license_status": "COCO terms and image-specific Flickr licenses",
+      "terms_url": "https://cocodataset.org/#termsofuse",
+      "auth": "anonymous",
+      "expected_bytes": 19336861798,
+      "sha256": null,
+      "archive": "zip",
+      "download_path": "work_dirs/reproduction/downloads/train2017.zip",
+      "extract_to": "data/coco",
+      "required_paths": ["data/coco/train2017"]
+    },
+    {
+      "id": "coco-val2017",
+      "url": "http://images.cocodataset.org/zips/val2017.zip",
+      "source_class": "official",
+      "license_status": "COCO terms and image-specific Flickr licenses",
+      "terms_url": "https://cocodataset.org/#termsofuse",
+      "auth": "anonymous",
+      "expected_bytes": 815585330,
+      "sha256": null,
+      "archive": "zip",
+      "download_path": "work_dirs/reproduction/downloads/val2017.zip",
+      "extract_to": "data/coco",
+      "required_paths": ["data/coco/val2017"]
+    },
+    {
+      "id": "coco-test2017",
+      "url": "http://images.cocodataset.org/zips/test2017.zip",
+      "source_class": "official",
+      "license_status": "COCO terms and image-specific Flickr licenses",
+      "terms_url": "https://cocodataset.org/#termsofuse",
+      "auth": "anonymous",
+      "expected_bytes": 6646970404,
+      "sha256": null,
+      "archive": "zip",
+      "download_path": "work_dirs/reproduction/downloads/test2017.zip",
+      "extract_to": "data/coco",
+      "required_paths": ["data/coco/test2017"]
+    },
+    {
+      "id": "coco-annotations",
+      "url": "http://images.cocodataset.org/annotations/annotations_trainval2017.zip",
+      "source_class": "official",
+      "license_status": "COCO terms",
+      "terms_url": "https://cocodataset.org/#termsofuse",
+      "auth": "anonymous",
+      "expected_bytes": 252907541,
+      "sha256": null,
+      "archive": "zip",
+      "download_path": "work_dirs/reproduction/downloads/annotations_trainval2017.zip",
+      "extract_to": "data/coco",
+      "required_paths": [
+        "data/coco/annotations/person_keypoints_train2017.json",
+        "data/coco/annotations/person_keypoints_val2017.json"
+      ]
+    },
+    {
+      "id": "coco-test-info",
+      "url": "http://images.cocodataset.org/annotations/image_info_test2017.zip",
+      "source_class": "official",
+      "license_status": "COCO terms",
+      "terms_url": "https://cocodataset.org/#termsofuse",
+      "auth": "anonymous",
+      "expected_bytes": 1144034,
+      "sha256": null,
+      "archive": "zip",
+      "download_path": "work_dirs/reproduction/downloads/image_info_test2017.zip",
+      "extract_to": "data/coco",
+      "required_paths": ["data/coco/annotations/image_info_test-dev2017.json"]
+    },
+    {
+      "id": "coco-val-detections",
+      "url": "https://drive.usercontent.google.com/download?id=1ygw57X-mh0QBfENB-U5DsuSauGIu-8RB&export=download&confirm=t",
+      "source_class": "derived",
+      "license_status": "HRNet comparison-protocol artifact",
+      "terms_url": "https://github.com/HRNet/HRNet-Human-Pose-Estimation",
+      "auth": "anonymous-public-google-drive",
+      "expected_bytes": 16383781,
+      "sha256": "53ba0ad8d0fd461c5a000cd90797fa8c39cd8c38cd125125c0412626ff592d59",
+      "archive": "file",
+      "target": "data/coco/person_detection_results/COCO_val2017_detections_AP_H_56_person.json",
+      "required_paths": ["data/coco/person_detection_results/COCO_val2017_detections_AP_H_56_person.json"]
+    },
+    {
+      "id": "coco-testdev-detections",
+      "url": "https://drive.usercontent.google.com/download?id=1odAJm_e-zrjMN5nkJXBn8NA1vzZOfRJv&export=download&confirm=t",
+      "source_class": "derived",
+      "license_status": "HRNet comparison-protocol artifact",
+      "terms_url": "https://github.com/HRNet/HRNet-Human-Pose-Estimation",
+      "auth": "anonymous-public-google-drive",
+      "expected_bytes": 81947852,
+      "sha256": "f030b73ba8db4f8c43f1707b23f5d0fbef56c7505050bf70fe9b39aee017b5e8",
+      "archive": "file",
+      "target": "data/coco/person_detection_results/COCO_test-dev2017_detections_AP_H_609_person.json",
+      "required_paths": ["data/coco/person_detection_results/COCO_test-dev2017_detections_AP_H_609_person.json"]
+    },
+    {
+      "id": "crowdpose-images",
+      "url": "https://drive.usercontent.google.com/download?id=1VprytECcLtU4tKP32SYi_7oDRbw7yUTL&export=download&confirm=t",
+      "source_class": "official",
+      "license_status": "manual review required; official repository has no dataset license file",
+      "terms_url": "https://github.com/jeffffffli/CrowdPose",
+      "auth": "anonymous-public-google-drive",
+      "expected_bytes": 2402012797,
+      "sha256": null,
+      "archive": "zip",
+      "download_path": "work_dirs/reproduction/downloads/crowdpose_images.zip",
+      "extract_to": "data/crowdpose",
+      "required_paths": ["data/crowdpose/images"]
+    },
+    {
+      "id": "crowdpose-annotations",
+      "url": "https://download.openmmlab.com/mmpose/datasets/crowdpose_annotations.tar",
+      "source_class": "derived",
+      "license_status": "MMPose converted annotations and detector boxes",
+      "terms_url": "https://mmpose.readthedocs.io/en/latest/user_guides/prepare_datasets.html",
+      "auth": "anonymous",
+      "expected_bytes": 131303936,
+      "sha256": null,
+      "archive": "tar",
+      "download_path": "work_dirs/reproduction/downloads/crowdpose_annotations.tar",
+      "extract_to": "data/crowdpose",
+      "required_paths": [
+        "data/crowdpose/annotations/mmpose_crowdpose_trainval.json",
+        "data/crowdpose/annotations/mmpose_crowdpose_test.json",
+        "data/crowdpose/annotations/det_for_crowd_test_0.1_0.5.json"
+      ]
+    },
+    {
+      "id": "vmamba-tiny-pretrained",
+      "url": "https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm_tiny_0230_ckpt_epoch_262.pth",
+      "source_class": "official",
+      "license_status": "VMamba repository license",
+      "terms_url": "https://github.com/MzeroMiko/VMamba",
+      "auth": "anonymous",
+      "expected_bytes": 122901430,
+      "sha256": null,
+      "archive": "file",
+      "target": "pretrained/vssm_tiny_0230_ckpt_epoch_262.pth",
+      "required_paths": ["pretrained/vssm_tiny_0230_ckpt_epoch_262.pth"]
+    }
+  ]
+}
