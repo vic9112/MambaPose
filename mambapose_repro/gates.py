@@ -253,7 +253,8 @@ class GateRunner:
                 continue
             code, evidence = self._worker(
                 label=f'{spec.id} resolved train smoke',
-                mode='train', config=config, batch_size=1,
+                mode='train', config=config,
+                batch_size=int(loaded.reproduction_resolution.micro_batch),
                 work_dir=root / spec.id / 'run',
                 output=root / spec.id / 'result.json')
             if code or evidence.get('status') != 'passed':

@@ -67,3 +67,21 @@ def test_native_build_script_runs_from_its_file_path():
         capture_output=True,
         text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_native_search_paths_are_relocatable():
+    from tools.reproduction.verify_native import (
+        dynamic_search_paths, validate_dynamic_search_paths)
+
+    dynamic = (
+        ' 0x000000000000001d (RUNPATH) Library runpath: '
+        '[$ORIGIN/../..:$ORIGIN/torch/lib]')
+    assert dynamic_search_paths(dynamic) == (
+        '$ORIGIN/../..', '$ORIGIN/torch/lib')
+    validate_dynamic_search_paths(dynamic, 'extension.so')
+
+    absolute = (
+        ' 0x000000000000000f (RPATH) Library rpath: '
+        '[/tmp/build-prefix/lib]')
+    with pytest.raises(RuntimeError, match='absolute ELF search path'):
+        validate_dynamic_search_paths(absolute, 'extension.so')

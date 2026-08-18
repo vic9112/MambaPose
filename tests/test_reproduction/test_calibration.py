@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from mmengine.config import Config
 import pytest
@@ -53,3 +54,29 @@ def test_materialized_configs_preserve_effective_batch_and_lr(tmp_path):
                     == entry['effective_batch'])
             assert config.optim_wrapper.optimizer.lr == pytest.approx(1e-3)
             assert config.reproduction_resolution.dtype == 'fp32'
+
+
+def test_resolved_smoke_executes_the_resolved_micro_batch(tmp_path):
+    from mambapose_repro.gates import GateRunner
+
+    config_path = tmp_path / 'resolved.py'
+    config_path.write_text(
+        "reproduction_resolution = dict("
+        "effective_batch=128, micro_batch=128, accumulation=1)\n")
+    runner = object.__new__(GateRunner)
+    runner.repository = tmp_path
+    runner.campaign = tmp_path / 'campaign'
+    runner.manifest = SimpleNamespace(
+        runs=(SimpleNamespace(id='train-run', kind='train'),))
+    runner._config = lambda spec, resolved=False: config_path
+    observed = []
+
+    def worker(**kwargs):
+        observed.append(kwargs['batch_size'])
+        return 0, {'status': 'passed', 'batch_size': kwargs['batch_size']}
+
+    runner._worker = worker
+    report = runner.resolved_smoke()
+
+    assert observed == [128]
+    assert report['runs'][0]['evidence']['batch_size'] == 128

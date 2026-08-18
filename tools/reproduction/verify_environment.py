@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import platform
@@ -17,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT = Path(os.environ.get(
     'MAMBAPOSE_EVIDENCE_OUTPUT',
     REPO_ROOT / 'work_dirs/reproduction/evidence/environment.json'))
+CONDA_LOCK = REPO_ROOT / 'requirements/conda-linux-64.lock'
 
 
 def _command(*args: str) -> str:
@@ -34,6 +36,55 @@ def _nvcc_version() -> str:
     return match.group(1)
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _normalize_prefix(value: str, prefix: Path) -> str:
+    return value.replace(str(prefix), '$PREFIX')
+
+
+def _locked_packages() -> dict[str, str]:
+    return {
+        line.rsplit('#', 1)[0]: line.rsplit('#', 1)[1]
+        for line in CONDA_LOCK.read_text(encoding='utf-8').splitlines()
+        if line.startswith('https://')
+        and len(line.rsplit('#', 1)[-1]) == 64
+    }
+
+
+def _conda_packages(prefix: Path) -> list[dict[str, str]]:
+    locked = _locked_packages()
+    packages = []
+    for path in sorted((prefix / 'conda-meta').glob('*.json')):
+        record = json.loads(path.read_text(encoding='utf-8'))
+        url = str(record['url'])
+        package = {
+            key: str(record[key])
+            for key in ('name', 'version', 'build', 'subdir', 'url')
+        }
+        package['sha256'] = str(record.get('sha256') or locked.get(url, ''))
+        packages.append(package)
+    return sorted(packages, key=lambda item: item['name'])
+
+
+def _compiler(prefix: Path) -> dict[str, str]:
+    cc = prefix / 'bin/x86_64-conda-linux-gnu-cc'
+    cxx = prefix / 'bin/x86_64-conda-linux-gnu-c++'
+    linker = prefix / 'bin/x86_64-conda-linux-gnu-ld'
+    return {
+        'cc': _normalize_prefix(str(cc), prefix),
+        'cc_version': _command(str(cc), '-dumpfullversion'),
+        'cxx': _normalize_prefix(str(cxx), prefix),
+        'cxx_version': _command(str(cxx), '-dumpfullversion'),
+        'target': _command(str(cc), '-dumpmachine'),
+        'linker': _normalize_prefix(str(linker), prefix),
+        'linker_version': _command(str(linker), '--version').splitlines()[0],
+        'sysroot': _normalize_prefix(
+            _command(str(cc), '--print-sysroot'), prefix),
+    }
+
+
 def collect() -> dict[str, Any]:
     import torch
     import torchvision
@@ -48,6 +99,7 @@ def collect() -> dict[str, Any]:
     driver_line = _command(
         'nvidia-smi', '--query-gpu=driver_version',
         '--format=csv,noheader').splitlines()[device_index]
+    prefix = Path(sys.prefix).resolve()
     return {
         'python_executable': sys.executable,
         'python_version': platform.python_version(),
@@ -61,7 +113,9 @@ def collect() -> dict[str, Any]:
         'device_capability': list(torch.cuda.get_device_capability(device_index)),
         'cuda_smoke_checksum': cuda_smoke_checksum,
         'cxx11_abi': bool(torch._C._GLIBCXX_USE_CXX11_ABI),
-        'gcc_version': _command('gcc', '-dumpfullversion'),
+        'compiler': _compiler(prefix),
+        'conda_lock_sha256': _sha256(CONDA_LOCK),
+        'conda_packages': _conda_packages(prefix),
         'python_no_user_site': os.environ.get('PYTHONNOUSERSITE'),
     }
 
@@ -86,6 +140,12 @@ def validate(evidence: dict[str, Any]) -> None:
             f"{evidence['device_capability']}")
     if evidence['python_no_user_site'] != '1':
         errors.append('PYTHONNOUSERSITE must be exactly 1')
+    locked = _locked_packages()
+    installed = {
+        item['url']: item['sha256'] for item in evidence['conda_packages']
+    }
+    if installed != locked:
+        errors.append('installed Conda package records do not match explicit lock')
     if errors:
         raise RuntimeError('; '.join(errors))
 

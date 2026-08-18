@@ -23,7 +23,9 @@ trap cleanup EXIT
 
 mkdir -p "${REBUILD_EVIDENCE}"
 export PYTHONNOUSERSITE=1
+unset CPATH CPLUS_INCLUDE_PATH C_INCLUDE_PATH LIBRARY_PATH LD_LIBRARY_PATH
 export MAMBAPOSE_ENV_PREFIX="${REBUILD_PREFIX}"
+export MAMBAPOSE_MAMBA_ROOT_PREFIX="${REBUILD_ROOT}/micromamba-root"
 export MAMBAPOSE_EVIDENCE_OUTPUT="${REBUILD_EVIDENCE}/environment.json"
 export MAMBAPOSE_NATIVE_EVIDENCE_OUTPUT="${REBUILD_EVIDENCE}/native.json"
 
@@ -59,7 +61,8 @@ primary_env = json.loads(primary_env_path.read_text())
 rebuilt_env = json.loads(rebuilt_env_path.read_text())
 environment_keys = [
     'python_version', 'torch_version', 'torchvision_version', 'cuda_runtime',
-    'nvcc_version', 'device_capability', 'cxx11_abi'
+    'nvcc_version', 'device_capability', 'cxx11_abi', 'compiler',
+    'conda_lock_sha256'
 ]
 environment_match = all(
     primary_env[key] == rebuilt_env[key] for key in environment_keys)
@@ -73,6 +76,11 @@ rebuilt_hashes = {
     item['module']: item['sha256'] for item in rebuilt_native['artifacts']
 }
 native_match = primary_hashes == rebuilt_hashes
+dynamic_dependencies_isolated = (
+    primary_native.get('dynamic_dependencies_isolated') is True
+    and rebuilt_native.get('dynamic_dependencies_isolated') is True)
+conda_packages_match = (
+    primary_env['conda_packages'] == rebuilt_env['conda_packages'])
 
 def package_versions(python):
     output = subprocess.run(
@@ -90,12 +98,15 @@ evidence = {
     'verified_at': datetime.now(timezone.utc).isoformat(),
     'environment_match': environment_match,
     'native_artifact_match': native_match,
+    'dynamic_dependencies_isolated': dynamic_dependencies_isolated,
+    'conda_packages_match': conda_packages_match,
     'package_versions_match': package_versions_match,
     'environment_keys': environment_keys,
     'native_sha256': rebuilt_hashes,
     'package_versions': rebuilt_packages,
 }
-if not environment_match or not native_match or not package_versions_match:
+if (not environment_match or not native_match or not package_versions_match
+        or not conda_packages_match or not dynamic_dependencies_isolated):
     raise SystemExit(f'rebuild mismatch: {evidence}')
 output_path.parent.mkdir(parents=True, exist_ok=True)
 temporary = output_path.with_suffix('.json.tmp')

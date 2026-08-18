@@ -26,6 +26,29 @@ MODULES = (
 )
 
 
+def dynamic_search_paths(readelf_output: str) -> tuple[str, ...]:
+    paths: list[str] = []
+    for line in readelf_output.splitlines():
+        if '(RPATH)' not in line and '(RUNPATH)' not in line:
+            continue
+        match = line.rsplit('[', 1)
+        if len(match) == 2 and match[1].endswith(']'):
+            paths.extend(match[1][:-1].split(':'))
+    return tuple(paths)
+
+
+def validate_dynamic_search_paths(readelf_output: str, label: str) -> None:
+    paths = dynamic_search_paths(readelf_output)
+    if not paths:
+        raise RuntimeError(f'{label} has no ELF RPATH/RUNPATH')
+    absolute = [path for path in paths if Path(path).is_absolute()]
+    unsafe = [path for path in paths if not path.startswith('$ORIGIN')]
+    if absolute or unsafe:
+        raise RuntimeError(
+            f'{label} contains absolute ELF search path(s) or non-ORIGIN '
+            f'entries: {absolute or unsafe}')
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open('rb') as stream:
@@ -59,6 +82,8 @@ def main() -> int:
     cuobjdump = (
         Path(triton.__file__).parent / 'backends/nvidia/bin/cuobjdump')
     artifacts = []
+    current_prefix = Path(sys.prefix).resolve()
+    primary_prefix = (REPO_ROOT / '.venv').resolve()
     for module_name in MODULES:
         module = importlib.import_module(module_name)
         path = Path(module.__file__)
@@ -71,12 +96,34 @@ def main() -> int:
                   if '.cubin' in line]
         if not cubins or not all('.sm_120.cubin' in cubin for cubin in cubins):
             raise RuntimeError(f'{module_name} contains non-sm120 cubins')
+        dynamic = subprocess.run(
+            ['readelf', '-d', str(path)], check=True, capture_output=True,
+            text=True).stdout
+        validate_dynamic_search_paths(dynamic, module_name)
+        ldd = subprocess.run(
+            ['ldd', str(path)], check=True, capture_output=True,
+            text=True).stdout
+        if 'not found' in ldd:
+            raise RuntimeError(f'{module_name} has unresolved dependencies')
+        dependency_paths = []
+        for line in ldd.splitlines():
+            candidate = line.split('=>', 1)[-1].strip().split(' ', 1)[0]
+            if candidate.startswith('/'):
+                dependency_paths.append(candidate)
+        if current_prefix != primary_prefix and any(
+                Path(candidate).is_relative_to(primary_prefix)
+                for candidate in dependency_paths):
+            raise RuntimeError(
+                f'{module_name} resolves a dependency through primary .venv')
         artifacts.append({
             'module': module_name,
             'path': str(path),
             'bytes': path.stat().st_size,
             'sha256': _sha256(path),
             'cubins': cubins,
+            'search_paths': dynamic_search_paths(dynamic),
+            'dependencies': dependency_paths,
+            'dynamic_dependencies_isolated': True,
         })
     evidence = {
         'verified_at': datetime.now(timezone.utc).isoformat(),
@@ -89,6 +136,8 @@ def main() -> int:
             'summary': result.stdout.splitlines()[-1],
         },
         'artifacts': artifacts,
+        'dynamic_dependencies_isolated': all(
+            item['dynamic_dependencies_isolated'] for item in artifacts),
     }
     DEFAULT_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     temporary = DEFAULT_OUTPUT.with_suffix('.json.tmp')

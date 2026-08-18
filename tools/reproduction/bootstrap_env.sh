@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TOOLS_DIR="${REPO_ROOT}/.tools"
 ENV_PREFIX="${MAMBAPOSE_ENV_PREFIX:-${REPO_ROOT}/.venv}"
-MAMBA_ROOT_PREFIX="${TOOLS_DIR}/micromamba-root"
+CONDA_LOCK="${REPO_ROOT}/requirements/conda-linux-64.lock"
+MAMBA_ROOT_PREFIX="${MAMBAPOSE_MAMBA_ROOT_PREFIX:-${TOOLS_DIR}/micromamba-root}"
 MICROMAMBA_VERSION="2.3.2"
 MICROMAMBA_URL="https://micro.mamba.pm/api/micromamba/linux-64/${MICROMAMBA_VERSION}"
 MICROMAMBA_ARCHIVE="${TOOLS_DIR}/micromamba-${MICROMAMBA_VERSION}.tar.bz2"
@@ -40,9 +41,7 @@ fi
 
 if [[ ! -x "${ENV_PREFIX}/bin/python" ]]; then
     "${MICROMAMBA_BIN}" create --yes --prefix "${ENV_PREFIX}" \
-        --channel nvidia --channel conda-forge --strict-channel-priority \
-        python=3.11.15 cuda-nvcc=12.8.93 \
-        cuda-cudart-dev=12.8.90 cuda-cccl=12.8.90 pip=26.2.1
+        --file "${CONDA_LOCK}"
 fi
 
 export CUDA_HOME="${ENV_PREFIX}"

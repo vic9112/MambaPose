@@ -13,10 +13,14 @@ PYTHONNOUSERSITE=1 .venv/bin/python tools/reproduction/native_build.py --all
 PYTHONNOUSERSITE=1 .venv/bin/python tools/reproduction/verify_native.py
 ```
 
-The top-level packages are in `requirements/reproduction.in`, the exact
-transitive resolution is in `requirements/reproduction-constraints.txt`, and
-the source-built wheels plus SHA-256 manifest are retained below
+The top-level Python packages are in `requirements/reproduction.in`, the exact
+pip transitive resolution is in `requirements/reproduction-constraints.txt`,
+and all 61 Conda packages are pinned by single-platform URL and SHA-256 in
+`requirements/conda-linux-64.lock`. The source-built wheels plus SHA-256
+manifest are retained below
 `work_dirs/reproduction/wheelhouse` and `work_dirs/reproduction/evidence`.
+The build evidence records the actual Conda GCC/G++ 13.4.0, GNU ld 2.46.1,
+target triple, and sysroot used for the CUDA extensions.
 
 ## Admission gates
 
@@ -25,7 +29,9 @@ the source-built wheels plus SHA-256 manifest are retained below
   operation are recorded by `verify_environment.py`.
 - **E1 — artifacts:** causal-conv1d, Mamba selective scan, and VMamba
   core/ndstate/oflex import successfully; `cuobjdump` finds only
-  `.sm_120.cubin` artifacts.
+  `.sm_120.cubin` artifacts. Every wheel uses only `$ORIGIN`-relative ELF
+  search paths, and `ldd` must resolve all non-system libraries inside the
+  environment being verified.
 - **E2 — causal convolution:** widths 2/3/4, both channel layouts, and
   FP32/FP16/BF16 forward, backward, and update match the upstream reference.
 - **E3 — Mamba scan:** FP32/BF16 forward and backward match the PyTorch
@@ -38,10 +44,12 @@ the source-built wheels plus SHA-256 manifest are retained below
   MambaPose S-V1 backbone/head finish FP32 and BF16 CUDA training steps.
 - **E7 — real data:** each dataset/model path must finish a real train and
   evaluation batch after data preflight and before formal training.
-- **E8 — clean rebuild:** `rebuild_check.sh` creates a second temporary prefix,
-  installs the pinned stack and local wheels, reruns E0–E6, compares native
-  hashes and every installed distribution version, and removes only that
-  validated temporary prefix.
+- **E8 — clean rebuild:** `rebuild_check.sh` creates a second temporary prefix
+  from the Conda explicit lock, installs the pinned pip stack and local wheels,
+  reruns E0–E6, compares the Conda package records, compiler provenance,
+  native hashes, and every installed distribution version, and proves through
+  `ldd` that no extension resolves through the primary `.venv`. It removes only
+  that validated temporary prefix.
 
 The native sources still emit upstream PyTorch deprecation warnings for the
 legacy `torch.cuda.amp.custom_fwd/custom_bwd` API. They are not admission

@@ -21,8 +21,9 @@ def test_reproduction_requirements_pin_the_blackwell_stack():
 def test_bootstrap_uses_python311_cuda128_and_disables_user_site():
     text = (ROOT / 'tools/reproduction/bootstrap_env.sh').read_text()
     assert 'PYTHONNOUSERSITE=1' in text
-    assert 'python=3.11' in text
-    assert 'cuda-nvcc=12.8' in text
+    lock = (ROOT / 'requirements/conda-linux-64.lock').read_text()
+    assert 'python-3.11.15-' in lock
+    assert 'cuda-nvcc-12.8.93-' in lock
     assert "--no-build-isolation 'chumpy==0.70'" in text
 
 
@@ -36,7 +37,9 @@ def test_environment_verifier_records_required_evidence_fields():
             'nvcc_version',
             'device_capability',
             'cxx11_abi',
-            'cuda_smoke_checksum'):
+            'cuda_smoke_checksum',
+            'conda_packages',
+            'compiler'):
         assert field in text
 
 

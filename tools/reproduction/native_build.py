@@ -10,8 +10,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Mapping
 
 _IMPORT_ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +35,8 @@ BUILD_MANIFEST = REPO_ROOT / 'work_dirs/reproduction/evidence/native-build.json'
 MAMBA_SOURCE = REPO_ROOT / 'mmpose/models/backbones/Vim/mamba-1p1p1'
 VMAMBA_SOURCE = (
     REPO_ROOT / 'mmpose/models/backbones/Vmamba/kernels/selective_scan')
+RELOCATABLE_RPATH = (
+    '$ORIGIN/../..:$ORIGIN/torch/lib:$ORIGIN/nvidia/cuda_runtime/lib')
 
 
 def blackwell_gencode(cuda_version: tuple[int, int]) -> list[str]:
@@ -160,6 +164,69 @@ def _find_wheel(distribution_prefix: str) -> Path:
     return max(candidates, key=lambda path: path.stat().st_mtime_ns)
 
 
+def _repair_wheel_rpath(wheel: Path, env_prefix: Path) -> Path:
+    """Replace Conda Python's prefix-bound RPATH in every native payload."""
+    patchelf = env_prefix / 'bin/patchelf'
+    if not patchelf.is_file():
+        raise RuntimeError(f'locked patchelf executable is missing: {patchelf}')
+    with tempfile.TemporaryDirectory(
+            prefix='.wheel-rpath-', dir=WHEELHOUSE) as temporary:
+        unpack_root = Path(temporary)
+        subprocess.run(
+            [str(env_prefix / 'bin/python'), '-m', 'wheel', 'unpack',
+             '--dest', str(unpack_root), str(wheel)],
+            check=True, capture_output=True, text=True)
+        unpacked = [path for path in unpack_root.iterdir() if path.is_dir()]
+        if len(unpacked) != 1:
+            raise RuntimeError(f'unexpected wheel unpack layout for {wheel}')
+        shared_objects = sorted(unpacked[0].rglob('*.so'))
+        if not shared_objects:
+            raise RuntimeError(f'wheel has no native payload: {wheel}')
+        for shared_object in shared_objects:
+            subprocess.run(
+                [str(patchelf), '--set-rpath', RELOCATABLE_RPATH,
+                 str(shared_object)], check=True, capture_output=True,
+                text=True)
+        wheel.unlink()
+        subprocess.run(
+            [str(env_prefix / 'bin/python'), '-m', 'wheel', 'pack',
+             '--dest-dir', str(WHEELHOUSE), str(unpacked[0])],
+            check=True, capture_output=True, text=True)
+    repaired = _find_wheel(wheel.name.split('-', 1)[0])
+    if repaired.name != wheel.name:
+        raise RuntimeError(
+            f'repacked wheel name changed: {wheel.name} -> {repaired.name}')
+    return repaired
+
+
+def compiler_provenance(
+        env_prefix: Path, environment: Mapping[str, str]) -> dict[str, str]:
+    def command(executable: str, *arguments: str) -> str:
+        return subprocess.run(
+            [executable, *arguments], check=True, capture_output=True,
+            text=True, env=environment, timeout=30).stdout.strip()
+
+    cc = environment.get('CC', shutil.which('cc', path=environment['PATH']))
+    cxx = environment.get('CXX', shutil.which('c++', path=environment['PATH']))
+    linker = env_prefix / 'bin/x86_64-conda-linux-gnu-ld'
+    if cc is None or cxx is None or not linker.is_file():
+        raise RuntimeError('locked Conda compiler toolchain is incomplete')
+
+    def normalized(path: str) -> str:
+        return path.replace(str(env_prefix), '$PREFIX')
+
+    return {
+        'cc': normalized(str(cc)),
+        'cc_version': command(str(cc), '-dumpfullversion'),
+        'cxx': normalized(str(cxx)),
+        'cxx_version': command(str(cxx), '-dumpfullversion'),
+        'target': command(str(cc), '-dumpmachine'),
+        'linker': normalized(str(linker)),
+        'linker_version': command(str(linker), '--version').splitlines()[0],
+        'sysroot': normalized(command(str(cc), '--print-sysroot')),
+    }
+
+
 def _build_and_install(
         distribution: str, source: Path, env_prefix: Path,
         environment: Mapping[str, str]) -> Path:
@@ -172,6 +239,7 @@ def _build_and_install(
         environment,
         BUILD_LOG_DIR / f'{distribution}-build.log')
     wheel = _find_wheel(distribution)
+    wheel = _repair_wheel_rpath(wheel, env_prefix)
     _run_logged(
         [python, '-m', 'pip', 'install', '--force-reinstall', '--no-deps',
          str(wheel)],
@@ -205,6 +273,8 @@ def build_all(env_prefix: Path = DEFAULT_ENV_PREFIX) -> dict[str, object]:
         'torch_cxx11_abi': bool(torch._C._GLIBCXX_USE_CXX11_ABI),
         'nvcc_version': list(version),
         'gencode': blackwell_gencode(version),
+        'compiler': compiler_provenance(env_prefix, environment),
+        'relocatable_rpath': RELOCATABLE_RPATH,
         'causal_source': {
             'url': CAUSAL_SOURCE_URL,
             'sha256': CAUSAL_SOURCE_SHA256,
