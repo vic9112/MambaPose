@@ -27,9 +27,8 @@ ALLOWED_METRICS = {
     'coco/AP', 'coco/AP .5', 'coco/AP .75', 'coco/AP (M)', 'coco/AP (L)',
     'coco/AR', 'coco/AR .5', 'coco/AR .75', 'coco/AR (M)', 'coco/AR (L)',
     'crowdpose/AP', 'crowdpose/AP .5', 'crowdpose/AP .75',
-    'crowdpose/AP (E)', 'crowdpose/AP (M)', 'crowdpose/AP (H)',
+    'crowdpose/AP(E)', 'crowdpose/AP(M)', 'crowdpose/AP(H)',
     'crowdpose/AR', 'crowdpose/AR .5', 'crowdpose/AR .75',
-    'crowdpose/AR (E)', 'crowdpose/AR (M)', 'crowdpose/AR (H)',
 }
 
 
