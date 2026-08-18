@@ -20,7 +20,7 @@ from mmengine.config import Config
 
 from mambapose_repro.manifest import load_manifest
 from mambapose_repro.results import (
-    normalize_testdev, validate_metrics)
+    normalize_testdev, validate_ablation_directions, validate_metrics)
 
 
 ALLOWED_METRICS = {
@@ -57,7 +57,13 @@ def collect() -> dict:
     rows = []
     all_valid = True
     for run in manifest.runs:
-        config_path = REPO_ROOT / run.config
+        source_config_path = REPO_ROOT / run.config
+        resolved_config_path = (
+            REPO_ROOT / 'work_dirs/reproduction/resolved_configs'
+            / f'{run.id}.py')
+        config_path = (
+            resolved_config_path
+            if resolved_config_path.is_file() else source_config_path)
         cfg = Config.fromfile(config_path)
         target = dict(cfg.paper_target)
         work_dir = REPO_ROOT / run.work_dir
@@ -67,14 +73,39 @@ def collect() -> dict:
             'kind': run.kind,
             'target': target,
             'config_sha256': _sha256(config_path),
+            'source_config_sha256': _sha256(source_config_path),
             'status': 'missing',
         }
         if not completion_path.is_file():
             all_valid = False
             rows.append(row)
             continue
-        completion = json.loads(completion_path.read_text(encoding='utf-8'))
+        try:
+            completion = json.loads(
+                completion_path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as error:
+            all_valid = False
+            row['status'] = 'invalid'
+            row['errors'] = [f'cannot load completion: {error}']
+            rows.append(row)
+            continue
         artifacts = completion.get('artifacts', [])
+        provenance = completion.get('provenance', {})
+        provenance_errors = []
+        if provenance.get('config_sha256') != row['config_sha256']:
+            provenance_errors.append('completion config hash mismatch')
+        for artifact in artifacts:
+            path = (REPO_ROOT / artifact.get('path', '')).resolve()
+            if (not path.is_relative_to(REPO_ROOT) or not path.is_file()
+                    or _sha256(path) != artifact.get('sha256')):
+                provenance_errors.append(
+                    f'invalid completion artifact: {artifact.get("path")}')
+        if provenance_errors:
+            all_valid = False
+            row['status'] = 'invalid'
+            row['errors'] = provenance_errors
+            rows.append(row)
+            continue
         if run.kind == 'train':
             metrics_artifact = next((
                 item for item in artifacts if item['path'].endswith('metrics.json')
@@ -87,20 +118,34 @@ def collect() -> dict:
                 row['status'] = 'invalid'
                 row['errors'] = ['completion lacks checkpoint or metrics']
             else:
-                provenance = {
+                metric_provenance = {
                     'checkpoint_sha256': checkpoint_artifact['sha256'],
                     'config_sha256': row['config_sha256'],
-                    'data_inventory_sha256': completion['provenance'][
+                    'data_inventory_sha256': provenance[
                         'data_inventory_sha256'],
                 }
                 report = validate_metrics(
                     REPO_ROOT / metrics_artifact['path'],
                     ALLOWED_METRICS,
-                    provenance=provenance)
+                    provenance=metric_provenance)
                 row['status'] = 'valid' if report.valid else 'invalid'
                 row['metrics'] = report.value
                 row['errors'] = report.errors
                 row['checkpoint_sha256'] = checkpoint_artifact['sha256']
+                metric_name = (
+                    'coco/AP' if target['dataset'] == 'coco'
+                    else 'crowdpose/AP')
+                measured = (report.value or {}).get(metric_name)
+                measured_ap = (
+                    measured * 100
+                    if isinstance(measured, (int, float)) and measured <= 1
+                    else measured)
+                if isinstance(measured_ap, (int, float)):
+                    row['measured_ap'] = measured_ap
+                    row['delta_ap'] = measured_ap - target['value']
+                    row['reproduction_class'] = (
+                        'direct_reproduction'
+                        if abs(row['delta_ap']) <= 0.5 else 'deviation')
                 all_valid &= report.valid
         else:
             submission_artifact = artifacts[0] if artifacts else None
@@ -123,11 +168,22 @@ def collect() -> dict:
                     row['status'] = 'invalid'
                     row['errors'] = [str(error)]
         rows.append(row)
+    measured_ap = {
+        row['id']: row['measured_ap'] for row in rows
+        if row.get('status') == 'valid' and 'measured_ap' in row
+    }
+    ablations = validate_ablation_directions(measured_ap)
+    all_valid &= ablations.valid
     return {
         'schema_version': 1,
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'valid': all_valid,
         'runs': rows,
+        'ablation_directions': {
+            'valid': ablations.valid,
+            'errors': ablations.errors,
+            'comparisons': ablations.rows,
+        },
     }
 
 

@@ -114,3 +114,40 @@ def validate_metrics(
                 errors.append(f'invalid provenance hash: {key}')
     return ValidationReport(not errors, errors, value=metrics)
 
+
+def validate_ablation_directions(
+        measured_ap: Mapping[str, float]) -> ValidationReport:
+    """Require each paper ablation to underperform its matched full model."""
+    comparisons = (
+        ('coco-pif', 'coco-s-v1', 'coco-s-v1-no-pif'),
+        ('crowdpose-pif', 'crowdpose-s-v1', 'crowdpose-s-v1-no-pif'),
+        ('crowdpose-prior', 'crowdpose-s-v1',
+         'crowdpose-s-v1-no-prior'),
+        ('crowdpose-cycling', 'crowdpose-s-v1',
+         'crowdpose-s-v1-no-cycling'),
+    )
+    errors = []
+    rows = []
+    for name, full_id, ablation_id in comparisons:
+        full = measured_ap.get(full_id)
+        ablation = measured_ap.get(ablation_id)
+        if not _finite_number(full) or not _finite_number(ablation):
+            errors.append(
+                f'{name} lacks finite full/ablation AP measurements')
+            continue
+        delta = full - ablation
+        row = {
+            'comparison': name,
+            'full_run': full_id,
+            'ablation_run': ablation_id,
+            'full_ap': full,
+            'ablation_ap': ablation,
+            'delta_ap': delta,
+            'direction_reproduced': delta > 0,
+        }
+        rows.append(row)
+        if delta <= 0:
+            errors.append(
+                f'{ablation_id} does not reproduce the paper direction: '
+                f'full={full}, ablation={ablation}')
+    return ValidationReport(not errors, errors, rows)

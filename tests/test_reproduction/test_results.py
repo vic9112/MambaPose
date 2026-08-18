@@ -78,3 +78,24 @@ def test_metric_artifact_requires_known_finite_metrics_and_hashes(tmp_path):
         path, {'invented'}, provenance={'checkpoint_sha256': 'a' * 64})
     assert not report.valid
     assert any('provenance' in error for error in report.errors)
+
+
+def test_ablation_directions_require_full_model_to_win():
+    from mambapose_repro.results import validate_ablation_directions
+
+    measured = {
+        'coco-s-v1': 72.8,
+        'coco-s-v1-no-pif': 72.6,
+        'crowdpose-s-v1': 65.6,
+        'crowdpose-s-v1-no-pif': 65.3,
+        'crowdpose-s-v1-no-prior': 65.35,
+        'crowdpose-s-v1-no-cycling': 65.49,
+    }
+    report = validate_ablation_directions(measured)
+    assert report.valid, report.errors
+    assert len(report.rows) == 4
+
+    measured['crowdpose-s-v1-no-prior'] = 66.0
+    report = validate_ablation_directions(measured)
+    assert not report.valid
+    assert any('no-prior' in error for error in report.errors)

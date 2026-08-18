@@ -150,7 +150,8 @@ class GateRunner:
         if code or first.get('status') != 'passed':
             raise GateError('resume smoke did not produce the first checkpoint')
         first_checkpoint = Path(first['checkpoint'])
-        if not validate_checkpoint(first_checkpoint).valid:
+        if not validate_checkpoint(
+                first_checkpoint, require_training_state=True).valid:
             raise GateError('resume smoke first checkpoint is invalid')
         code, second = self._worker(
             label='resume smoke restarted process',
