@@ -65,3 +65,21 @@ def test_campaign_lock_rejects_concurrent_owner(tmp_path):
         with pytest.raises(ConcurrentCampaign):
             with CampaignLock(tmp_path / 'campaign.lock'):
                 pass
+
+
+def test_complete_run_is_not_retried_after_attempt_budget(tmp_path):
+    from mambapose_repro.orchestrator import (
+        AttemptOutcome, run_until_terminal)
+    from mambapose_repro.state import StateStore
+
+    store = StateStore(tmp_path)
+    store.transition(
+        'fixture', 'complete', attempt=3,
+        completion_fingerprint='validated-completion')
+    runner = FakeRunner([AttemptOutcome(75, 'must-not-run')])
+
+    result = run_until_terminal(
+        'fixture', runner, store, max_attempts=3, delays=(0,))
+
+    assert result == AttemptOutcome(0, 'validated-completion')
+    assert runner.calls == 0

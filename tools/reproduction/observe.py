@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mambapose_repro.observe import observe
+from mambapose_repro.manifest import load_manifest
 
 
 def main() -> int:
@@ -23,7 +24,10 @@ def main() -> int:
         '--campaign-dir', type=Path,
         default=REPO_ROOT / 'work_dirs/reproduction')
     args = parser.parse_args()
-    status = observe(args.campaign_dir)
+    manifest = load_manifest(REPO_ROOT / 'reproduction/manifest.json')
+    status = observe(
+        args.campaign_dir,
+        expected_run_ids=(run.id for run in manifest.runs))
     print(json.dumps(status, indent=2, sort_keys=True))
     if args.check and status['health'] in {'stalled', 'failed'}:
         return 1
@@ -32,4 +36,3 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
-

@@ -81,6 +81,10 @@ def run_until_terminal(
     """Run one stage with persistent, bounded, fingerprinted recovery."""
     delay_values = tuple(delays)
     previous = state_store.read().get('runs', {}).get(run_id, {})
+    if previous.get('status') == 'complete':
+        return AttemptOutcome(
+            0, previous.get(
+                'completion_fingerprint', 'validated-existing-completion'))
     starting_attempt = int(previous.get('attempt', 0))
     last_fingerprint = previous.get('failure_fingerprint')
     for attempt in range(starting_attempt + 1, max_attempts + 1):
@@ -126,4 +130,3 @@ def run_until_terminal(
         if delay:
             time.sleep(delay)
     raise RetryExhausted(f'{run_id} has no remaining attempts')
-

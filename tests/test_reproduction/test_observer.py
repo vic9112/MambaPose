@@ -40,3 +40,20 @@ def test_observer_never_invokes_controller_process_operations():
     forbidden = ('Popen(', 'subprocess.run(', 'os.kill(', 'systemctl')
     assert all(token not in source for token in forbidden)
 
+
+def test_observer_requires_every_manifest_run_before_complete(tmp_path):
+    from mambapose_repro.observe import observe
+    from mambapose_repro.state import StateStore
+
+    store = StateStore(tmp_path)
+    store.transition('first', 'complete', attempt=1)
+
+    partial = observe(tmp_path, expected_run_ids=('first', 'second'))
+
+    assert partial['health'] != 'complete'
+    assert partial['completed_runs'] == 1
+    assert partial['expected_runs'] == 2
+
+    store.transition('second', 'complete', attempt=1)
+    complete = observe(tmp_path, expected_run_ids=('first', 'second'))
+    assert complete['health'] == 'complete'

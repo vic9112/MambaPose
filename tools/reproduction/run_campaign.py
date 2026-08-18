@@ -333,6 +333,11 @@ class CampaignExecutor:
     def run(self, spec: RunSpec) -> AttemptOutcome:
         return self._train(spec) if spec.kind == 'train' else self._export(spec)
 
+    def completion_valid(self, spec: RunSpec) -> bool:
+        config = _resolved_config(spec)
+        provenance = _provenance(config)
+        return _completion_valid(REPO_ROOT / spec.work_dir, provenance)
+
 
 def _render_status(require_complete: bool = False) -> int:
     manifest = load_manifest(MANIFEST_PATH)
@@ -370,6 +375,13 @@ def main() -> int:
     try:
         with CampaignLock(CAMPAIGN_DIR / 'campaign.lock'):
             for spec in executor.manifest.runs:
+                run_state = store.read().get('runs', {}).get(spec.id, {})
+                if run_state.get('status') == 'complete':
+                    if executor.completion_valid(spec):
+                        continue
+                    raise PermanentFailure(
+                        f'{spec.id} is recorded complete but its provenance '
+                        'or artifacts no longer validate')
                 dependencies_complete = all(
                     store.read().get('runs', {}).get(dependency, {}).get(
                         'status') == 'complete'

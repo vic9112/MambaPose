@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any
+from typing import Any, Iterable
 
 
 def _now() -> datetime:
@@ -65,7 +65,8 @@ def observe(
         campaign_dir: Path | str,
         *,
         heartbeat_max_age: int = 180,
-        startup_grace: int = 600) -> dict[str, Any]:
+        startup_grace: int = 600,
+        expected_run_ids: Iterable[str] | None = None) -> dict[str, Any]:
     """Derive health without changing controller-owned state or processes."""
     campaign_dir = Path(campaign_dir)
     state = _load(campaign_dir / 'state.json')
@@ -83,8 +84,16 @@ def observe(
     state_time = _parse_time(state.get('updated_at'))
     state_age = (
         (now - state_time).total_seconds() if state_time is not None else None)
+    runs = state.get('runs', {})
+    expected = tuple(expected_run_ids or ())
+    completed_runs = sum(
+        runs.get(run_id, {}).get('status') == 'complete'
+        for run_id in expected)
+    campaign_complete = (
+        completed_runs == len(expected) if expected
+        else stage == 'complete' and bool(state.get('current_run')))
 
-    if stage == 'complete' and state.get('current_run'):
+    if campaign_complete:
         health = 'complete'
     elif stage in {'blocked', 'exhausted'}:
         health = 'failed'
@@ -95,6 +104,11 @@ def observe(
             health = 'starting'
         else:
             health = 'stalled' if process_alive else 'failed'
+    elif stage == 'complete':
+        health = (
+            'starting'
+            if state_age is not None and state_age <= startup_grace
+            else 'failed')
     else:
         health = 'not_started'
 
@@ -106,6 +120,8 @@ def observe(
         'stage': stage,
         'current_run': state.get('current_run'),
         'generation': state.get('generation', 0),
+        'completed_runs': completed_runs,
+        'expected_runs': len(expected),
         'heartbeat_age_seconds': heartbeat_age,
         'process_alive': process_alive,
         'pid': pid,
@@ -126,4 +142,3 @@ def observe(
         stream.flush()
         os.fsync(stream.fileno())
     return status
-
