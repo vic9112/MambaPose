@@ -57,6 +57,12 @@ def _combined_hash(paths: list[Path]) -> str:
 
 
 def _repo_commit() -> str:
+    dirty = subprocess.run(
+        ['git', 'status', '--porcelain', '--untracked-files=no'],
+        cwd=REPO_ROOT, check=True, capture_output=True, text=True)
+    if dirty.stdout.strip():
+        raise PermanentFailure(
+            'formal campaign requires a clean tracked Git worktree')
     result = subprocess.run(
         ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, check=True,
         capture_output=True, text=True)
@@ -71,6 +77,8 @@ def _provenance(config_path: Path) -> dict[str, str]:
         'environment_sha256': _combined_hash([
             REPO_ROOT / 'work_dirs/reproduction/evidence/environment.json',
             REPO_ROOT / 'work_dirs/reproduction/evidence/native-build.json',
+            REPO_ROOT / 'work_dirs/reproduction/evidence/native.json',
+            REPO_ROOT / 'work_dirs/reproduction/evidence/rebuild.json',
             REPO_ROOT / 'work_dirs/reproduction/evidence/pip-freeze.txt',
         ]),
     }
