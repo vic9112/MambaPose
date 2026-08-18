@@ -30,6 +30,8 @@ install -m 0644 "${SYSTEMD_SOURCE}/mambapose-observer.timer" \
 systemctl --user daemon-reload
 systemctl --user enable mambapose-reproduction.service
 systemctl --user enable mambapose-observer.timer
+SERVICE_ENABLED="$(systemctl --user is-enabled mambapose-reproduction.service)"
+TIMER_ENABLED="$(systemctl --user is-enabled mambapose-observer.timer)"
 
 LINGER_VALUE="$(loginctl show-user "${ACCOUNT_NAME}" -p Linger --value)"
 if [[ "${LINGER_VALUE}" == "yes" ]]; then
@@ -40,19 +42,39 @@ fi
 
 "${REPO_ROOT}/.venv/bin/python" - \
     "${EVIDENCE_DIR}/service-install.json" \
-    "${ACCOUNT_NAME}" "${LINGER_VALUE}" "${DURABILITY_SCOPE}" <<'PY'
+    "${ACCOUNT_NAME}" "${LINGER_VALUE}" "${DURABILITY_SCOPE}" \
+    "${SERVICE_ENABLED}" "${TIMER_ENABLED}" \
+    "${SYSTEMD_SOURCE}/mambapose-reproduction.service" \
+    "${SYSTEMD_SOURCE}/mambapose-observer.service" \
+    "${SYSTEMD_SOURCE}/mambapose-observer.timer" <<'PY'
+import hashlib
 import json
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import sys
 
-path, account, linger, durability_scope = sys.argv[1:]
-Path(path).write_text(json.dumps({
+path, account, linger, durability_scope, service_enabled, timer_enabled, *unit_paths = sys.argv[1:]
+unit_sha256 = {
+    Path(unit).name: hashlib.sha256(Path(unit).read_bytes()).hexdigest()
+    for unit in unit_paths
+}
+destination = Path(path)
+temporary = destination.with_suffix('.json.tmp')
+temporary.write_text(json.dumps({
     'installed_at': datetime.now(timezone.utc).isoformat(),
     'account': account,
     'linger': linger,
     'durability_scope': durability_scope,
+    'service_enabled': service_enabled,
+    'timer_enabled': timer_enabled,
+    'unit_sha256': unit_sha256,
 }, indent=2, sort_keys=True) + '\n')
+os.replace(temporary, destination)
 PY
 
 echo "linger=${LINGER_VALUE} durability_scope=${DURABILITY_SCOPE}"
+if [[ "${LINGER_VALUE}" != "yes" ]]; then
+    echo "linger must be enabled before formal campaign launch" >&2
+    exit 78
+fi

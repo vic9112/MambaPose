@@ -35,3 +35,5 @@ def test_installer_checks_and_records_linger():
     assert 'enable mambapose-reproduction.service' in source
     assert 'enable mambapose-observer.timer' in source
     assert 'durability_scope' in source
+    assert 'unit_sha256' in source
+    assert 'linger must be enabled' in source
