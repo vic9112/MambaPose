@@ -1,4 +1,7 @@
 from pathlib import Path
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -41,4 +44,26 @@ def test_native_build_environment_forces_local_source_builds():
     assert environment['MAMBA_FORCE_BUILD'] == 'TRUE'
     assert environment['PYTHONNOUSERSITE'] == '1'
     assert environment['CUDA_HOME'] == str(ROOT / '.venv')
+    target_include = str(ROOT / '.venv/targets/x86_64-linux/include')
+    target_lib = str(ROOT / '.venv/targets/x86_64-linux/lib')
+    assert target_include in environment['CPATH'].split(os.pathsep)
+    assert target_lib in environment['LIBRARY_PATH'].split(os.pathsep)
+    assert target_lib in environment['LD_LIBRARY_PATH'].split(os.pathsep)
+    nvidia_root = ROOT / '.venv/lib/python3.11/site-packages/nvidia'
+    for component in ('cublas', 'cusparse'):
+        assert str(nvidia_root / component / 'include') in (
+            environment['CPATH'].split(os.pathsep))
     assert 'MAMBA_FORCE_CXX11_ABI' not in environment
+
+
+def test_native_build_script_runs_from_its_file_path():
+    environment = os.environ.copy()
+    environment['PYTHONNOUSERSITE'] = '1'
+    result = subprocess.run(
+        [sys.executable, str(ROOT / 'tools/reproduction/native_build.py'),
+         '--show-policy'],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
