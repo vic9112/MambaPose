@@ -12,6 +12,10 @@
 
 所以，本報告證明實驗矩陣與主模型數值已復現，但不宣稱論文的所有消融主張都被重現。`final-verification.json` 的總體 `valid=false` 正是由兩個 PIF 方向偏差造成；其中 11 個 individual run 均為 `valid`，不是 checkpoint 或資料損毀。
 
+## 取得 checkpoints
+
+9 個 best inference checkpoints 已發布為 [`mambapose-icme2025-reproduction-v1`](https://github.com/vic9112/MambaPose/releases/tag/mambapose-icme2025-reproduction-v1) GitHub Release assets。完整 asset 名稱、下載 URL、檔案大小、best epoch、AP、resolved-config SHA256 與 checkpoint SHA256 記錄在 [`reproduction/checkpoints.json`](../../reproduction/checkpoints.json)。這些 best checkpoints 是評估／推論格式，刻意不含 optimizer state；9 個較大的 `epoch_300.pth` 續訓檔未納入 GitHub。
+
 ## 主模型結果
 
 AP 數值以百分點表示；delta = measured − paper。
