@@ -32,6 +32,7 @@ from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 from mambapose_opt.source import clean_git_commit
 from mambapose_opt.numeric_runtime import resolve_numeric_runtime
+from mambapose_opt.process_environment import deterministic_child_environment
 
 
 def _sha256(path: Path) -> str:
@@ -86,6 +87,10 @@ def _git_commit() -> str:
     return clean_git_commit(REPO_ROOT)
 
 
+def _child_environment() -> dict[str, str]:
+    return deterministic_child_environment(REPO_ROOT)
+
+
 _deterministic_config = build_deterministic_evaluation_config
 
 
@@ -112,13 +117,8 @@ def _evaluate_mode(
     }
     order_hash = repeated_order_hash(
         config.test_dataloader, seed=candidate.seed, epoch=0)
-    environment = os.environ.copy()
-    environment.update({
-        'PYTHONNOUSERSITE': '1',
-        'PYTHONDONTWRITEBYTECODE': '1',
-        'CUBLAS_WORKSPACE_CONFIG': ':4096:8',
-        'MAMBAPOSE_OPTIMIZATION_SEED': str(candidate.seed),
-    })
+    environment = _child_environment()
+    environment['MAMBAPOSE_OPTIMIZATION_SEED'] = str(candidate.seed)
     subprocess.run([
         sys.executable,
         str(REPO_ROOT / 'tools/test.py'),

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 import subprocess
@@ -791,6 +792,10 @@ def test_direct_evaluation_child_disables_bytecode_independent_of_parent(
     monkeypatch.setattr(
         tool, 'build_determinism_record',
         lambda **kwargs: {'provenance': kwargs})
+    existing = tmp_path / 'existing-pythonpath'
+    monkeypatch.setenv(
+        'PYTHONPATH', os.pathsep.join([
+            str(existing), str(tmp_path), str(tmp_path)]))
     monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '0')
     captured_environment = None
 
@@ -806,7 +811,12 @@ def test_direct_evaluation_child_disables_bytecode_independent_of_parent(
         checkpoint=checkpoint)
 
     assert captured_environment is not None
+    assert captured_environment['PYTHONPATH'].split(os.pathsep) == [
+        str(tmp_path), str(existing)]
+    assert captured_environment['PYTHONNOUSERSITE'] == '1'
     assert captured_environment['PYTHONDONTWRITEBYTECODE'] == '1'
+    assert captured_environment['CUBLAS_WORKSPACE_CONFIG'] == ':4096:8'
+    assert captured_environment['MAMBAPOSE_OPTIMIZATION_SEED'] == '0'
 
 
 def _coco_fixture(tmp_path):

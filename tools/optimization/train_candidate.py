@@ -27,6 +27,7 @@ from mambapose_opt.numeric_source import (
     build_numeric_source_binding, file_sha256)
 from mambapose_opt.numeric_runtime import (
     validate_recovery_admission, validate_recovery_calibration_dependency)
+from mambapose_opt.process_environment import deterministic_child_environment
 from mambapose_opt.schema import load_candidate_manifest
 
 
@@ -51,6 +52,10 @@ def _atomic_json(path: Path, value: object) -> None:
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def _child_environment() -> dict[str, str]:
+    return deterministic_child_environment(REPO_ROOT)
 
 
 def _recovery_admission(
@@ -118,10 +123,7 @@ def main() -> int:
         config.resume = False
         config.randomness = dict(seed=candidate.seed, deterministic=True)
         config.dump(resolved)
-        environment = os.environ.copy()
-        environment.update({
-            'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1',
-            'CUBLAS_WORKSPACE_CONFIG': ':4096:8'})
+        environment = _child_environment()
         subprocess.run([
             sys.executable, str(REPO_ROOT / 'tools/train.py'), str(resolved),
             '--work-dir', str(work_dir)], cwd=REPO_ROOT, env=environment,
