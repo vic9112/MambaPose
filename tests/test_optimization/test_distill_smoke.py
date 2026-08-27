@@ -181,11 +181,42 @@ def test_checkpoint_path_rejects_unapproved_symlink(tmp_path, kind):
             label='student checkpoint')
 
 
+def test_config_dependency_closure_rejects_dirty_inherited_base(tmp_path):
+    from mambapose_opt.distill_smoke import config_dependency_bindings
+
+    root = tmp_path / 'repo'
+    leaf = root / 'configs/optimization/accuracy_first/leaf.py'
+    base = root / 'configs/optimization/accuracy_first/base.py'
+    leaf.parent.mkdir(parents=True)
+    leaf.write_text("_base_ = ['base.py']\nvalue = 2\n")
+    base.write_text('base_value = 1\n')
+    subprocess.run(['git', 'init', '-q'], cwd=root, check=True)
+    subprocess.run(['git', 'add', 'configs'], cwd=root, check=True)
+    subprocess.run([
+        'git', '-c', 'user.name=Fixture', '-c',
+        'user.email=fixture@example.test', 'commit', '-qm', 'fixture configs',
+    ], cwd=root, check=True)
+    commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
+
+    bindings = config_dependency_bindings(
+        root, leaf.relative_to(root), git_commit=commit)
+    assert [row['path'] for row in bindings] == [
+        'configs/optimization/accuracy_first/base.py',
+        'configs/optimization/accuracy_first/leaf.py',
+    ]
+
+    base.write_text('base_value = 999\n')
+    with pytest.raises(ValueError, match='commit|blob|differs'):
+        config_dependency_bindings(
+            root, leaf.relative_to(root), git_commit=commit)
+
+
 def _valid_artifact(tmp_path: Path):
     from mmengine.config import Config
     from mambapose_opt.distill_smoke import (
-        _canonicalize, canonical_json_sha256, smoke_dataloader_config,
-        validate_coco_train_assets_at_root)
+        _canonicalize, canonical_json_sha256, config_dependency_bindings,
+        smoke_dataloader_config, validate_coco_train_assets_at_root)
 
     root = tmp_path / 'repo'
     run = root / 'work_dirs/optimization/accuracy-first/smoke-fixture'
@@ -245,7 +276,10 @@ def _valid_artifact(tmp_path: Path):
         'configs/optimization/accuracy_first/distill_s_v1_from_b.py')
     config_path = root / config_relative
     config_path.parent.mkdir(parents=True)
+    base_path = config_path.with_name('base.py')
+    base_path.write_text('fixture_base_value = 1\n')
     config_path.write_text(
+        "_base_ = ['base.py']\n"
         "experiment_id = 'distill-s-v1-from-coco-b'\n"
         "model = dict(\n"
         "    type='MambaPoseHeatmapDistiller',\n"
@@ -284,7 +318,7 @@ def _valid_artifact(tmp_path: Path):
 
     subprocess.run(['git', 'init', '-q'], cwd=root, check=True)
     subprocess.run([
-        'git', 'add', config_relative.as_posix(),
+        'git', 'add', 'configs',
     ], cwd=root, check=True)
     subprocess.run([
         'git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
@@ -335,6 +369,8 @@ def _valid_artifact(tmp_path: Path):
             'config': file_binding(
                 'configs/optimization/accuracy_first/'
                 'distill_s_v1_from_b.py'),
+            'config_dependencies': list(config_dependency_bindings(
+                root, config_relative, git_commit=commit)),
             'resolved_config_sha256': canonical_json_sha256(
                 _canonicalize(config.to_dict())),
         },
@@ -430,6 +466,17 @@ def test_smoke_artifact_strict_schema_and_bound_files_round_trip(tmp_path):
     assert load_smoke_artifact(artifact, repository_root=root) == value
 
 
+def test_smoke_artifact_rejects_dirty_inherited_base(tmp_path):
+    from mambapose_opt.distill_smoke import load_smoke_artifact
+
+    root, artifact, _ = _valid_artifact(tmp_path)
+    base = root / 'configs/optimization/accuracy_first/base.py'
+    base.write_text('fixture_base_value = 999\n')
+
+    with pytest.raises(ValueError, match='commit|blob|differs|dependency'):
+        load_smoke_artifact(artifact, repository_root=root)
+
+
 def test_smoke_artifact_rejects_cross_run_json_symlink(tmp_path):
     from mambapose_opt.distill_smoke import load_smoke_artifact
 
@@ -482,12 +529,12 @@ def test_publication_rename_is_atomic_no_replace(tmp_path):
     staging.mkdir()
     destination.mkdir()
     (staging / 'new').write_text('new')
-    (destination / 'existing').write_text('existing')
 
     with pytest.raises(FileExistsError):
         _rename_noreplace(staging, destination)
     assert (staging / 'new').read_text() == 'new'
-    assert (destination / 'existing').read_text() == 'existing'
+    assert destination.is_dir()
+    assert not tuple(destination.iterdir())
 
 
 def test_cuda_boundary_revalidation_rejects_new_external_owner(monkeypatch):

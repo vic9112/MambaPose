@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from contextlib import suppress
 import copy
 import ctypes
@@ -13,6 +14,7 @@ import json
 import math
 import os
 from pathlib import Path
+import posixpath
 import random
 import re
 import shutil
@@ -418,6 +420,90 @@ def _checkpoint_path(
     return effective, relative.as_posix()
 
 
+def _config_base_references(path: Path) -> tuple[str, ...]:
+    """Read the literal top-level ``_base_`` declaration from one config."""
+    try:
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    except (OSError, UnicodeError, SyntaxError) as error:
+        raise ValueError(f'cannot parse config dependency: {path}') from error
+    declarations = []
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else (
+            [statement.target])
+        if any(isinstance(target, ast.Name) and target.id == '_base_'
+               for target in targets):
+            declarations.append(statement.value)
+    if len(declarations) > 1:
+        raise ValueError('config must declare _base_ at most once')
+    if not declarations:
+        return ()
+    try:
+        value = ast.literal_eval(declarations[0])
+    except (TypeError, ValueError) as error:
+        raise ValueError('config _base_ must be a literal path or path list') \
+            from error
+    if isinstance(value, str):
+        values = (value,)
+    elif isinstance(value, (list, tuple)) and all(
+            isinstance(item, str) for item in value):
+        values = tuple(value)
+    else:
+        raise ValueError('config _base_ must be a literal path or path list')
+    if any(not item or '\\' in item for item in values):
+        raise ValueError('config _base_ contains an invalid path')
+    return values
+
+
+def config_dependency_bindings(
+        repository_root: Path, config_path: Path | str, *, git_commit: str,
+        ) -> tuple[dict[str, str], ...]:
+    """Bind a config and its complete inherited ``_base_`` closure to Git."""
+    root = Path(repository_root).resolve(strict=True)
+    leaf = _relative_path(Path(config_path).as_posix(), label='config')
+    if leaf.parts[0] != 'configs' or leaf.suffix != '.py':
+        raise ValueError('config dependencies must be Python files under configs')
+    bindings: dict[str, dict[str, str]] = {}
+    visiting: set[str] = set()
+
+    def visit(relative: Path) -> None:
+        name = relative.as_posix()
+        if name in bindings:
+            return
+        if name in visiting:
+            raise ValueError('config _base_ dependency cycle detected')
+        if relative.parts[0] != 'configs' or relative.suffix != '.py':
+            raise ValueError(
+                'config dependencies must be Python files under configs')
+        cursor = root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError('config dependency path must not contain symlinks')
+        binding = tracked_file_binding(
+            root, relative, git_commit=git_commit)
+        visiting.add(name)
+        for raw_base in _config_base_references(root / relative):
+            if posixpath.isabs(raw_base):
+                raise ValueError('config _base_ path must be repository-relative')
+            normalized = posixpath.normpath(posixpath.join(
+                relative.parent.as_posix(), raw_base))
+            dependency = Path(normalized)
+            if (
+                    not dependency.parts
+                    or dependency.parts[0] != 'configs'
+                    or any(part in {'.', '..'} for part in dependency.parts)
+                    or dependency.suffix != '.py'):
+                raise ValueError('config _base_ dependency escapes configs')
+            visit(dependency)
+        visiting.remove(name)
+        bindings[name] = binding
+
+    visit(leaf)
+    return tuple(bindings[name] for name in sorted(bindings))
+
+
 def build_smoke_preflight(
         repository_root: Path, config_path: Path) -> SmokePreflight:
     """Validate immutable source, checkpoints, and all train data before CUDA."""
@@ -426,8 +512,11 @@ def build_smoke_preflight(
     if config_relative.parts[:3] != _CONFIG_PREFIX:
         raise ValueError('config must be under configs/optimization/accuracy_first')
     commit = clean_git_commit(root)
-    config_binding = tracked_file_binding(
+    config_dependencies = config_dependency_bindings(
         root, config_relative, git_commit=commit)
+    config_binding = next(
+        row for row in config_dependencies
+        if row['path'] == config_relative.as_posix())
 
     from mmengine.config import Config
 
@@ -481,6 +570,7 @@ def build_smoke_preflight(
             'git_commit': commit,
             'git_commit_timestamp': _commit_timestamp(root, commit),
             'config': config_binding,
+            'config_dependencies': list(config_dependencies),
         },
         resolved_config_sha256=resolved,
         experiment_id=experiment_id,
@@ -527,11 +617,23 @@ def _validate_smoke_schema(value: object) -> Mapping:
 
     source = _mapping_fields(top['source'], {
         'git_commit', 'git_commit_timestamp', 'config',
-        'resolved_config_sha256'}, 'smoke source')
+        'config_dependencies', 'resolved_config_sha256'}, 'smoke source')
     _hex(source['git_commit'], label='source git_commit', commit=True)
     commit_at = _timestamp(
         source['git_commit_timestamp'], label='source git_commit_timestamp')
-    _file_binding(source['config'], label='source config')
+    config_path, config_sha256 = _file_binding(
+        source['config'], label='source config')
+    dependencies = source['config_dependencies']
+    if not isinstance(dependencies, list) or not dependencies:
+        raise ValueError('source config_dependencies must be a nonempty list')
+    parsed_dependencies = [
+        _file_binding(row, label='source config dependency')
+        for row in dependencies]
+    dependency_paths = [path.as_posix() for path, _ in parsed_dependencies]
+    if dependency_paths != sorted(set(dependency_paths)):
+        raise ValueError('source config_dependencies must be unique and sorted')
+    if (config_path, config_sha256) not in parsed_dependencies:
+        raise ValueError('source config must belong to config_dependencies')
     _hex(source['resolved_config_sha256'], label='resolved config sha256')
     inputs = _mapping_fields(
         top['inputs'], {'teacher_checkpoint', 'student_checkpoint'},
@@ -694,18 +796,19 @@ def _verify_artifact_files(
         value: Mapping, *, repository_root: Path,
         physical_artifact_root: Path | None = None,
         logical_artifact_root: Path | None = None) -> None:
-    source_binding = tracked_file_binding(
+    dependencies = config_dependency_bindings(
         repository_root, value['source']['config']['path'],
         git_commit=value['source']['git_commit'])
-    if source_binding != value['source']['config']:
-        raise ValueError('source config does not match its clean commit')
+    if list(dependencies) != value['source']['config_dependencies']:
+        raise ValueError(
+            'source config dependency closure does not match its clean commit')
     observed_commit_timestamp = _commit_timestamp(
         repository_root, value['source']['git_commit'])
     if observed_commit_timestamp != value['source']['git_commit_timestamp']:
         raise ValueError('source commit timestamp mismatch')
-    for field in ('config',):
+    for dependency in value['source']['config_dependencies']:
         _verify_bound_file(
-            repository_root, value['source'][field], label=f'source {field}')
+            repository_root, dependency, label='source config dependency')
     for field in ('teacher_checkpoint', 'student_checkpoint'):
         _verify_bound_file(
             repository_root, value['inputs'][field], label=field)
@@ -880,11 +983,11 @@ def _revalidate_preflight(preflight: SmokePreflight) -> None:
     commit = clean_git_commit(preflight.repository_root)
     if commit != preflight.source['git_commit']:
         raise RuntimeError('source commit changed after smoke preflight')
-    binding = tracked_file_binding(
-        preflight.repository_root, preflight.config_path,
-        git_commit=commit)
-    if binding != preflight.source['config']:
-        raise RuntimeError('source config changed after smoke preflight')
+    dependencies = config_dependency_bindings(
+        preflight.repository_root, preflight.config_path, git_commit=commit)
+    if list(dependencies) != preflight.source['config_dependencies']:
+        raise RuntimeError(
+            'source config dependency closure changed after smoke preflight')
     if sha256_file(preflight.teacher_checkpoint) != (
             preflight.teacher_checkpoint_sha256):
         raise RuntimeError('teacher checkpoint changed after smoke preflight')
