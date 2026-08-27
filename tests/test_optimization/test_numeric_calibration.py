@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -64,6 +65,55 @@ def _activation_record(*, numeric_range=(-4.0, 2.0), underflow=7,
         'underflow_count': underflow,
         'overflow_count': overflow,
         'percentile_bound_valid': bounded,
+    }
+
+
+def _root_determinism(seed=0):
+    return {
+        'seed': seed,
+        'python_seed': seed,
+        'numpy_seed': seed,
+        'torch_seed': seed,
+        'torch_cuda_seed': seed,
+        'torch_deterministic_algorithms': True,
+        'cudnn_benchmark': False,
+        'cudnn_deterministic': True,
+    }
+
+
+def _schema_artifact(*, version, include_root):
+    record = {
+        'granularity': 'tensor', 'sample_count': 2, 'zero_count': 0,
+        'underflow_count': 0, 'overflow_count': 0, 'max_abs': 1.0,
+        'range': [-1.0, 1.0],
+        'percentiles': {'0.5': 1.0, '0.9': 1.0, '0.99': 1.0,
+                        '0.999': 1.0},
+        'algorithm': 'fixed-log2-histogram-v1', 'histogram_bins': 256,
+        'histogram_domain': [2 ** -32, 2 ** 32],
+        'percentile_bound_valid': True,
+        'relative_error_bound': 2 ** 0.25 - 1,
+        'outlier_ratio_above_p99_bin': 0.0, 'token_ids': None,
+        'observed_shape': [],
+    }
+    protocol = {
+        'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
+        'worker_count': 0, 'sample_count': 2,
+        'sample_order_sha256': 'a' * 64,
+    }
+    if include_root:
+        protocol['root_determinism'] = _root_determinism()
+    return {
+        'schema_version': version,
+        'candidate_id': 'full-s-v1',
+        'stage': 'calibrate',
+        'source': {},
+        'identity': _valid_identity(),
+        'protocol': protocol,
+        'hooks': {
+            'records': {'attention.0.q': record},
+            'required_records': ['attention.0.q'],
+            'unsupported_internals': [],
+        },
     }
 
 
@@ -275,7 +325,7 @@ def test_calibration_artifact_requires_deterministic_order_and_exact_hooks():
         'observed_shape': [],
     }
     artifact = {
-        'schema_version': 1,
+        'schema_version': 2,
         'candidate_id': 'full-s-v1',
         'stage': 'calibrate',
         'source': {},
@@ -284,16 +334,7 @@ def test_calibration_artifact_requires_deterministic_order_and_exact_hooks():
             'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
             'worker_count': 0, 'sample_count': 2,
             'sample_order_sha256': 'a' * 64,
-            'root_determinism': {
-                'seed': 0,
-                'python_seed': 0,
-                'numpy_seed': 0,
-                'torch_seed': 0,
-                'torch_cuda_seed': 0,
-                'torch_deterministic_algorithms': True,
-                'cudnn_benchmark': False,
-                'cudnn_deterministic': True,
-            },
+            'root_determinism': _root_determinism(),
         },
         'hooks': {'records': {'attention.0.q': record},
                   'required_records': ['attention.0.q'],
@@ -313,6 +354,30 @@ def test_calibration_artifact_requires_deterministic_order_and_exact_hooks():
     artifact['protocol']['root_determinism']['torch_seed'] = 1
     with pytest.raises(CalibrationContractError, match='root determinism'):
         validate_calibration_artifact(artifact)
+
+
+def test_calibration_schema_rejects_strip_downgrade_and_unknown_version():
+    from mambapose_opt.numeric_calibration import (
+        CalibrationContractError, validate_calibration_artifact)
+
+    valid = _schema_artifact(version=2, include_root=True)
+    assert validate_calibration_artifact(valid) is valid
+
+    stripped = copy.deepcopy(valid)
+    stripped['protocol'].pop('root_determinism')
+    with pytest.raises(CalibrationContractError, match='schema v2'):
+        validate_calibration_artifact(stripped)
+
+    downgraded = copy.deepcopy(valid)
+    downgraded['schema_version'] = 1
+    with pytest.raises(CalibrationContractError, match='schema v1'):
+        validate_calibration_artifact(downgraded)
+
+    for unknown_version in (3, True, [], None):
+        unknown = copy.deepcopy(valid)
+        unknown['schema_version'] = unknown_version
+        with pytest.raises(CalibrationContractError, match='version'):
+            validate_calibration_artifact(unknown)
 
 
 def test_calibration_artifact_keeps_legacy_protocol_compatible():
@@ -347,6 +412,84 @@ def test_calibration_artifact_keeps_legacy_protocol_compatible():
     }
 
     assert validate_calibration_artifact(artifact) is artifact
+
+
+def test_calibration_v2_provenance_rejects_candidate_seed_downgrade(
+        tmp_path, monkeypatch):
+    from mambapose_opt.numeric_calibration import (
+        CalibrationContractError, validate_calibration_provenance)
+    from mambapose_opt.schema import CandidateSpec
+
+    candidate = CandidateSpec.from_dict({
+        'id': 'w8a8', 'route': 'ssm-quant-pwl', 'kind': 'fake-quant',
+        'config': 'configs/w8a8.py', 'checkpoint': 'checkpoint.pth',
+        'checkpoint_sha256': 'a' * 64, 'seed': 7,
+        'features': {'numeric_kind': 'w8a8'},
+    })
+    artifact = _schema_artifact(version=2, include_root=True)
+    artifact['candidate_id'] = candidate.id
+    artifact['protocol']['root_determinism'] = _root_determinism(seed=0)
+    monkeypatch.setattr(
+        'mambapose_opt.numeric_source.validate_numeric_source_binding',
+        lambda *_args, **_kwargs: {
+            'git_commit': 'b' * 40, 'policy_path': 'policy.py',
+            'policy_sha256': 'a' * 64,
+            'authority_path': 'optimization/authority.json'})
+    monkeypatch.setattr(
+        'mmengine.config.Config.fromfile',
+        lambda _path: {
+            'numeric_optimization': {
+                'calibration': {'artifact_schema_version': 2}}})
+
+    with pytest.raises(CalibrationContractError, match='candidate'):
+        validate_calibration_provenance(
+            artifact, expected_candidate=candidate,
+            repository_root=tmp_path,
+            manifest_path=tmp_path / 'optimization/candidates.json')
+
+
+def test_calibration_provenance_rejects_combined_strip_and_v1_downgrade(
+        tmp_path, monkeypatch):
+    from mambapose_opt.numeric_calibration import (
+        CalibrationContractError, validate_calibration_provenance)
+    from mambapose_opt.schema import CandidateSpec
+
+    candidate = CandidateSpec.from_dict({
+        'id': 'w8a8', 'route': 'ssm-quant-pwl', 'kind': 'fake-quant',
+        'config': 'configs/w8a8.py', 'checkpoint': 'checkpoint.pth',
+        'checkpoint_sha256': 'a' * 64, 'seed': 0,
+        'features': {'numeric_kind': 'w8a8'},
+    })
+    downgraded = _schema_artifact(version=1, include_root=False)
+    downgraded['candidate_id'] = candidate.id
+    monkeypatch.setattr(
+        'mambapose_opt.numeric_source.validate_numeric_source_binding',
+        lambda *_args, **_kwargs: {
+            'git_commit': 'b' * 40, 'policy_path': 'policy.py',
+            'policy_sha256': 'a' * 64,
+            'authority_path': 'optimization/authority.json'})
+    monkeypatch.setattr(
+        'mmengine.config.Config.fromfile',
+        lambda _path: {
+            'numeric_optimization': {
+                'calibration': {'artifact_schema_version': 2}}})
+
+    with pytest.raises(CalibrationContractError, match='source policy'):
+        validate_calibration_provenance(
+            downgraded, expected_candidate=candidate,
+            repository_root=tmp_path,
+            manifest_path=tmp_path / 'optimization/candidates.json')
+
+
+def test_numeric_calibration_policies_declare_schema_v2():
+    from mmengine.config import Config
+
+    for path in (
+            'configs/optimization/numeric/observer_only.py',
+            'configs/optimization/numeric/w8a8.py'):
+        config = Config.fromfile(path)
+        assert config.numeric_optimization.calibration[
+            'artifact_schema_version'] == 2
 
 
 def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
@@ -443,6 +586,7 @@ def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
         torch.backends.cudnn.deterministic = original_cudnn_deterministic
 
     assert calls == [('seed', 7), ('model', None), ('loader', 7, False)]
+    assert artifact['schema_version'] == 2
     assert artifact['protocol']['root_determinism']['seed'] == 7
 
 
@@ -487,6 +631,9 @@ def test_calibration_provenance_rejects_identity_commit_mismatch(
         lambda *_args, **_kwargs: {
             'git_commit': 'c' * 40, 'policy_path': 'configs/w8a8.py',
             'policy_sha256': 'a' * 64})
+    monkeypatch.setattr(
+        'mmengine.config.Config.fromfile',
+        lambda _path: {'numeric_optimization': {'calibration': {}}})
 
     with pytest.raises(CalibrationContractError, match='commit'):
         validate_calibration_provenance(

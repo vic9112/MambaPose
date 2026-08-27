@@ -358,8 +358,14 @@ def validate_calibration_artifact(
                 'identity', 'protocol', 'hooks'}
     if not isinstance(value, Mapping) or set(value) != required:
         raise CalibrationContractError(
-            'calibration artifact fields do not match schema v1')
-    if value['schema_version'] != 1 or value['stage'] != 'calibrate' \
+            'calibration artifact fields do not match a supported schema')
+    schema_version = value['schema_version']
+    if (isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version not in (1, 2)):
+        raise CalibrationContractError(
+            'calibration artifact schema version is unsupported')
+    if value['stage'] != 'calibrate' \
             or not isinstance(value['candidate_id'], str) \
             or not value['candidate_id']:
         raise CalibrationContractError('calibration artifact identity is invalid')
@@ -419,11 +425,18 @@ def validate_calibration_artifact(
     legacy_protocol_fields = {
         'model_mode', 'grad_enabled', 'shuffle', 'worker_count',
         'sample_count', 'sample_order_sha256'}
+    deterministic_protocol_fields = (
+        legacy_protocol_fields | {'root_determinism'})
     protocol_fields = set(protocol) if isinstance(protocol, Mapping) else set()
-    if (not isinstance(protocol, Mapping) or protocol_fields not in (
-            legacy_protocol_fields,
-            legacy_protocol_fields | {'root_determinism'})):
+    if not isinstance(protocol, Mapping):
         raise CalibrationContractError('calibration protocol is invalid')
+    if schema_version == 1 and protocol_fields != legacy_protocol_fields:
+        raise CalibrationContractError(
+            'calibration schema v1 requires the exact legacy protocol')
+    if schema_version == 2 \
+            and protocol_fields != deterministic_protocol_fields:
+        raise CalibrationContractError(
+            'calibration schema v2 requires root determinism protocol')
     expected = {
         'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
         'worker_count': 0,
@@ -438,7 +451,7 @@ def validate_calibration_artifact(
     if not isinstance(protocol.get('sample_order_sha256'), str) or not re.fullmatch(
             r'[0-9a-f]{64}', protocol['sample_order_sha256']):
         raise CalibrationContractError('calibration sample order hash is invalid')
-    if 'root_determinism' in protocol:
+    if schema_version == 2:
         root_determinism = protocol['root_determinism']
         seed_fields = {
             'seed', 'python_seed', 'numpy_seed', 'torch_seed',
@@ -603,10 +616,26 @@ def validate_calibration_provenance(
     except ValueError as error:
         raise CalibrationContractError(
             f'calibration source binding is invalid: {error}') from error
+    from mmengine.config import Config
+    config = Config.fromfile(repository_root / source['policy_path'])
+    numeric = config.get('numeric_optimization', {})
+    calibration_policy = numeric.get('calibration', {}) \
+        if isinstance(numeric, Mapping) else None
+    expected_schema_version = calibration_policy.get(
+        'artifact_schema_version', 1) \
+        if isinstance(calibration_policy, Mapping) else None
+    if (isinstance(expected_schema_version, bool)
+            or not isinstance(expected_schema_version, int)
+            or expected_schema_version not in (1, 2)):
+        raise CalibrationContractError(
+            'calibration source policy schema version is invalid')
+    if value['schema_version'] != expected_schema_version:
+        raise CalibrationContractError(
+            'calibration artifact version disagrees with source policy')
     identity = value['identity']
-    root_determinism = value['protocol'].get('root_determinism')
-    if (root_determinism is not None
-            and root_determinism['seed'] != expected_candidate.seed):
+    if (value['schema_version'] == 2
+            and value['protocol']['root_determinism']['seed']
+            != expected_candidate.seed):
         raise CalibrationContractError(
             'calibration root determinism seed disagrees with candidate')
     if identity['git_commit'] != source['git_commit']:
@@ -667,9 +696,6 @@ def validate_calibration_provenance(
     if identity != expected_identity:
         raise CalibrationContractError(
             'calibration identity disagrees with canonical production inputs')
-    from mmengine.config import Config
-    config = Config.fromfile(repository_root / source['policy_path'])
-    numeric = config.get('numeric_optimization', {})
     policy = numeric.get('quant_policy', {})
     observers = policy.get('activation_observers', {})
     if expected_candidate.features.get('numeric_kind') == 'w8a8':

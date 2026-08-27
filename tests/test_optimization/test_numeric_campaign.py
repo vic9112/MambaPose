@@ -877,12 +877,19 @@ def test_real_numeric_producer_round_trips_public_and_controller_validation(
                  text=True).strip()},
             checkpoint_sha=checkpoint_sha)
         calibration_path.write_text(json.dumps({
-            'schema_version': 1, 'candidate_id': candidate.id,
+            'schema_version': 2, 'candidate_id': candidate.id,
             'stage': 'calibrate', 'source': {}, 'identity': identity,
             'protocol': {
                 'model_mode': 'eval', 'grad_enabled': False,
                 'shuffle': False, 'worker_count': 0, 'sample_count': 2,
-                'sample_order_sha256': 'b' * 64},
+                'sample_order_sha256': 'b' * 64,
+                'root_determinism': {
+                    'seed': 0, 'python_seed': 0, 'numpy_seed': 0,
+                    'torch_seed': 0, 'torch_cuda_seed': 0,
+                    'torch_deterministic_algorithms': True,
+                    'cudnn_benchmark': False,
+                    'cudnn_deterministic': True,
+                }},
             'hooks': {
                 'records': {'layer.input': _tensor_calibration_record()},
                 'required_records': ['layer.input'],

@@ -7,7 +7,8 @@ numeric_optimization = dict(
     calibration=dict(
         source_candidate='full-s-v1', split='train2017', shuffle=False,
         worker_count=0, sample_count=512,
-        artifact_binding='runtime-sha256-required'),
+        artifact_binding='runtime-sha256-required',
+        artifact_schema_version=2),
     quant_policy=dict(
         allow=(
             'backbone.layers.0.blocks.0.op.in_proj',

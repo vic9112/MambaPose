@@ -321,7 +321,7 @@ class OptimizationController:
             except ValueError as error:
                 raise ArtifactValidationError(
                     f'numeric calibration artifact is invalid: {error}') from error
-            return 'numeric-calibration-v1'
+            return f'numeric-calibration-v{value["schema_version"]}'
         if stage == 'profile':
             base_required = {
                 'schema_version', 'git_commit', 'candidate', 'config',

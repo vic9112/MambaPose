@@ -337,7 +337,7 @@ def calibrate(
     if identity_after != identity_before:
         raise ValueError('calibration inputs changed during production run')
     artifact = {
-        'schema_version': 1,
+        'schema_version': 2,
         'candidate_id': target.id,
         'stage': 'calibrate',
         'source': build_numeric_source_binding(
