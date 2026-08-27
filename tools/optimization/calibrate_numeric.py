@@ -69,6 +69,25 @@ def _identity(candidate, policy: Path) -> dict[str, Any]:
     return value
 
 
+def _require_target_policy(target_candidate, policy: Path) -> Path:
+    """Bind calibration policy input to the target candidate config."""
+    root = REPOSITORY_ROOT.resolve()
+    try:
+        expected = (root / target_candidate.config).resolve(strict=True)
+        supplied = (
+            policy if policy.is_absolute() else root / policy
+        ).resolve(strict=True)
+        expected.relative_to(root)
+        supplied.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            'calibration policy must equal target candidate config') from error
+    if supplied != expected:
+        raise ValueError(
+            'calibration policy must equal target candidate config')
+    return expected
+
+
 def _target_dict(targets: CalibrationTargets) -> dict[str, list[str]]:
     return {
         name: list(getattr(targets, name))
@@ -78,8 +97,11 @@ def _target_dict(targets: CalibrationTargets) -> dict[str, list[str]]:
 
 def audit(
         candidate, policy: Path, *, manifest_path: Path | None = None,
+        target_candidate=None,
         ) -> dict[str, Any]:
     """CPU checkpoint/config load audit; no dataset iteration or artifact write."""
+    target = target_candidate or candidate
+    policy = _require_target_policy(target, policy)
     from mmpose.apis import init_model
 
     manifest = manifest_path or REPOSITORY_ROOT / 'optimization/candidates.json'
@@ -285,6 +307,8 @@ def calibrate(
         raise ValueError('production numeric calibration requires cuda:0')
     if samples <= 0 or samples > 4096:
         raise ValueError('calibration samples must be in [1, 4096]')
+    target = target_candidate or candidate
+    policy = _require_target_policy(target, policy)
     manifest = manifest_path or REPOSITORY_ROOT / 'optimization/candidates.json'
     authorized = authorize_manifest_candidate(
         REPOSITORY_ROOT, manifest, candidate.id)
@@ -332,7 +356,6 @@ def calibrate(
     activation_observers = policy_value.get('activation_observers', {})
     activation_scales = _w8a8_activation_scales_from_records(
         activation_observers, records)
-    target = target_candidate or candidate
     identity_after = _identity(candidate, policy)
     if identity_after != identity_before:
         raise ValueError('calibration inputs changed during production run')
@@ -397,7 +420,9 @@ def main() -> int:
             _candidate(args.manifest, 'full-s-v1')
             if target.route == 'ssm-quant-pwl' else target)
         if args.audit_only:
-            value = audit(source, policy, manifest_path=args.manifest)
+            value = audit(
+                source, policy, target_candidate=target,
+                manifest_path=args.manifest)
             value['target_candidate_id'] = target.id
             print(json.dumps(value, indent=2, sort_keys=True))
             return 0

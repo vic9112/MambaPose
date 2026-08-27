@@ -616,6 +616,10 @@ def validate_calibration_provenance(
     except ValueError as error:
         raise CalibrationContractError(
             f'calibration source binding is invalid: {error}') from error
+    expected_policy_path = expected_candidate.config.as_posix()
+    if source['policy_path'] != expected_policy_path:
+        raise CalibrationContractError(
+            'calibration source policy must equal target candidate config')
     from mmengine.config import Config
     config = Config.fromfile(repository_root / source['policy_path'])
     numeric = config.get('numeric_optimization', {})

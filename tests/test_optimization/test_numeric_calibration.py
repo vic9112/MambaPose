@@ -432,7 +432,7 @@ def test_calibration_v2_provenance_rejects_candidate_seed_downgrade(
     monkeypatch.setattr(
         'mambapose_opt.numeric_source.validate_numeric_source_binding',
         lambda *_args, **_kwargs: {
-            'git_commit': 'b' * 40, 'policy_path': 'policy.py',
+            'git_commit': 'b' * 40, 'policy_path': 'configs/w8a8.py',
             'policy_sha256': 'a' * 64,
             'authority_path': 'optimization/authority.json'})
     monkeypatch.setattr(
@@ -465,7 +465,7 @@ def test_calibration_provenance_rejects_combined_strip_and_v1_downgrade(
     monkeypatch.setattr(
         'mambapose_opt.numeric_source.validate_numeric_source_binding',
         lambda *_args, **_kwargs: {
-            'git_commit': 'b' * 40, 'policy_path': 'policy.py',
+            'git_commit': 'b' * 40, 'policy_path': 'configs/w8a8.py',
             'policy_sha256': 'a' * 64,
             'authority_path': 'optimization/authority.json'})
     monkeypatch.setattr(
@@ -477,6 +477,42 @@ def test_calibration_provenance_rejects_combined_strip_and_v1_downgrade(
     with pytest.raises(CalibrationContractError, match='source policy'):
         validate_calibration_provenance(
             downgraded, expected_candidate=candidate,
+            repository_root=tmp_path,
+            manifest_path=tmp_path / 'optimization/candidates.json')
+
+
+def test_calibration_provenance_rejects_tracked_alternate_policy_downgrade(
+        tmp_path, monkeypatch):
+    from mambapose_opt.numeric_calibration import (
+        CalibrationContractError, validate_calibration_provenance)
+    from mambapose_opt.schema import CandidateSpec
+
+    candidate = CandidateSpec.from_dict({
+        'id': 'numeric-observer-s-v1', 'route': 'ssm-quant-pwl',
+        'kind': 'fake-quant',
+        'config': 'configs/optimization/numeric/observer_only.py',
+        'checkpoint': 'checkpoint.pth',
+        'checkpoint_sha256': 'a' * 64, 'seed': 0,
+        'features': {'numeric_kind': 'observer'},
+    })
+    alternate_policy = 'configs/reproduction/coco_s_v1.py'
+    rebound = _schema_artifact(version=1, include_root=False)
+    rebound['candidate_id'] = candidate.id
+    rebound['identity']['policy'] = alternate_policy
+    monkeypatch.setattr(
+        'mambapose_opt.numeric_source.validate_numeric_source_binding',
+        lambda *_args, **_kwargs: {
+            'git_commit': 'b' * 40, 'policy_path': alternate_policy,
+            'policy_sha256': 'a' * 64,
+            'authority_path': 'optimization/authority.json'})
+    monkeypatch.setattr(
+        'mmengine.config.Config.fromfile',
+        lambda _path: {'numeric_optimization': {'calibration': {}}})
+
+    with pytest.raises(CalibrationContractError,
+                       match='target candidate config'):
+        validate_calibration_provenance(
+            rebound, expected_candidate=candidate,
             repository_root=tmp_path,
             manifest_path=tmp_path / 'optimization/candidates.json')
 
@@ -497,14 +533,19 @@ def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
     import tools.optimization.calibrate_numeric as tool
     from mambapose_opt.determinism import seed_deterministic_root
 
-    candidate = SimpleNamespace(id='w8a8', seed=7)
+    source = SimpleNamespace(
+        id='full-s-v1', seed=7,
+        config=Path('configs/reproduction/coco_s_v1.py'))
+    target = SimpleNamespace(
+        id='w8a8', seed=7, config=Path('policy.py'))
     authorized = SimpleNamespace(
-        candidate=candidate, config_path=tmp_path / 'config.py',
+        candidate=source, config_path=tmp_path / 'config.py',
         checkpoint_path=tmp_path / 'checkpoint.pth')
     config = SimpleNamespace(
         train_dataloader={},
         numeric_optimization={'quant_policy': {'activation_observers': {}}})
     calls = []
+    identity_candidates = []
 
     class Model(nn.Module):
         def __init__(self):
@@ -556,10 +597,16 @@ def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
         calls.append(('loader', seed, diff_rank_seed))
         return [{'data_samples': [SimpleNamespace(img_id=11)]}]
 
+    def identity(candidate, _policy):
+        identity_candidates.append(candidate.id)
+        return _valid_identity()
+
+    monkeypatch.setattr(tool, 'REPOSITORY_ROOT', tmp_path)
+    (tmp_path / 'policy.py').write_text(
+        'numeric_optimization = dict()\n', encoding='utf-8')
     monkeypatch.setattr(tool, 'authorize_manifest_candidate',
                         lambda *_args: authorized)
-    monkeypatch.setattr(tool, '_identity',
-                        lambda *_args: _valid_identity())
+    monkeypatch.setattr(tool, '_identity', identity)
     monkeypatch.setattr(tool, 'seed_deterministic_root', deterministic_root)
     monkeypatch.setattr(tool, 'discover_calibration_targets', lambda _model:
                         SimpleNamespace(unsupported_internals=()))
@@ -578,7 +625,8 @@ def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
     original_cudnn_deterministic = torch.backends.cudnn.deterministic
     try:
         artifact = tool.calibrate(
-            candidate, tmp_path / 'policy.py', samples=1, device='cuda:0',
+            source, tmp_path / 'policy.py', samples=1, device='cuda:0',
+            target_candidate=target,
             manifest_path=tmp_path / 'manifest.json')
     finally:
         torch.use_deterministic_algorithms(original_algorithms)
@@ -586,8 +634,81 @@ def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
         torch.backends.cudnn.deterministic = original_cudnn_deterministic
 
     assert calls == [('seed', 7), ('model', None), ('loader', 7, False)]
+    assert identity_candidates == ['full-s-v1', 'full-s-v1']
+    assert artifact['candidate_id'] == 'w8a8'
     assert artifact['schema_version'] == 2
     assert artifact['protocol']['root_determinism']['seed'] == 7
+
+
+@pytest.mark.parametrize('operation', ('audit', 'calibrate'))
+def test_calibration_producer_rejects_alternate_target_policy_before_load(
+        tmp_path, monkeypatch, operation):
+    import tools.optimization.calibrate_numeric as tool
+
+    source = SimpleNamespace(
+        id='full-s-v1', config=Path('configs/reproduction/coco_s_v1.py'))
+    target = SimpleNamespace(
+        id='numeric-observer-s-v1',
+        config=Path('configs/optimization/numeric/observer_only.py'))
+    alternate = tmp_path / 'configs/reproduction/coco_s_v1.py'
+    expected = tmp_path / target.config
+    alternate.parent.mkdir(parents=True)
+    expected.parent.mkdir(parents=True)
+    alternate.write_text('model = dict()\n', encoding='utf-8')
+    expected.write_text('numeric_optimization = dict()\n', encoding='utf-8')
+    monkeypatch.setattr(tool, 'REPOSITORY_ROOT', tmp_path)
+    monkeypatch.setattr(
+        tool, 'authorize_manifest_candidate',
+        lambda *_args: (_ for _ in ()).throw(
+            ValueError('source checkpoint load reached')))
+
+    with pytest.raises(ValueError, match='target candidate config'):
+        if operation == 'audit':
+            tool.audit(
+                source, alternate, target_candidate=target,
+                manifest_path=tmp_path / 'manifest.json')
+        else:
+            tool.calibrate(
+                source, alternate, samples=1, device='cuda:0',
+                target_candidate=target,
+                manifest_path=tmp_path / 'manifest.json')
+
+
+def test_calibration_cli_audit_rejects_alternate_target_policy(
+        tmp_path, monkeypatch, capsys):
+    import tools.optimization.calibrate_numeric as tool
+
+    source = SimpleNamespace(
+        id='full-s-v1', route='baseline',
+        config=Path('configs/reproduction/coco_s_v1.py'))
+    target = SimpleNamespace(
+        id='numeric-observer-s-v1', route='ssm-quant-pwl',
+        config=Path('configs/optimization/numeric/observer_only.py'))
+    alternate = tmp_path / 'configs/reproduction/coco_s_v1.py'
+    expected = tmp_path / target.config
+    alternate.parent.mkdir(parents=True)
+    expected.parent.mkdir(parents=True)
+    alternate.write_text('model = dict()\n', encoding='utf-8')
+    expected.write_text('numeric_optimization = dict()\n', encoding='utf-8')
+    monkeypatch.setattr(tool, 'REPOSITORY_ROOT', tmp_path)
+    monkeypatch.setattr(
+        tool, '_candidate',
+        lambda _manifest, identifier: (
+            source if identifier == 'full-s-v1' else target))
+    monkeypatch.setattr(
+        tool, 'authorize_manifest_candidate',
+        lambda *_args: (_ for _ in ()).throw(
+            ValueError('source checkpoint load reached')))
+    monkeypatch.setattr(sys, 'argv', [
+        'calibrate_numeric.py', '--candidate', target.id,
+        '--manifest', str(tmp_path / 'manifest.json'),
+        '--policy', str(alternate), '--audit-only'])
+
+    with pytest.raises(SystemExit) as error:
+        tool.main()
+
+    assert error.value.code == 2
+    assert 'target candidate config' in capsys.readouterr().err
 
 
 def test_calibration_provenance_rejects_identity_commit_mismatch(
