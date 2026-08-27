@@ -13,6 +13,8 @@ import sys
 import tempfile
 from typing import Any
 
+sys.dont_write_bytecode = True
+
 import torch
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]

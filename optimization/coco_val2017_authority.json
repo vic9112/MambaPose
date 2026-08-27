@@ -2,6 +2,10 @@
   "schema_version": 1,
   "dataset": "coco",
   "split": "val2017",
+  "inventory": {
+    "path": "data/inventory.json",
+    "sha256": "2a82ab3cfe05a514d141c17921463e72f22741d67eaf978d93317155bbeaf0ed"
+  },
   "annotation": {
     "path": "data/coco/annotations/person_keypoints_val2017.json",
     "sha256": "788e2dae83c86bd547be7fab269d6399df5671063d29a61360cdb2cc370d2b14",

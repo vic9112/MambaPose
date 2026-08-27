@@ -16,6 +16,8 @@ import sys
 import tempfile
 from typing import Any, Callable
 
+sys.dont_write_bytecode = True
+
 import numpy as np
 
 

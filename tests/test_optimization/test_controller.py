@@ -61,6 +61,10 @@ def _candidate(repo_root):
             {'id': 'coco-val-detections', 'sha256': '2' * 64},
         ],
     }))
+    authority_value = json.loads(authority.read_text())
+    authority_value['inventory'] = {
+        'path': 'data/inventory.json', 'sha256': _sha256(inventory)}
+    authority.write_text(json.dumps(authority_value))
     candidate = CandidateSpec.from_dict({
         'id': 'fixture',
         'route': 'accuracy-first',
@@ -151,6 +155,8 @@ def _write_generic_artifact(
             'authority_image_count': 5000,
             'authority_annotation_count': 11004,
             'authority_detection_count': 104125,
+            'inventory_authority_sha256': _sha256(
+                repo_root / 'data/inventory.json'),
             'annotation_authority_sha256': '1' * 64,
             'detection_authority_sha256': '2' * 64,
             'image_corpus_digest_algorithm': (
@@ -1044,11 +1050,104 @@ def test_completed_latency_revalidates_persisted_controller_lease(
         shared_lock_root=tmp_path / 'shared')
     assert controller.run_next().exit_code == 0
     run = controller.store.read()['runs']['fixture:latency']
+    assert datetime.fromisoformat(run['lease_validated_at']).tzinfo is not None
     assert controller._completed_evidence_valid('latency', run)
 
     counterfeit = json.loads(json.dumps(run))
     counterfeit['gpu_lease']['lease_id'] = '8' * 64
     assert not controller._completed_evidence_valid('latency', counterfeit)
+
+
+def test_old_completed_latency_remains_valid_against_persisted_validation_time(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'latency.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    campaign = tmp_path / 'work_dirs/optimization'
+    controller = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('latency',),
+        gpu_lock_path=tmp_path / 'shared/work_dirs/optimization/gpu.lock',
+        shared_lock_root=tmp_path / 'shared')
+    assert controller.run_next().exit_code == 0
+    run = controller.store.read()['runs']['fixture:latency']
+    old_restart = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('latency',),
+        gpu_lock_path=tmp_path / 'shared/work_dirs/optimization/gpu.lock',
+        shared_lock_root=tmp_path / 'shared',
+        now=lambda: datetime(2036, 8, 27, tzinfo=timezone.utc))
+
+    assert old_restart._completed_evidence_valid('latency', run)
+
+
+def test_restart_rejects_future_latency_timestamp_even_with_updated_hash(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'latency.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    campaign = tmp_path / 'work_dirs/optimization'
+    controller = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('latency',),
+        gpu_lock_path=tmp_path / 'shared/work_dirs/optimization/gpu.lock',
+        shared_lock_root=tmp_path / 'shared')
+    assert controller.run_next().exit_code == 0
+    run = json.loads(json.dumps(
+        controller.store.read()['runs']['fixture:latency']))
+    artifact = campaign / run['artifact_evidence'][0]['path']
+    value = json.loads(artifact.read_text())
+    value['result']['gpu_lease']['timestamp'] = (
+        '2999-01-01T00:00:00+00:00')
+    artifact.write_text(json.dumps(value))
+    run['artifact_evidence'][0]['sha256'] = _sha256(artifact)
+
+    assert not controller._completed_evidence_valid('latency', run)
+
+
+@pytest.mark.parametrize('validated_at', [
+    'not-a-time',
+    '2000-01-01T00:00:00',
+    '1999-01-01T00:00:00+00:00',
+])
+def test_restart_rejects_malformed_or_replayed_lease_validation_time(
+        tmp_path, monkeypatch, validated_at):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'latency.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    campaign = tmp_path / 'work_dirs/optimization'
+    controller = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('latency',),
+        gpu_lock_path=tmp_path / 'shared/work_dirs/optimization/gpu.lock',
+        shared_lock_root=tmp_path / 'shared')
+    assert controller.run_next().exit_code == 0
+    run = json.loads(json.dumps(
+        controller.store.read()['runs']['fixture:latency']))
+    run['lease_validated_at'] = validated_at
+
+    assert not controller._completed_evidence_valid('latency', run)
 
 
 @pytest.mark.parametrize('stage', ['calibrate', 'evaluate', 'latency'])

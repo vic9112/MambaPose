@@ -191,8 +191,9 @@ def build_source_binding(
 
 def _official_authority_expectations(value: object) -> dict[str, Any]:
     top_fields = {
-        'schema_version', 'dataset', 'split', 'annotation', 'images',
-        'detections'}
+        'schema_version', 'dataset', 'split', 'inventory', 'annotation',
+        'images', 'detections'}
+    inventory_fields = {'path', 'sha256'}
     annotation_fields = {
         'path', 'sha256', 'image_count', 'annotation_count',
         'inventory_asset_id', 'inventory_archive_sha256'}
@@ -205,6 +206,8 @@ def _official_authority_expectations(value: object) -> dict[str, Any]:
             or value.get('schema_version') != 1
             or value.get('dataset') != 'coco'
             or value.get('split') != 'val2017'
+            or not isinstance(value.get('inventory'), Mapping)
+            or set(value['inventory']) != inventory_fields
             or not isinstance(value.get('annotation'), Mapping)
             or set(value['annotation']) != annotation_fields
             or not isinstance(value.get('images'), Mapping)
@@ -215,11 +218,13 @@ def _official_authority_expectations(value: object) -> dict[str, Any]:
     annotation = value['annotation']
     images = value['images']
     detections = value['detections']
+    inventory = value['inventory']
     asset_ids = (
         annotation.get('inventory_asset_id'), images.get('inventory_asset_id'),
         detections.get('inventory_asset_id'))
     if (
             annotation.get('path') != _COCO_ANNOTATION
+            or inventory.get('path') != 'data/inventory.json'
             or images.get('prefix') != 'data/coco/val2017'
             or detections.get('path') != _COCO_DETECTIONS
             or annotation.get('image_count') != _COCO_IMAGE_COUNT
@@ -239,6 +244,7 @@ def _official_authority_expectations(value: object) -> dict[str, Any]:
             'inventory_archive_sha256'),
         'inventory_image_archive_sha256': images.get(
             'inventory_archive_sha256'),
+        'inventory_authority_sha256': inventory.get('sha256'),
     }
     if any(not isinstance(item, str) or not _SHA256.fullmatch(item)
            for item in hashes.values()):
@@ -443,8 +449,9 @@ def validate_coco_val_protocol(
     except (OSError, json.JSONDecodeError) as error:
         raise MetricError(f'cannot verify COCO val assets: {error}') from error
     authority_fields = {
-        'schema_version', 'dataset', 'split', 'annotation', 'images',
-        'detections'}
+        'schema_version', 'dataset', 'split', 'inventory', 'annotation',
+        'images', 'detections'}
+    inventory_authority_fields = {'path', 'sha256'}
     annotation_authority_fields = {
         'path', 'sha256', 'image_count', 'annotation_count',
         'inventory_asset_id', 'inventory_archive_sha256'}
@@ -459,6 +466,8 @@ def validate_coco_val_protocol(
             or authority.get('schema_version') != 1
             or authority.get('dataset') != 'coco'
             or authority.get('split') != 'val2017'
+            or not isinstance(authority.get('inventory'), Mapping)
+            or set(authority['inventory']) != inventory_authority_fields
             or not isinstance(authority.get('annotation'), Mapping)
             or set(authority['annotation']) != annotation_authority_fields
             or not isinstance(authority.get('images'), Mapping)
@@ -469,6 +478,7 @@ def validate_coco_val_protocol(
     annotation_authority = authority['annotation']
     image_authority = authority['images']
     detection_authority = authority['detections']
+    inventory_authority = authority['inventory']
     if (
             any(
                 not isinstance(row['inventory_asset_id'], str)
@@ -481,6 +491,9 @@ def validate_coco_val_protocol(
                 image_authority['inventory_asset_id'],
                 detection_authority['inventory_asset_id']}) != 3
             or isinstance(annotation_authority['image_count'], bool)
+            or inventory_authority.get('path') != 'data/inventory.json'
+            or not isinstance(inventory_authority.get('sha256'), str)
+            or not _SHA256.fullmatch(inventory_authority['sha256'])
             or not isinstance(annotation_authority['image_count'], int)
             or isinstance(image_authority['image_count'], bool)
             or not isinstance(image_authority['image_count'], int)
@@ -562,6 +575,9 @@ def validate_coco_val_protocol(
                 for row in detections)):
         raise MetricError('COCO val detections disagree with authority or image IDs')
     assets = inventory.get('assets') if isinstance(inventory, Mapping) else None
+    inventory_sha256 = _file_sha256(inventory_path)
+    if inventory_sha256 != inventory_authority['sha256']:
+        raise MetricError('data inventory hash disagrees with COCO authority')
     if not isinstance(assets, list):
         raise MetricError('data inventory assets are invalid')
     by_id: dict[str, Mapping[str, Any]] = {}
@@ -607,6 +623,7 @@ def validate_coco_val_protocol(
         'authority_image_count': image_authority['image_count'],
         'authority_annotation_count': annotation_authority['annotation_count'],
         'authority_detection_count': detection_authority['record_count'],
+        'inventory_authority_sha256': inventory_authority['sha256'],
         'annotation_authority_sha256': annotation_authority['sha256'],
         'detection_authority_sha256': detection_authority['sha256'],
         'image_corpus_digest_algorithm': _COCO_IMAGE_DIGEST_ALGORITHM,
@@ -616,7 +633,7 @@ def validate_coco_val_protocol(
         'inventory_image_archive_sha256': image_archive_sha256,
         'inventory_projection': {
             'inventory_path': 'data/inventory.json',
-            'inventory_sha256': _file_sha256(inventory_path),
+            'inventory_sha256': inventory_sha256,
             'annotation_asset_id': annotation_authority[
                 'inventory_asset_id'],
             'annotation_declared_sha256': annotation_authority[
@@ -825,6 +842,7 @@ def _validate_recorded_coco_protocol(
         'authority_path', 'authority_sha256',
         'authority_image_count', 'authority_annotation_count',
         'authority_detection_count',
+        'inventory_authority_sha256',
         'annotation_authority_sha256', 'detection_authority_sha256',
         'image_corpus_digest_algorithm',
         'image_corpus_authority_sha256', 'image_corpus_sha256',
@@ -850,7 +868,8 @@ def _validate_recorded_coco_protocol(
             'authority_sha256', 'annotation_authority_sha256',
             'detection_authority_sha256', 'annotation_sha256',
             'detection_sha256', 'inventory_detection_sha256',
-            'image_corpus_authority_sha256', 'image_corpus_sha256'):
+            'image_corpus_authority_sha256', 'image_corpus_sha256',
+            'inventory_authority_sha256'):
         if not isinstance(value.get(name), str) or not _SHA256.fullmatch(
                 value[name]):
             raise MetricError(f'evaluation protocol {name} is invalid')
@@ -924,6 +943,9 @@ def _validate_recorded_coco_protocol(
             or not isinstance(projection.get('inventory_sha256'), str)
             or not _SHA256.fullmatch(projection['inventory_sha256'])):
         raise MetricError('evaluation inventory projection is invalid')
+    if projection['inventory_sha256'] != value['inventory_authority_sha256']:
+        raise MetricError(
+            'evaluation inventory hash disagrees with corpus authority')
     for name in (
             'annotation_declared_sha256', 'image_declared_sha256',
             'detection_declared_sha256', 'detection_observed_sha256'):
@@ -941,6 +963,7 @@ def _validate_recorded_coco_protocol(
         for name in (
                 'authority_image_count', 'authority_annotation_count',
                 'authority_detection_count',
+                'inventory_authority_sha256',
                 'annotation_authority_sha256',
                 'detection_authority_sha256',
                 'image_corpus_digest_algorithm',
@@ -1106,6 +1129,7 @@ def validate_evaluation_envelope(
             'data_inventory', 'authority_path', 'authority_sha256',
             'authority_image_count', 'authority_annotation_count',
             'authority_detection_count', 'annotation_authority_sha256',
+            'inventory_authority_sha256',
             'detection_authority_sha256', 'image_corpus_digest_algorithm',
             'image_corpus_authority_sha256', 'image_corpus_sha256',
             'inventory_annotation_archive_sha256',
