@@ -138,6 +138,36 @@ def controller_process_tree(roots: Collection[int]) -> tuple[int, ...]:
     return tuple(sorted(allowed))
 
 
+def revalidate_cuda_lease(
+        lease: GpuLease, *, clock: Callable[[], datetime] | None = None,
+        ) -> GpuLease:
+    """Re-prove one live lease immediately at a CUDA execution boundary."""
+    if not isinstance(lease, GpuLease):
+        raise TypeError('CUDA lease revalidation requires a GpuLease')
+    if lease.pid != os.getpid():
+        raise ExternalGpuContention('CUDA lease owner process changed')
+    if _boot_id() != lease.boot_id:
+        raise ExternalGpuContention('CUDA lease boot identity changed')
+    process_tree = controller_process_tree({lease.pid})
+    if lease.pid not in process_tree:
+        raise ExternalGpuContention('CUDA lease owner is no longer live')
+    permitted = set(process_tree)
+    owners = query_compute_processes(lease.device_index)
+    external = tuple(owner for owner in owners if owner.pid not in permitted)
+    if external:
+        rendered = ', '.join(
+            f'pid={owner.pid} memory={owner.used_memory_mib}MiB '
+            f'command={owner.command!r}' for owner in external)
+        raise ExternalGpuContention(
+            f'external compute owner on GPU {lease.device_index}: {rendered}')
+    now = clock if clock is not None else lambda: datetime.now(timezone.utc)
+    timestamp = now()
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError('CUDA lease revalidation clock must be timezone-aware')
+    return replace(
+        lease, timestamp=timestamp.isoformat(), allowed_pids=process_tree)
+
+
 def canonical_gpu_lock_path(repository_root: Path) -> Path:
     """Return the one GPU lock shared by every worktree of a checkout."""
     root = Path(repository_root).resolve(strict=True)

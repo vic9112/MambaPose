@@ -10,6 +10,42 @@ import subprocess
 
 _ALLOWED_IGNORED_ROOTS = frozenset({
     '.pytest_cache', '.venv', 'data', 'pretrained', 'work_dirs'})
+_SOURCE_CAPABLE_SUFFIXES = frozenset({
+    '.bash', '.c', '.cc', '.cpp', '.cu', '.cuh', '.dll', '.dylib', '.fish',
+    '.h', '.hpp', '.ipynb', '.js', '.mjs', '.ps1', '.py', '.pyc', '.pyd',
+    '.sh', '.so', '.toml', '.zsh',
+})
+
+
+def _approved_shared_link(root: Path, relative: Path) -> bool:
+    """Allow only the checkout's explicit environment/asset link boundaries."""
+    if relative.parts in {('.venv',), ('data',), ('pretrained',),
+                          ('work_dirs', 'reproduction')}:
+        return (root / relative).is_symlink()
+    return False
+
+
+def _approved_generated_config(relative: Path) -> bool:
+    """Allow evaluator configs that are atomically regenerated before use."""
+    return (
+        len(relative.parts) >= 4
+        and relative.parts[:2] == ('work_dirs', 'optimization')
+        and relative.name in {'resolved-flip.py', 'resolved-no-flip.py'}
+    )
+
+
+def _ignored_entry_is_source_capable(root: Path, relative: Path) -> bool:
+    lexical = root / relative
+    if lexical.is_symlink():
+        return not _approved_shared_link(root, relative)
+    if _approved_generated_config(relative):
+        return False
+    if relative.suffix.lower() in _SOURCE_CAPABLE_SUFFIXES:
+        return True
+    try:
+        return lexical.is_file() and bool(lexical.stat().st_mode & 0o111)
+    except OSError:
+        return True
 
 
 def _unsafe_ignored_paths(root: Path) -> tuple[str, ...]:
@@ -28,6 +64,8 @@ def _unsafe_ignored_paths(root: Path) -> tuple[str, ...]:
             unsafe.append(os.fsdecode(raw))
             continue
         if relative.parts[0] in _ALLOWED_IGNORED_ROOTS:
+            if _ignored_entry_is_source_capable(root, relative):
+                unsafe.append(relative.as_posix())
             continue
         unsafe.append(relative.as_posix())
     return tuple(sorted(unsafe))
@@ -50,8 +88,8 @@ def clean_git_commit(repository_root: Path) -> str:
     unsafe_ignored = _unsafe_ignored_paths(root)
     if unsafe_ignored:
         raise RuntimeError(
-            'formal optimization rejects ignored entries outside approved '
-            'runtime/asset roots: '
+            'formal optimization rejects ignored source-capable, executable, '
+            'or out-of-scope runtime/asset entries: '
             + ', '.join(unsafe_ignored))
     return subprocess.check_output(
         ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()

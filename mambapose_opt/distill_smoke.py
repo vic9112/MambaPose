@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from contextlib import suppress
 import copy
+import ctypes
 from dataclasses import asdict, dataclass
+from datetime import datetime
+import errno
 import hashlib
 import json
 import math
@@ -13,6 +16,7 @@ from pathlib import Path
 import random
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -21,7 +25,8 @@ import zipfile
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.evaluation import resolve_project_asset_root
 from mambapose_opt.gpu_guard import (
-    GpuLease, canonical_gpu_lock_path, exclusive_cuda_stage)
+    GpuLease, canonical_gpu_lock_path, exclusive_cuda_stage,
+    revalidate_cuda_lease)
 from mambapose_opt.latency import validate_gpu_lease
 from mambapose_opt.source import (
     clean_git_commit, sha256_file, tracked_file_binding)
@@ -72,6 +77,29 @@ def canonical_json_sha256(value: object) -> str:
     payload = json.dumps(
         value, sort_keys=True, separators=(',', ':'), allow_nan=False)
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _timestamp(value: object, *, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f'{label} must be ISO-8601')
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f'{label} must be ISO-8601') from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f'{label} must include a timezone')
+    return parsed
+
+
+def _commit_timestamp(repository_root: Path, commit: str) -> str:
+    try:
+        value = subprocess.check_output(
+            ['git', 'show', '-s', '--format=%cI', commit],
+            cwd=repository_root, text=True).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError('cannot read source commit timestamp') from error
+    _timestamp(value, label='source commit timestamp')
+    return value
 
 
 def _mapping_fields(value: object, expected: set[str], label: str) -> Mapping:
@@ -218,10 +246,17 @@ def _verify_image_corpus(
                 raise ValueError('train2017 archive members are invalid')
             if len(members) != expected_count:
                 raise ValueError('train2017 archive image count is invalid')
-            extracted = {
-                f'{prefix}{path.relative_to(image_root).as_posix()}'
-                for path in image_root.rglob('*.jpg') if path.is_file()
-            }
+            extracted = set()
+            for path in image_root.rglob('*'):
+                if path.is_dir() and not path.is_symlink():
+                    continue
+                if (
+                        path.is_symlink() or not path.is_file()
+                        or path.suffix.lower() != '.jpg'):
+                    raise ValueError(
+                        'extracted train2017 corpus contains unexpected entries')
+                extracted.add(
+                    f'{prefix}{path.relative_to(image_root).as_posix()}')
             if extracted != set(names):
                 raise ValueError('extracted train2017 corpus file set is invalid')
 
@@ -362,6 +397,17 @@ def _checkpoint_path(
     if relative.parts[:2] != ('work_dirs', 'reproduction'):
         raise ValueError(f'{label} must be under work_dirs/reproduction')
     lexical = repository_root / relative
+    cursor = repository_root
+    for index, part in enumerate(relative.parts):
+        cursor = cursor / part
+        if not cursor.is_symlink():
+            continue
+        allowed_shared = relative.parts[:index + 1] == (
+            'work_dirs', 'reproduction')
+        expected_shared = asset_root / 'work_dirs/reproduction'
+        if not allowed_shared or cursor.resolve(strict=True) != (
+                expected_shared.resolve(strict=True)):
+            raise ValueError(f'{label} path contains an unapproved symlink')
     try:
         effective = lexical.resolve(strict=True)
         effective.relative_to(asset_root / 'work_dirs/reproduction')
@@ -431,7 +477,11 @@ def build_smoke_preflight(
         repository_root=root,
         asset_root=asset_root,
         config_path=config_relative,
-        source={'git_commit': commit, 'config': config_binding},
+        source={
+            'git_commit': commit,
+            'git_commit_timestamp': _commit_timestamp(root, commit),
+            'config': config_binding,
+        },
         resolved_config_sha256=resolved,
         experiment_id=experiment_id,
         teacher_checkpoint=teacher,
@@ -462,8 +512,11 @@ def _validate_smoke_schema(value: object) -> Mapping:
     execution = _mapping_fields(top['execution'], {
         'python_seed', 'numpy_seed', 'torch_seed',
         'deterministic_algorithms', 'python_dont_write_bytecode',
-        'vram_scope'}, 'smoke execution')
-    if execution != {
+        'vram_scope', 'completed_at'}, 'smoke execution')
+    static_execution = dict(execution)
+    completed_at = _timestamp(
+        static_execution.pop('completed_at'), label='smoke completed_at')
+    if static_execution != {
             'python_seed': 0,
             'numpy_seed': 0,
             'torch_seed': 0,
@@ -472,10 +525,12 @@ def _validate_smoke_schema(value: object) -> Mapping:
             'vram_scope': 'batch-1-smoke-not-training-batch'}:
         raise ValueError('smoke deterministic execution contract is invalid')
 
-    source = _mapping_fields(
-        top['source'], {'git_commit', 'config', 'resolved_config_sha256'},
-        'smoke source')
+    source = _mapping_fields(top['source'], {
+        'git_commit', 'git_commit_timestamp', 'config',
+        'resolved_config_sha256'}, 'smoke source')
     _hex(source['git_commit'], label='source git_commit', commit=True)
+    commit_at = _timestamp(
+        source['git_commit_timestamp'], label='source git_commit_timestamp')
     _file_binding(source['config'], label='source config')
     _hex(source['resolved_config_sha256'], label='resolved config sha256')
     inputs = _mapping_fields(
@@ -544,6 +599,10 @@ def _validate_smoke_schema(value: object) -> Mapping:
     lease_hash = _hex(gpu['lease_sha256'], label='GPU lease sha256')
     if canonical_json_sha256(lease) != lease_hash:
         raise ValueError('GPU lease sha256 mismatch')
+    lease_at = _timestamp(lease['timestamp'], label='GPU lease timestamp')
+    if lease_at < commit_at or completed_at != lease_at:
+        raise ValueError(
+            'smoke GPU lease must be execution-bound and after its source commit')
 
     checks = _mapping_fields(top['checks'], {
         'losses', 'teacher_frozen', 'teacher_gradient_tensors',
@@ -640,6 +699,10 @@ def _verify_artifact_files(
         git_commit=value['source']['git_commit'])
     if source_binding != value['source']['config']:
         raise ValueError('source config does not match its clean commit')
+    observed_commit_timestamp = _commit_timestamp(
+        repository_root, value['source']['git_commit'])
+    if observed_commit_timestamp != value['source']['git_commit_timestamp']:
+        raise ValueError('source commit timestamp mismatch')
     for field in ('config',):
         _verify_bound_file(
             repository_root, value['source'][field], label=f'source {field}')
@@ -671,18 +734,92 @@ def _verify_artifact_files(
     if len(matches) != 1 or matches[0].get('file_name') != file_name:
         raise ValueError('batch image identity disagrees with train2017 annotation')
 
+    # Reconstruct every derived authority claim from the tracked config and
+    # live official archives rather than trusting well-formed digest strings.
+    from mmengine.config import Config
+
+    config_path = repository_root / value['source']['config']['path']
+    config = Config.fromfile(config_path)
+    resolved = canonical_json_sha256(_canonicalize(config.to_dict()))
+    if resolved != value['source']['resolved_config_sha256']:
+        raise ValueError('resolved config sha256 mismatch')
+    model = config.get('model')
+    if (
+            not isinstance(model, Mapping)
+            or model.get('type') != 'MambaPoseHeatmapDistiller'):
+        raise ValueError('tracked config does not define the smoke distiller')
+    for role in ('teacher', 'student'):
+        path_key = f'{role}_checkpoint'
+        sha_key = f'{path_key}_sha256'
+        relative, digest = _file_binding(
+            value['inputs'][path_key], label=path_key)
+        if model.get(path_key) != relative.as_posix() \
+                or model.get(sha_key) != digest:
+            raise ValueError(f'{role} checkpoint disagrees with tracked config')
+
+    loader = config.get('train_dataloader')
+    if not isinstance(loader, Mapping):
+        raise ValueError('tracked config has no train_dataloader')
+    original_batch = loader.get('batch_size')
+    if original_batch != value['data']['original_batch_size']:
+        raise ValueError('original batch size disagrees with tracked config')
+    override = canonical_json_sha256(_canonicalize(
+        smoke_dataloader_config(loader)))
+    if override != value['data']['dataloader_override_sha256']:
+        raise ValueError('smoke dataloader override sha256 mismatch')
+    asset_root = resolve_project_asset_root(repository_root)
+    assets = validate_coco_train_assets_at_root(
+        config.get('smoke_data_authority'), loader.get('dataset'), asset_root)
+    expected_data = {
+        'inventory': {
+            'path': assets.inventory_path,
+            'sha256': assets.inventory_sha256,
+        },
+        'image_archive': {
+            'path': assets.image_archive_path,
+            'sha256': assets.image_archive_sha256,
+        },
+        'annotation_archive': {
+            'path': assets.annotation_archive_path,
+            'sha256': assets.annotation_archive_sha256,
+        },
+        'annotation': {
+            'path': assets.annotation_path,
+            'sha256': assets.annotation_sha256,
+        },
+    }
+    for field, expected in expected_data.items():
+        if value['data'][field] != expected:
+            raise ValueError(f'{field} disagrees with tracked config authority')
+    if (
+            value['data']['corpus_sha256'] != assets.corpus_sha256
+            or value['data']['corpus_image_count'] != assets.image_count):
+        raise ValueError('COCO train2017 corpus authority mismatch')
+
 
 def load_smoke_artifact(
         path: Path | str, *, repository_root: Path) -> dict[str, Any]:
     """Load and rehash every file bound by one strict smoke artifact."""
     root = Path(repository_root).resolve(strict=True)
-    artifact = Path(path).resolve(strict=True)
+    supplied = Path(path)
+    lexical = supplied if supplied.is_absolute() else root / supplied
+    lexical = lexical.absolute()
+    if lexical.is_symlink():
+        raise ValueError('smoke artifact must not be a symlink')
     try:
-        relative = artifact.relative_to(root)
+        relative = lexical.relative_to(root)
     except ValueError as error:
         raise ValueError('smoke artifact must be inside the repository') from error
     if relative.parts[:3] != _OUTPUT_PREFIX or relative.name != 'smoke.json':
         raise ValueError('smoke artifact path is outside accuracy-first outputs')
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError('smoke artifact path must not contain symlinks')
+    artifact = lexical.resolve(strict=True)
+    if artifact != lexical:
+        raise ValueError('smoke artifact path changed during resolution')
     try:
         value = json.loads(artifact.read_text(encoding='utf-8'))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -708,6 +845,35 @@ def _atomic_json(path: Path, value: object) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish one path without replacing a concurrent target."""
+    source = Path(source)
+    destination = Path(destination)
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = library.renameat2
+    except AttributeError as error:
+        raise RuntimeError(
+            'atomic no-replace publication requires renameat2') from error
+    renameat2.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint)
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    if result != 0:
+        code = ctypes.get_errno()
+        if code in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(
+                code, os.strerror(code), str(destination))
+        raise OSError(code, os.strerror(code), str(destination))
+    directory_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _revalidate_preflight(preflight: SmokePreflight) -> None:
@@ -876,6 +1042,7 @@ def _execute_smoke(
         batch_binding = _packed_batch_binding(
             batch, asset_root=preflight.asset_root)
 
+        entry_lease = revalidate_cuda_lease(lease)
         if not torch.cuda.is_available():
             raise RuntimeError('CUDA is unavailable after exclusive admission')
         if runtime_index < 0 or runtime_index >= torch.cuda.device_count():
@@ -951,7 +1118,7 @@ def _execute_smoke(
             'teacher_checkpoint_sha256': preflight.teacher_checkpoint_sha256,
             'student_checkpoint_sha256': preflight.student_checkpoint_sha256,
             'packed_batch_sha256': batch_binding['packed_sha256'],
-            'gpu_lease_sha256': canonical_json_sha256(asdict(lease)),
+            'gpu_lease_sha256': canonical_json_sha256(asdict(entry_lease)),
             'execution': {
                 'python_seed': 0,
                 'numpy_seed': 0,
@@ -1007,7 +1174,8 @@ def _execute_smoke(
         if peak_allocated <= 0 or peak_reserved <= 0:
             raise RuntimeError('CUDA peak memory counters are invalid')
 
-        lease_record = asdict(lease)
+        execution_lease = revalidate_cuda_lease(entry_lease)
+        lease_record = asdict(execution_lease)
         lease_record['allowed_pids'] = list(lease_record['allowed_pids'])
         output_full = output_root / 'distiller.pth'
         output_student = output_root / 'student.pth'
@@ -1020,7 +1188,10 @@ def _execute_smoke(
                 'latency': False,
                 'training_batch_vram': False,
             },
-            'execution': full_meta['execution'],
+            'execution': {
+                **full_meta['execution'],
+                'completed_at': execution_lease.timestamp,
+            },
             'source': {
                 **preflight.source,
                 'resolved_config_sha256': preflight.resolved_config_sha256,
@@ -1133,33 +1304,36 @@ def run_distill_smoke(
     lock_path = canonical_gpu_lock_path(root)
     stage_id = f'distill-smoke:{preflight.experiment_id}'
     output.parent.mkdir(parents=True, exist_ok=True)
-    staging: Path | None = None
+    staging = Path(tempfile.mkdtemp(
+        prefix=f'.{output.name}.', suffix='.tmp', dir=output.parent))
     published = False
-    with exclusive_cuda_stage(
-            lock_path, device_index, {os.getpid()}, stage_id=stage_id) as lease:
-        if os.path.lexists(output):
-            raise FileExistsError(f'refusing to overwrite output: {relative}')
-        staging = Path(tempfile.mkdtemp(
-            prefix=f'.{output.name}.', suffix='.tmp', dir=output.parent))
-        try:
+    try:
+        # Leave the lease successfully (including heartbeat shutdown) before
+        # validating and publishing the completed CPU-readable artifact.
+        with exclusive_cuda_stage(
+                lock_path, device_index, {os.getpid()},
+                stage_id=stage_id) as lease:
+            if os.path.lexists(output):
+                raise FileExistsError(
+                    f'refusing to overwrite output: {relative}')
             record = _execute_smoke(
                 preflight, staging, output, lease, device_index)
-            validated = _validate_smoke_schema(record)
-            _atomic_json(staging / 'smoke.json', validated)
-            _verify_artifact_files(
-                validated, repository_root=root,
-                physical_artifact_root=staging,
-                logical_artifact_root=output)
-            staging.rename(output)
-            published = True
-            load_smoke_artifact(output / 'smoke.json', repository_root=root)
-        except BaseException:
-            if published and output.exists():
-                with suppress(OSError):
-                    output.rename(staging)
-                    published = False
-            raise
-        finally:
-            if not published and staging is not None:
-                shutil.rmtree(staging, ignore_errors=True)
+        validated = _validate_smoke_schema(record)
+        _atomic_json(staging / 'smoke.json', validated)
+        _verify_artifact_files(
+            validated, repository_root=root,
+            physical_artifact_root=staging,
+            logical_artifact_root=output)
+        _rename_noreplace(staging, output)
+        published = True
+        load_smoke_artifact(output / 'smoke.json', repository_root=root)
+    except BaseException:
+        if published and os.path.lexists(output):
+            with suppress(OSError):
+                _rename_noreplace(output, staging)
+                published = False
+        raise
+    finally:
+        if not published:
+            shutil.rmtree(staging, ignore_errors=True)
     return output / 'smoke.json'

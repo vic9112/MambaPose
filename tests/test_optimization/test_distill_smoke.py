@@ -149,19 +149,50 @@ def test_train_asset_validation_rejects_mutated_extracted_image(tmp_path):
         validate(authority, dataset, root)
 
 
+def test_train_asset_validation_rejects_extra_non_archive_file(tmp_path):
+    root, authority, dataset, validate = _train_fixture(tmp_path)
+    (root / 'data/coco/train2017/unexpected.py').write_text(
+        'raise SystemExit\n')
+
+    with pytest.raises(ValueError, match='extracted train2017 corpus'):
+        validate(authority, dataset, root)
+
+
+@pytest.mark.parametrize('kind', ['direct', 'parent'])
+def test_checkpoint_path_rejects_unapproved_symlink(tmp_path, kind):
+    from mambapose_opt.distill_smoke import _checkpoint_path
+
+    root = tmp_path / 'repo'
+    target = root / 'work_dirs/reproduction/real/real.pth'
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'checkpoint')
+    if kind == 'direct':
+        alias = root / 'work_dirs/reproduction/alias.pth'
+        alias.symlink_to(target)
+        supplied = 'work_dirs/reproduction/alias.pth'
+    else:
+        alias = root / 'work_dirs/reproduction/alias-parent'
+        alias.symlink_to(target.parent, target_is_directory=True)
+        supplied = 'work_dirs/reproduction/alias-parent/real.pth'
+
+    with pytest.raises(ValueError, match='symlink'):
+        _checkpoint_path(
+            root, root, supplied,
+            label='student checkpoint')
+
+
 def _valid_artifact(tmp_path: Path):
-    from mambapose_opt.distill_smoke import canonical_json_sha256
+    from mmengine.config import Config
+    from mambapose_opt.distill_smoke import (
+        _canonicalize, canonical_json_sha256, smoke_dataloader_config,
+        validate_coco_train_assets_at_root)
 
     root = tmp_path / 'repo'
     run = root / 'work_dirs/optimization/accuracy-first/smoke-fixture'
     run.mkdir(parents=True)
     files = {
-        'configs/optimization/accuracy_first/distill_s_v1_from_b.py': b'config',
         'work_dirs/reproduction/runs/coco-b/teacher.pth': b'teacher',
         'work_dirs/reproduction/runs/coco-s-v1/student.pth': b'student',
-        'data/inventory.json': b'inventory',
-        'work_dirs/reproduction/downloads/train2017.zip': b'images-archive',
-        'work_dirs/reproduction/downloads/annotations.zip': b'ann-archive',
         'data/coco/annotations/person_keypoints_train2017.json': json.dumps({
             'images': [{
                 'id': 1,
@@ -180,10 +211,80 @@ def _valid_artifact(tmp_path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
 
+    image_archive = root / 'work_dirs/reproduction/downloads/train2017.zip'
+    annotation_archive = (
+        root / 'work_dirs/reproduction/downloads/annotations.zip')
+    image_member = 'train2017/000000000001.jpg'
+    annotation_member = 'annotations/person_keypoints_train2017.json'
+    _write_zip(image_archive, {image_member: b'batch-image'})
+    _write_zip(annotation_archive, {
+        annotation_member: files[
+            'data/coco/annotations/person_keypoints_train2017.json'],
+    })
+    inventory = root / 'data/inventory.json'
+    inventory.write_text(json.dumps({
+        'schema_version': 1,
+        'assets': [
+            {
+                'id': 'coco-train2017',
+                'path': 'work_dirs/reproduction/downloads/train2017.zip',
+                'sha256': _sha256(image_archive),
+                'required_paths': ['data/coco/train2017'],
+            },
+            {
+                'id': 'coco-annotations',
+                'path': 'work_dirs/reproduction/downloads/annotations.zip',
+                'sha256': _sha256(annotation_archive),
+                'required_paths': [
+                    'data/coco/annotations/person_keypoints_train2017.json'],
+            },
+        ],
+    }, sort_keys=True))
+
+    config_relative = Path(
+        'configs/optimization/accuracy_first/distill_s_v1_from_b.py')
+    config_path = root / config_relative
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "experiment_id = 'distill-s-v1-from-coco-b'\n"
+        "model = dict(\n"
+        "    type='MambaPoseHeatmapDistiller',\n"
+        "    teacher_checkpoint=(\n"
+        "        'work_dirs/reproduction/runs/coco-b/teacher.pth'),\n"
+        f"    teacher_checkpoint_sha256='{_sha256(root / 'work_dirs/reproduction/runs/coco-b/teacher.pth')}',\n"
+        "    student_checkpoint=(\n"
+        "        'work_dirs/reproduction/runs/coco-s-v1/student.pth'),\n"
+        f"    student_checkpoint_sha256='{_sha256(root / 'work_dirs/reproduction/runs/coco-s-v1/student.pth')}')\n"
+        "train_dataloader = dict(\n"
+        "    batch_size=128, num_workers=4, persistent_workers=True,\n"
+        "    sampler=dict(type='DefaultSampler', shuffle=True),\n"
+        "    dataset=dict(\n"
+        "        type='CocoDataset', data_root='data/coco/',\n"
+        "        data_mode='topdown',\n"
+        "        ann_file='annotations/person_keypoints_train2017.json',\n"
+        "        data_prefix=dict(img='train2017/'),\n"
+        "        pipeline=[dict(type='LoadImage'),\n"
+        "                  dict(type='PackPoseInputs')]))\n"
+        "smoke_data_authority = dict(\n"
+        "    inventory_path='data/inventory.json',\n"
+        f"    inventory_sha256='{_sha256(inventory)}',\n"
+        "    image_archive_path=(\n"
+        "        'work_dirs/reproduction/downloads/train2017.zip'),\n"
+        f"    image_archive_sha256='{_sha256(image_archive)}',\n"
+        "    image_inventory_asset_id='coco-train2017',\n"
+        "    image_prefix='train2017/', image_count=1,\n"
+        "    annotation_archive_path=(\n"
+        "        'work_dirs/reproduction/downloads/annotations.zip'),\n"
+        f"    annotation_archive_sha256='{_sha256(annotation_archive)}',\n"
+        "    annotation_inventory_asset_id='coco-annotations',\n"
+        "    annotation_path=(\n"
+        "        'data/coco/annotations/person_keypoints_train2017.json'),\n"
+        "    annotation_member=(\n"
+        "        'annotations/person_keypoints_train2017.json'))\n")
+
     subprocess.run(['git', 'init', '-q'], cwd=root, check=True)
     subprocess.run([
-        'git', 'add',
-        'configs/optimization/accuracy_first/distill_s_v1_from_b.py',
+        'git', 'add', config_relative.as_posix(),
     ], cwd=root, check=True)
     subprocess.run([
         'git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
@@ -191,12 +292,18 @@ def _valid_artifact(tmp_path: Path):
     ], cwd=root, check=True)
     commit = subprocess.check_output(
         ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
+    commit_timestamp = subprocess.check_output(
+        ['git', 'show', '-s', '--format=%cI', commit],
+        cwd=root, text=True).strip()
+    config = Config.fromfile(config_path)
+    authority = validate_coco_train_assets_at_root(
+        config.smoke_data_authority, config.train_dataloader.dataset, root)
 
     lease = {
         'stage_id': 'distill-smoke:distill-s-v1-from-coco-b',
         'pid': 42,
         'boot_id': '12345678-1234-5678-1234-567812345678',
-        'timestamp': '2026-08-27T12:00:00+00:00',
+        'timestamp': commit_timestamp,
         'device_index': 0,
         'allowed_pids': [42],
         'lease_id': '1' * 64,
@@ -220,13 +327,16 @@ def _valid_artifact(tmp_path: Path):
             'deterministic_algorithms': True,
             'python_dont_write_bytecode': True,
             'vram_scope': 'batch-1-smoke-not-training-batch',
+            'completed_at': commit_timestamp,
         },
         'source': {
             'git_commit': commit,
+            'git_commit_timestamp': commit_timestamp,
             'config': file_binding(
                 'configs/optimization/accuracy_first/'
                 'distill_s_v1_from_b.py'),
-            'resolved_config_sha256': 'b' * 64,
+            'resolved_config_sha256': canonical_json_sha256(
+                _canonicalize(config.to_dict())),
         },
         'inputs': {
             'teacher_checkpoint': file_binding(
@@ -242,18 +352,28 @@ def _valid_artifact(tmp_path: Path):
             'smoke_batch_size': 1,
             'smoke_num_workers': 0,
             'smoke_persistent_workers': False,
-            'inventory': file_binding('data/inventory.json'),
-            'image_archive': file_binding(
-                'work_dirs/reproduction/downloads/train2017.zip'),
-            'annotation_archive': file_binding(
-                'work_dirs/reproduction/downloads/annotations.zip'),
-            'annotation': file_binding(
-                'data/coco/annotations/person_keypoints_train2017.json'),
+            'inventory': {
+                'path': authority.inventory_path,
+                'sha256': authority.inventory_sha256,
+            },
+            'image_archive': {
+                'path': authority.image_archive_path,
+                'sha256': authority.image_archive_sha256,
+            },
+            'annotation_archive': {
+                'path': authority.annotation_archive_path,
+                'sha256': authority.annotation_archive_sha256,
+            },
+            'annotation': {
+                'path': authority.annotation_path,
+                'sha256': authority.annotation_sha256,
+            },
             'corpus_digest_algorithm': (
                 'sha256-zip-member-and-extracted-content-v1'),
-            'corpus_sha256': 'c' * 64,
-            'corpus_image_count': 118287,
-            'dataloader_override_sha256': 'd' * 64,
+            'corpus_sha256': authority.corpus_sha256,
+            'corpus_image_count': authority.image_count,
+            'dataloader_override_sha256': canonical_json_sha256(_canonicalize(
+                smoke_dataloader_config(config.train_dataloader))),
             'batch': {
                 'size': 1,
                 'image_ids': [1],
@@ -308,6 +428,89 @@ def test_smoke_artifact_strict_schema_and_bound_files_round_trip(tmp_path):
     root, artifact, value = _valid_artifact(tmp_path)
 
     assert load_smoke_artifact(artifact, repository_root=root) == value
+
+
+def test_smoke_artifact_rejects_cross_run_json_symlink(tmp_path):
+    from mambapose_opt.distill_smoke import load_smoke_artifact
+
+    root, artifact, _ = _valid_artifact(tmp_path)
+    alias = artifact.parents[1] / 'alias-run'
+    alias.mkdir()
+    (alias / 'smoke.json').symlink_to(artifact)
+
+    with pytest.raises(ValueError, match='symlink'):
+        load_smoke_artifact(alias / 'smoke.json', repository_root=root)
+
+
+def test_smoke_artifact_rejects_precommit_gpu_lease_timestamp(tmp_path):
+    from mambapose_opt.distill_smoke import (
+        canonical_json_sha256, load_smoke_artifact)
+
+    root, artifact, value = _valid_artifact(tmp_path)
+    value['gpu']['lease']['timestamp'] = '2000-01-01T00:00:00+00:00'
+    value['gpu']['lease_sha256'] = canonical_json_sha256(
+        value['gpu']['lease'])
+    value['execution']['completed_at'] = value['gpu']['lease']['timestamp']
+    artifact.write_text(json.dumps(value))
+
+    with pytest.raises(ValueError, match='execution-bound|source commit'):
+        load_smoke_artifact(artifact, repository_root=root)
+
+
+@pytest.mark.parametrize('field', [
+    'resolved_config_sha256', 'corpus_sha256', 'dataloader_override_sha256',
+])
+def test_smoke_artifact_recomputes_declared_authority(tmp_path, field):
+    from mambapose_opt.distill_smoke import load_smoke_artifact
+
+    root, artifact, value = _valid_artifact(tmp_path)
+    if field == 'resolved_config_sha256':
+        value['source'][field] = '9' * 64
+    else:
+        value['data'][field] = '9' * 64
+    artifact.write_text(json.dumps(value))
+
+    with pytest.raises(ValueError, match='config|corpus|dataloader'):
+        load_smoke_artifact(artifact, repository_root=root)
+
+
+def test_publication_rename_is_atomic_no_replace(tmp_path):
+    from mambapose_opt.distill_smoke import _rename_noreplace
+
+    staging = tmp_path / 'staging'
+    destination = tmp_path / 'destination'
+    staging.mkdir()
+    destination.mkdir()
+    (staging / 'new').write_text('new')
+    (destination / 'existing').write_text('existing')
+
+    with pytest.raises(FileExistsError):
+        _rename_noreplace(staging, destination)
+    assert (staging / 'new').read_text() == 'new'
+    assert (destination / 'existing').read_text() == 'existing'
+
+
+def test_cuda_boundary_revalidation_rejects_new_external_owner(monkeypatch):
+    from mambapose_opt.gpu_guard import (
+        ExternalGpuContention, GpuLease, GpuProcess,
+        revalidate_cuda_lease)
+
+    lease = GpuLease(
+        stage_id='distill-smoke:fixture', pid=os.getpid(),
+        boot_id='12345678-1234-5678-1234-567812345678',
+        timestamp='2026-08-27T12:00:00+00:00', device_index=0,
+        allowed_pids=(os.getpid(),), lease_id='1' * 64)
+    monkeypatch.setattr(
+        'mambapose_opt.gpu_guard._boot_id', lambda: lease.boot_id)
+    monkeypatch.setattr(
+        'mambapose_opt.gpu_guard.controller_process_tree',
+        lambda roots: (os.getpid(),))
+    monkeypatch.setattr(
+        'mambapose_opt.gpu_guard.query_compute_processes',
+        lambda device: (GpuProcess(999999, 1024, 'external'),))
+
+    with pytest.raises(ExternalGpuContention, match='external compute owner'):
+        revalidate_cuda_lease(lease)
 
 
 @pytest.mark.parametrize('tamper', [
