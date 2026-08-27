@@ -1,0 +1,9 @@
+[Unit]
+Description=Observe MambaPose optimization health without controlling it
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/vicchen/workspace/MambaPose
+Environment=PYTHONNOUSERSITE=1
+ExecStart=/home/vicchen/workspace/MambaPose/.venv/bin/python /home/vicchen/workspace/MambaPose/tools/optimization/observe.py
+UMask=0027
