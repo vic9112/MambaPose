@@ -102,6 +102,11 @@ def load_candidate_manifest(path: Path | str) -> tuple[CandidateSpec, ...]:
     except (OSError, json.JSONDecodeError) as error:
         raise CandidateManifestError(f'cannot load candidate manifest: {error}') from error
 
+    return parse_candidate_manifest(value)
+
+
+def parse_candidate_manifest(value: object) -> tuple[CandidateSpec, ...]:
+    """Validate a decoded manifest, including a blob loaded from Git."""
     if not isinstance(value, Mapping):
         raise CandidateManifestError('manifest must be an object')
     if set(value) != {'schema_version', 'candidates'}:

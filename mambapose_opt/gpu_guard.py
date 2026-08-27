@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import fcntl
 import json
 import os
 from pathlib import Path
 import subprocess
-from typing import Collection, Iterator
+import threading
+from typing import Callable, Collection, Iterator
 
 
 PROC_ROOT = Path('/proc')
@@ -39,6 +40,13 @@ class GpuLease:
     timestamp: str
     device_index: int
     allowed_pids: tuple[int, ...]
+
+
+def _write_lease(stream, lease: GpuLease) -> None:
+    payload = (json.dumps(asdict(lease), sort_keys=True) + '\n').encode('utf-8')
+    os.pwrite(stream.fileno(), payload, 0)
+    os.ftruncate(stream.fileno(), len(payload))
+    os.fsync(stream.fileno())
 
 
 def _boot_id() -> str:
@@ -131,11 +139,29 @@ def controller_process_tree(roots: Collection[int]) -> tuple[int, ...]:
 @contextmanager
 def exclusive_cuda_stage(
         lock_path: Path, device_index: int, allowed_pids: Collection[int],
-        *, stage_id: str = 'cuda-stage') -> Iterator[GpuLease]:
+        *, stage_id: str = 'cuda-stage', heartbeat_interval: float = 30.0,
+        clock: Callable[[], datetime] | None = None,
+        heartbeat_wait: Callable[[threading.Event, float], bool] | None = None,
+        ) -> Iterator[GpuLease]:
     """Hold the shared lock and reject every non-controller GPU owner."""
+    if (
+            isinstance(heartbeat_interval, bool)
+            or not isinstance(heartbeat_interval, (int, float))
+            or heartbeat_interval <= 0):
+        raise ValueError('heartbeat_interval must be positive')
+    now = clock if clock is not None else lambda: datetime.now(timezone.utc)
+    wait = (
+        heartbeat_wait if heartbeat_wait is not None
+        else lambda stop, interval: stop.wait(interval))
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    stream = lock_path.open('a+', encoding='utf-8')
+    try:
+        stream = lock_path.open('r+', encoding='utf-8')
+    except FileNotFoundError:
+        try:
+            stream = lock_path.open('x+', encoding='utf-8')
+        except FileExistsError:
+            stream = lock_path.open('r+', encoding='utf-8')
     try:
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -158,17 +184,39 @@ def exclusive_cuda_stage(
             stage_id=stage_id,
             pid=os.getpid(),
             boot_id=_boot_id(),
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=now().isoformat(),
             device_index=device_index,
             allowed_pids=process_tree,
         )
-        stream.seek(0)
-        stream.truncate()
-        json.dump(asdict(lease), stream, sort_keys=True)
-        stream.write('\n')
-        stream.flush()
-        os.fsync(stream.fileno())
-        yield lease
+        _write_lease(stream, lease)
+        stop = threading.Event()
+        heartbeat_errors: list[BaseException] = []
+
+        def refresh() -> None:
+            try:
+                while not wait(stop, float(heartbeat_interval)):
+                    refreshed = replace(lease, timestamp=now().isoformat())
+                    _write_lease(stream, refreshed)
+            except BaseException as error:
+                heartbeat_errors.append(error)
+                stop.set()
+
+        heartbeat = threading.Thread(
+            target=refresh, name=f'gpu-lease-{stage_id}', daemon=True)
+        heartbeat.start()
+        body_failed = False
+        try:
+            yield lease
+        except BaseException:
+            body_failed = True
+            raise
+        finally:
+            stop.set()
+            heartbeat.join(timeout=max(1.0, float(heartbeat_interval) + 1.0))
+            if heartbeat.is_alive() and not body_failed:
+                raise RuntimeError('GPU lease heartbeat did not stop')
+            if heartbeat_errors and not body_failed:
+                raise RuntimeError('GPU lease heartbeat failed') from heartbeat_errors[0]
     finally:
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)

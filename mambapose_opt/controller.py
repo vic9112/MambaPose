@@ -27,7 +27,9 @@ from .gpu_guard import (
     GpuLease,
     exclusive_cuda_stage,
 )
-from .evaluation import MetricError, validate_evaluation_envelope
+from .evaluation import (
+    MetricError, resolve_artifact_source, validate_evaluation_envelope,
+    validate_latency_envelope)
 from .schema import CandidateSpec
 
 
@@ -170,6 +172,7 @@ class OptimizationController:
             runner: StageRunner,
             *,
             repository_root: Path | None = None,
+            manifest_path: Path | None = None,
             stages: Sequence[str] = STAGES,
             device_index: int = 0,
             gpu_lock_path: Path | None = None,
@@ -194,6 +197,8 @@ class OptimizationController:
         self.candidate = candidate
         self.runner = runner
         self.repository_root = Path(repository_root or Path.cwd()).resolve()
+        self.manifest_path = Path(
+            manifest_path or self.repository_root / 'optimization/candidates.json')
         self.root = Path(root).resolve()
         try:
             self.root.relative_to(self.repository_root)
@@ -395,23 +400,61 @@ class OptimizationController:
                 f'{stage} artifact result must be an object')
         if stage == 'evaluate':
             try:
+                source, source_candidate, authority = resolve_artifact_source(
+                    value, repository_root=self.repository_root,
+                    expected_manifest_path=self.manifest_path)
+                if source_candidate != self.candidate:
+                    raise MetricError(
+                        'evaluate source candidate disagrees with controller')
                 validate_evaluation_envelope(
                     value,
                     expected_candidate_id=self.candidate.id,
                     expected_route=self.candidate.route,
                     expected_checkpoint_sha256=(
                         self.candidate.checkpoint_sha256),
-                    expected_data_inventory_sha256=_sha256(
-                        self.repository_root / 'data/inventory.json'),
-                    expected_authority_sha256=_sha256(
-                        self.repository_root /
-                        'optimization/coco_val2017_authority.json'),
+                    expected_data_inventory_sha256=(
+                        source['data_inventory_sha256']),
+                    expected_authority_sha256=source['authority_sha256'],
                     expected_source_config=self.candidate.config.as_posix(),
                     expected_checkpoint=self.candidate.checkpoint.as_posix(),
+                    expected_seed=self.candidate.seed,
+                    expected_git_commit=source['git_commit'],
+                    expected_source_binding=source,
+                    expected_authority=authority,
+                    require_source_binding=True,
                 )
             except (MetricError, OSError) as error:
                 raise ArtifactValidationError(
                     f'evaluate artifact is invalid: {error}') from error
+        if stage == 'latency':
+            try:
+                source, source_candidate, authority = resolve_artifact_source(
+                    value, repository_root=self.repository_root,
+                    expected_manifest_path=self.manifest_path)
+                if source_candidate != self.candidate:
+                    raise MetricError(
+                        'latency source candidate disagrees with controller')
+                validate_latency_envelope(
+                    value,
+                    expected_candidate_id=self.candidate.id,
+                    expected_route=self.candidate.route,
+                    expected_checkpoint_sha256=(
+                        self.candidate.checkpoint_sha256),
+                    expected_data_inventory_sha256=(
+                        source['data_inventory_sha256']),
+                    expected_authority_sha256=source['authority_sha256'],
+                    expected_source_config=self.candidate.config.as_posix(),
+                    expected_checkpoint=self.candidate.checkpoint.as_posix(),
+                    expected_device_index=self.device_index,
+                    expected_git_commit=source['git_commit'],
+                    expected_config_sha256=source['config_sha256'],
+                    expected_source_binding=source,
+                    expected_authority=authority,
+                    require_source_binding=True,
+                )
+            except (MetricError, OSError) as error:
+                raise ArtifactValidationError(
+                    f'latency artifact is invalid: {error}') from error
         return 'optimization-stage-envelope-v1'
 
     def _validate_artifacts(

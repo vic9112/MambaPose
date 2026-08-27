@@ -286,6 +286,7 @@ def main() -> int:
                 candidate,
                 runner,
                 repository_root=REPO_ROOT,
+                manifest_path=args.manifest,
                 device_index=args.device_index,
                 gpu_lock_path=gpu_lock_path,
                 shared_lock_root=shared_lock_root,

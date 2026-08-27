@@ -8,10 +8,13 @@ import json
 import math
 import re
 from pathlib import Path
+import subprocess
 from types import MappingProxyType
 from typing import Any, Mapping
 
 from mambapose_opt.latency import LatencyError, validate_gpu_lease
+from mambapose_opt.schema import (
+    CandidateManifestError, CandidateSpec, parse_candidate_manifest)
 
 
 _SHA256 = re.compile(r'^[0-9a-f]{64}$')
@@ -39,6 +42,15 @@ _COCO_DETECTIONS = (
     'data/coco/person_detection_results/'
     'COCO_val2017_detections_AP_H_56_person.json')
 _COCO_AUTHORITY = 'optimization/coco_val2017_authority.json'
+_COCO_IMAGE_DIGEST_ALGORITHM = 'sha256-filename-size-content-v1'
+_COCO_IMAGE_COUNT = 5000
+_COCO_ANNOTATION_COUNT = 11004
+_COCO_DETECTION_COUNT = 104125
+_TRUSTED_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_SOURCE_BINDING_FIELDS = {
+    'git_commit', 'manifest_path', 'manifest_sha256', 'config_path',
+    'config_sha256', 'authority_path', 'authority_sha256',
+    'data_inventory_path', 'data_inventory_sha256'}
 
 
 def _file_sha256(path: Path) -> str:
@@ -47,6 +59,304 @@ def _file_sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _bytes_sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _safe_repository_relative(
+        path: Path | str, repository_root: Path, *, label: str) -> str:
+    root = Path(repository_root).resolve()
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise MetricError(f'{label} must be an existing repository file') from error
+    if not resolved.is_file() or any(part in {'.', '..'} for part in relative.parts):
+        raise MetricError(f'{label} must be a safe repository-relative file')
+    return relative.as_posix()
+
+
+def _git_blob(repository_root: Path, commit: str, relative: str) -> bytes:
+    try:
+        return subprocess.run(
+            ['git', 'show', f'{commit}:{relative}'], cwd=repository_root,
+            check=True, capture_output=True).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise MetricError(
+            f'source path is not tracked at recorded commit: {relative}') from error
+
+
+def build_source_binding(
+        *, repository_root: Path, candidate: CandidateSpec,
+        manifest_path: Path, git_commit: str) -> dict[str, str]:
+    """Bind one candidate to immutable tracked source and current inventory."""
+    if not isinstance(git_commit, str) or not _COMMIT.fullmatch(git_commit):
+        raise MetricError('source git commit is invalid')
+    root = Path(repository_root).resolve()
+    manifest_relative = _safe_repository_relative(
+        manifest_path, root, label='candidate manifest')
+    config_relative = _safe_repository_relative(
+        candidate.config, root, label='candidate config')
+    authority_relative = _safe_repository_relative(
+        _COCO_AUTHORITY, root, label='COCO authority')
+    inventory_relative = _safe_repository_relative(
+        'data/inventory.json', root, label='data inventory')
+    tracked = {
+        'manifest': (manifest_relative, root / manifest_relative),
+        'config': (config_relative, root / config_relative),
+        'authority': (authority_relative, root / authority_relative),
+    }
+    hashes: dict[str, str] = {}
+    for name, (relative, actual_path) in tracked.items():
+        blob = _git_blob(root, git_commit, relative)
+        actual = actual_path.read_bytes()
+        if actual != blob:
+            raise MetricError(
+                f'{name} source differs from recorded clean Git commit')
+        hashes[name] = _bytes_sha256(blob)
+        if name == 'manifest':
+            try:
+                manifest_candidates = parse_candidate_manifest(
+                    json.loads(blob))
+            except (json.JSONDecodeError, CandidateManifestError) as error:
+                raise MetricError(f'candidate manifest is invalid: {error}') from error
+            if tuple(
+                    row for row in manifest_candidates if row.id == candidate.id
+                    ) != (candidate,):
+                raise MetricError(
+                    'candidate does not exactly match the recorded manifest')
+    return {
+        'git_commit': git_commit,
+        'manifest_path': manifest_relative,
+        'manifest_sha256': hashes['manifest'],
+        'config_path': config_relative,
+        'config_sha256': hashes['config'],
+        'authority_path': authority_relative,
+        'authority_sha256': hashes['authority'],
+        'data_inventory_path': inventory_relative,
+        'data_inventory_sha256': _file_sha256(root / inventory_relative),
+    }
+
+
+def _official_authority_expectations(value: object) -> dict[str, Any]:
+    top_fields = {
+        'schema_version', 'dataset', 'split', 'annotation', 'images',
+        'detections'}
+    annotation_fields = {
+        'path', 'sha256', 'image_count', 'annotation_count',
+        'inventory_asset_id', 'inventory_archive_sha256'}
+    image_fields = {
+        'prefix', 'image_count', 'corpus_digest_algorithm', 'corpus_sha256',
+        'inventory_asset_id', 'inventory_archive_sha256'}
+    detection_fields = {'path', 'sha256', 'record_count', 'inventory_asset_id'}
+    if (
+            not isinstance(value, Mapping) or set(value) != top_fields
+            or value.get('schema_version') != 1
+            or value.get('dataset') != 'coco'
+            or value.get('split') != 'val2017'
+            or not isinstance(value.get('annotation'), Mapping)
+            or set(value['annotation']) != annotation_fields
+            or not isinstance(value.get('images'), Mapping)
+            or set(value['images']) != image_fields
+            or not isinstance(value.get('detections'), Mapping)
+            or set(value['detections']) != detection_fields):
+        raise MetricError('recorded COCO authority blob is malformed')
+    annotation = value['annotation']
+    images = value['images']
+    detections = value['detections']
+    asset_ids = (
+        annotation.get('inventory_asset_id'), images.get('inventory_asset_id'),
+        detections.get('inventory_asset_id'))
+    if (
+            annotation.get('path') != _COCO_ANNOTATION
+            or images.get('prefix') != 'data/coco/val2017'
+            or detections.get('path') != _COCO_DETECTIONS
+            or annotation.get('image_count') != _COCO_IMAGE_COUNT
+            or images.get('image_count') != _COCO_IMAGE_COUNT
+            or annotation.get('annotation_count') != _COCO_ANNOTATION_COUNT
+            or detections.get('record_count') != _COCO_DETECTION_COUNT
+            or any(not isinstance(item, str) or not item for item in asset_ids)
+            or len(set(asset_ids)) != 3
+            or images.get('corpus_digest_algorithm') != (
+                _COCO_IMAGE_DIGEST_ALGORITHM)):
+        raise MetricError('recorded COCO authority is not official val2017')
+    hashes = {
+        'annotation_authority_sha256': annotation.get('sha256'),
+        'detection_authority_sha256': detections.get('sha256'),
+        'image_corpus_authority_sha256': images.get('corpus_sha256'),
+        'inventory_annotation_archive_sha256': annotation.get(
+            'inventory_archive_sha256'),
+        'inventory_image_archive_sha256': images.get(
+            'inventory_archive_sha256'),
+    }
+    if any(not isinstance(item, str) or not _SHA256.fullmatch(item)
+           for item in hashes.values()):
+        raise MetricError('recorded COCO authority hashes are invalid')
+    return {
+        **hashes,
+        'authority_image_count': _COCO_IMAGE_COUNT,
+        'authority_annotation_count': _COCO_ANNOTATION_COUNT,
+        'authority_detection_count': _COCO_DETECTION_COUNT,
+        'image_corpus_digest_algorithm': _COCO_IMAGE_DIGEST_ALGORITHM,
+        'annotation_inventory_asset_id': annotation['inventory_asset_id'],
+        'image_inventory_asset_id': images['inventory_asset_id'],
+        'detection_inventory_asset_id': detections['inventory_asset_id'],
+    }
+
+
+def resolve_artifact_source(
+        envelope: Mapping[str, Any], *, repository_root: Path,
+        expected_manifest_path: Path | None = None,
+        ) -> tuple[Mapping[str, str], CandidateSpec, Mapping[str, Any]]:
+    result = envelope.get('result')
+    source = result.get('source') if isinstance(result, Mapping) else None
+    if not isinstance(source, Mapping) or set(source) != _SOURCE_BINDING_FIELDS:
+        raise MetricError('artifact source manifest binding is missing or invalid')
+    normalized = dict(source)
+    commit = normalized.get('git_commit')
+    if not isinstance(commit, str) or not _COMMIT.fullmatch(commit):
+        raise MetricError('artifact source git commit is invalid')
+    for name in (
+            'manifest_path', 'config_path', 'authority_path',
+            'data_inventory_path'):
+        item = normalized.get(name)
+        if (
+                not isinstance(item, str) or not item
+                or Path(item).is_absolute()
+                or any(part in {'.', '..'} for part in Path(item).parts)):
+            raise MetricError(f'artifact source {name} is invalid')
+    for name in (
+            'manifest_sha256', 'config_sha256', 'authority_sha256',
+            'data_inventory_sha256'):
+        item = normalized.get(name)
+        if not isinstance(item, str) or not _SHA256.fullmatch(item):
+            raise MetricError(f'artifact source {name} is invalid')
+    root = Path(repository_root).resolve()
+    if expected_manifest_path is not None:
+        expected_relative = _safe_repository_relative(
+            expected_manifest_path, root, label='candidate manifest')
+        if normalized['manifest_path'] != expected_relative:
+            raise MetricError('artifact source manifest path is not authoritative')
+    blobs: dict[str, bytes] = {}
+    for name in ('manifest', 'config', 'authority'):
+        relative = normalized[f'{name}_path']
+        blob = _git_blob(root, commit, relative)
+        if _bytes_sha256(blob) != normalized[f'{name}_sha256']:
+            raise MetricError(f'artifact source {name} hash is invalid')
+        blobs[name] = blob
+    if normalized['authority_path'] != _COCO_AUTHORITY:
+        raise MetricError('artifact source authority path is invalid')
+    if normalized['data_inventory_path'] != 'data/inventory.json':
+        raise MetricError('artifact source data inventory path is invalid')
+    inventory_path = root / normalized['data_inventory_path']
+    if _file_sha256(inventory_path) != normalized['data_inventory_sha256']:
+        raise MetricError('artifact source data inventory hash is invalid')
+    try:
+        manifest_value = json.loads(blobs['manifest'])
+        authority_value = json.loads(blobs['authority'])
+        inventory_value = json.loads(inventory_path.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError) as error:
+        raise MetricError(f'artifact source JSON is invalid: {error}') from error
+    try:
+        candidates = parse_candidate_manifest(manifest_value)
+    except CandidateManifestError as error:
+        raise MetricError(f'artifact source manifest is invalid: {error}') from error
+    candidate_id = envelope.get('candidate_id')
+    selected = tuple(row for row in candidates if row.id == candidate_id)
+    if len(selected) != 1:
+        raise MetricError('artifact candidate is absent from source manifest')
+    candidate = selected[0]
+    if candidate.config.as_posix() != normalized['config_path']:
+        raise MetricError('artifact source config disagrees with manifest')
+    expectations = _official_authority_expectations(authority_value)
+    assets = inventory_value.get('assets') if isinstance(
+        inventory_value, Mapping) else None
+    if not isinstance(assets, list):
+        raise MetricError('artifact source inventory is malformed')
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for row in assets:
+        if not isinstance(row, Mapping) or not isinstance(row.get('id'), str):
+            raise MetricError('artifact source inventory is malformed')
+        if row['id'] in by_id:
+            raise MetricError('artifact source inventory asset IDs are duplicated')
+        by_id[row['id']] = row
+    expected_inventory = {
+        expectations['annotation_inventory_asset_id']:
+            expectations['inventory_annotation_archive_sha256'],
+        expectations['image_inventory_asset_id']:
+            expectations['inventory_image_archive_sha256'],
+        expectations['detection_inventory_asset_id']:
+            expectations['detection_authority_sha256'],
+    }
+    if any(by_id.get(asset_id, {}).get('sha256') != digest
+           for asset_id, digest in expected_inventory.items()):
+        raise MetricError('artifact source inventory disagrees with authority')
+    return MappingProxyType(normalized), candidate, MappingProxyType(expectations)
+
+
+def _repository_root_from_artifacts(root: Path) -> Path:
+    trusted = _TRUSTED_REPOSITORY_ROOT.resolve(strict=True)
+    try:
+        repository = subprocess.check_output(
+            ['git', '-C', str(root), 'rev-parse', '--show-toplevel'],
+            text=True, stderr=subprocess.DEVNULL).strip()
+        resolved = Path(repository).resolve(strict=True)
+        root.resolve().relative_to(resolved)
+    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+        raise MetricError(
+            'candidate artifact root must belong to a Git repository') from error
+    if resolved != trusted:
+        raise MetricError(
+            'candidate artifacts must belong to the trusted source repository')
+    return resolved
+
+
+def _image_corpus_sha256(image_dir: Path, file_names: set[str]) -> str:
+    """Hash canonical names, byte lengths, and contents for a whole corpus."""
+    digest = hashlib.sha256()
+    for name in sorted(file_names):
+        path = image_dir / name
+        size = path.stat().st_size
+        digest.update(name.encode('utf-8'))
+        digest.update(b'\0')
+        digest.update(str(size).encode('ascii'))
+        digest.update(b'\0')
+        with path.open('rb') as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+                digest.update(block)
+        digest.update(b'\0')
+    return digest.hexdigest()
+
+
+def _verify_inventory_archive(
+        root: Path, entry: Mapping[str, Any], expected_sha256: str,
+        *, label: str) -> str | None:
+    if entry.get('sha256') != expected_sha256:
+        raise MetricError(f'{label} inventory hash disagrees with COCO authority')
+    archive_relative = entry.get('path')
+    required = entry.get('required_paths')
+    if not isinstance(archive_relative, str) or not archive_relative:
+        raise MetricError(f'{label} inventory archive path is invalid')
+    archive = root / archive_relative
+    if archive.exists():
+        if not archive.is_file():
+            raise MetricError(f'{label} inventory archive is not a file')
+        actual = _file_sha256(archive)
+        if actual != expected_sha256:
+            raise MetricError(f'{label} inventory archive hash is invalid')
+        return actual
+    if (
+            not isinstance(required, list) or not required
+            or any(not isinstance(item, str) or not (root / item).exists()
+                   for item in required)):
+        raise MetricError(
+            f'{label} inventory archive and extracted required paths are missing')
+    return None
 
 
 def validate_coco_val_protocol(
@@ -103,8 +413,8 @@ def validate_coco_val_protocol(
         'path', 'sha256', 'image_count', 'annotation_count',
         'inventory_asset_id', 'inventory_archive_sha256'}
     image_authority_fields = {
-        'prefix', 'image_count', 'inventory_asset_id',
-        'inventory_archive_sha256'}
+        'prefix', 'image_count', 'corpus_digest_algorithm', 'corpus_sha256',
+        'inventory_asset_id', 'inventory_archive_sha256'}
     detection_authority_fields = {
         'path', 'sha256', 'record_count', 'inventory_asset_id'}
     if (
@@ -140,6 +450,8 @@ def validate_coco_val_protocol(
             or not isinstance(image_authority['image_count'], int)
             or annotation_authority['path'] != _COCO_ANNOTATION
             or image_authority['prefix'] != 'data/coco/val2017'
+            or image_authority['corpus_digest_algorithm'] != (
+                _COCO_IMAGE_DIGEST_ALGORITHM)
             or detection_authority['path'] != _COCO_DETECTIONS
             or annotation_authority['image_count'] != expected_image_count
             or image_authority['image_count'] != expected_image_count
@@ -149,13 +461,22 @@ def validate_coco_val_protocol(
             or isinstance(detection_authority['record_count'], bool)
             or not isinstance(detection_authority['record_count'], int)
             or detection_authority['record_count'] <= 0
+            or (
+                expected_image_count == _COCO_IMAGE_COUNT
+                and annotation_authority['annotation_count'] != (
+                    _COCO_ANNOTATION_COUNT))
+            or (
+                expected_image_count == _COCO_IMAGE_COUNT
+                and detection_authority['record_count'] != (
+                    _COCO_DETECTION_COUNT))
             or any(
                 not isinstance(authority_row[field], str)
                 or not _SHA256.fullmatch(authority_row[field])
                 for authority_row, fields in (
                     (annotation_authority,
                      ('sha256', 'inventory_archive_sha256')),
-                    (image_authority, ('inventory_archive_sha256',)),
+                    (image_authority,
+                     ('inventory_archive_sha256', 'corpus_sha256')),
                     (detection_authority, ('sha256',)))
                 for field in fields)):
         raise MetricError('COCO val authority manifest values are invalid')
@@ -194,6 +515,9 @@ def validate_coco_val_protocol(
         ids.add(row['id'])
         file_names.add(row['file_name'])
         file_identities.add(identity)
+    image_corpus_sha256 = _image_corpus_sha256(image_dir, file_names)
+    if image_corpus_sha256 != image_authority['corpus_sha256']:
+        raise MetricError('COCO val image corpus hash disagrees with authority')
     if (
             not isinstance(detections, list)
             or len(detections) != detection_authority['record_count']
@@ -224,6 +548,13 @@ def validate_coco_val_protocol(
             or by_id[asset_id].get('sha256') != expected_hash
             for asset_id, expected_hash in required_assets.items()):
         raise MetricError('data inventory hashes disagree with COCO authority')
+    annotation_archive_sha256 = _verify_inventory_archive(
+        root, by_id[annotation_authority['inventory_asset_id']],
+        annotation_authority['inventory_archive_sha256'],
+        label='annotation')
+    image_archive_sha256 = _verify_inventory_archive(
+        root, by_id[image_authority['inventory_asset_id']],
+        image_authority['inventory_archive_sha256'], label='image')
     detection_entry = by_id[detection_authority['inventory_asset_id']]
     if detection_entry.get('path') != _COCO_DETECTIONS:
         raise MetricError('data inventory lacks the official COCO val detections')
@@ -242,6 +573,11 @@ def validate_coco_val_protocol(
         'authority_detection_count': detection_authority['record_count'],
         'annotation_authority_sha256': annotation_authority['sha256'],
         'detection_authority_sha256': detection_authority['sha256'],
+        'image_corpus_digest_algorithm': _COCO_IMAGE_DIGEST_ALGORITHM,
+        'image_corpus_authority_sha256': image_authority['corpus_sha256'],
+        'image_corpus_sha256': image_corpus_sha256,
+        'inventory_annotation_archive_sha256': annotation_archive_sha256,
+        'inventory_image_archive_sha256': image_archive_sha256,
         'annotation_sha256': annotation_sha256,
         'detection_sha256': detection_sha256,
         'inventory_detection_sha256': detection_entry['sha256'],
@@ -416,13 +752,19 @@ def _validate_determinism(
     return _freeze(value)
 
 
-def _validate_recorded_coco_protocol(value: object) -> Mapping[str, Any]:
+def _validate_recorded_coco_protocol(
+        value: object, *, expected_authority: Mapping[str, Any] | None = None,
+        ) -> Mapping[str, Any]:
     required = {
         'dataset', 'split', 'complete_split', 'batch_size',
         'authority_path', 'authority_sha256',
         'authority_image_count', 'authority_annotation_count',
         'authority_detection_count',
         'annotation_authority_sha256', 'detection_authority_sha256',
+        'image_corpus_digest_algorithm',
+        'image_corpus_authority_sha256', 'image_corpus_sha256',
+        'inventory_annotation_archive_sha256',
+        'inventory_image_archive_sha256',
         'annotation_sha256', 'detection_sha256',
         'inventory_detection_sha256', 'annotation_image_count',
         'annotation_record_count', 'detection_record_count',
@@ -442,14 +784,17 @@ def _validate_recorded_coco_protocol(value: object) -> Mapping[str, Any]:
     for name in (
             'authority_sha256', 'annotation_authority_sha256',
             'detection_authority_sha256', 'annotation_sha256',
-            'detection_sha256', 'inventory_detection_sha256'):
+            'detection_sha256', 'inventory_detection_sha256',
+            'image_corpus_authority_sha256', 'image_corpus_sha256'):
         if not isinstance(value.get(name), str) or not _SHA256.fullmatch(
                 value[name]):
             raise MetricError(f'evaluation protocol {name} is invalid')
     if (
             value['annotation_sha256'] != value['annotation_authority_sha256']
             or value['detection_sha256'] != value['detection_authority_sha256']
-            or value['detection_sha256'] != value['inventory_detection_sha256']):
+            or value['detection_sha256'] != value['inventory_detection_sha256']
+            or value['image_corpus_sha256'] != (
+                value['image_corpus_authority_sha256'])):
         raise MetricError(
             'evaluation recorded hashes disagree with corpus authority')
     if (
@@ -474,11 +819,20 @@ def _validate_recorded_coco_protocol(value: object) -> Mapping[str, Any]:
             or value['annotation_image_count'] != 5000
             or value['verified_image_count'] != 5000
             or value['authority_image_count'] != 5000
-            or value['authority_annotation_count'] <= 0
-            or value['authority_detection_count'] <= 0
-            or value['annotation_record_count'] == 0
-            or value['detection_record_count'] == 0):
+            or value['authority_annotation_count'] != _COCO_ANNOTATION_COUNT
+            or value['authority_detection_count'] != _COCO_DETECTION_COUNT
+            or value['annotation_record_count'] != _COCO_ANNOTATION_COUNT
+            or value['detection_record_count'] != _COCO_DETECTION_COUNT):
         raise MetricError('evaluation protocol COCO asset counts are invalid')
+    if value['image_corpus_digest_algorithm'] != _COCO_IMAGE_DIGEST_ALGORITHM:
+        raise MetricError('evaluation protocol image corpus algorithm is invalid')
+    for name in (
+            'inventory_annotation_archive_sha256',
+            'inventory_image_archive_sha256'):
+        item = value[name]
+        if item is not None and (
+                not isinstance(item, str) or not _SHA256.fullmatch(item)):
+            raise MetricError(f'evaluation protocol {name} is invalid')
     if value['authority_path'] != _COCO_AUTHORITY:
         raise MetricError('evaluation protocol authority path is invalid')
     for name in ('source_config', 'checkpoint', 'data_inventory'):
@@ -490,6 +844,23 @@ def _validate_recorded_coco_protocol(value: object) -> Mapping[str, Any]:
             raise MetricError(f'evaluation protocol {name} path is invalid')
     if value['data_inventory'] != 'data/inventory.json':
         raise MetricError('evaluation protocol data inventory path is invalid')
+    if expected_authority is not None:
+        for name in (
+                'authority_image_count', 'authority_annotation_count',
+                'authority_detection_count',
+                'annotation_authority_sha256',
+                'detection_authority_sha256',
+                'image_corpus_digest_algorithm',
+                'image_corpus_authority_sha256'):
+            if value[name] != expected_authority[name]:
+                raise MetricError(
+                    f'evaluation protocol {name} disagrees with authority blob')
+        for name in (
+                'inventory_annotation_archive_sha256',
+                'inventory_image_archive_sha256'):
+            if value[name] is not None and value[name] != expected_authority[name]:
+                raise MetricError(
+                    f'evaluation protocol {name} disagrees with authority blob')
     return _freeze(value)
 
 
@@ -500,7 +871,12 @@ def validate_evaluation_envelope(
         expected_data_inventory_sha256: str | None = None,
         expected_authority_sha256: str | None = None,
         expected_source_config: str | None = None,
-        expected_checkpoint: str | None = None) -> Mapping[str, Any]:
+        expected_checkpoint: str | None = None,
+        expected_seed: int | None = None,
+        expected_git_commit: str | None = None,
+        expected_source_binding: Mapping[str, str] | None = None,
+        expected_authority: Mapping[str, Any] | None = None,
+        require_source_binding: bool = False) -> Mapping[str, Any]:
     """Validate the canonical formal dual-mode evaluation artifact."""
     required = {'schema_version', 'candidate_id', 'stage', 'result'}
     if not isinstance(value, Mapping) or set(value) != required:
@@ -515,10 +891,22 @@ def validate_evaluation_envelope(
     if expected_candidate_id is not None and candidate_id != expected_candidate_id:
         raise MetricError('evaluation candidate identity mismatch')
     result = value['result']
+    expected_result_fields = {'route', 'calibration_split', 'modes', 'source'}
     if (
             not isinstance(result, Mapping)
-            or set(result) != {'route', 'calibration_split', 'modes'}):
+            or set(result) not in (
+                expected_result_fields,
+                expected_result_fields - {'source'})):
         raise MetricError('evaluation result has invalid fields')
+    source = result.get('source')
+    if require_source_binding and source is None:
+        raise MetricError('evaluation source manifest binding is required')
+    if source is not None:
+        if not isinstance(source, Mapping) or set(source) != _SOURCE_BINDING_FIELDS:
+            raise MetricError('evaluation source manifest binding is invalid')
+        if expected_source_binding is not None and dict(source) != dict(
+                expected_source_binding):
+            raise MetricError('evaluation source manifest binding mismatch')
     route = result['route']
     if not isinstance(route, str) or not route:
         raise MetricError('evaluation route must be non-empty')
@@ -538,8 +926,17 @@ def validate_evaluation_envelope(
             raise MetricError(f'evaluation {name} mode has invalid fields')
         provenance = validate_provenance(row['provenance'])
         determinism = _validate_determinism(row['determinism'], provenance)
-        protocol = _validate_recorded_coco_protocol(row['protocol'])
+        protocol = _validate_recorded_coco_protocol(
+            row['protocol'], expected_authority=expected_authority)
         metrics = CocoMetrics.from_dict(row['metrics'])
+        if expected_seed is not None and any(
+                determinism[field] != expected_seed
+                for field in ('python_seed', 'numpy_seed', 'torch_seed')):
+            raise MetricError('evaluation seed disagrees with candidate manifest')
+        if (
+                expected_git_commit is not None
+                and provenance['git_commit'] != expected_git_commit):
+            raise MetricError('evaluation commit disagrees with source binding')
         if (
                 expected_checkpoint_sha256 is not None
                 and provenance['checkpoint_sha256'] != expected_checkpoint_sha256):
@@ -584,7 +981,10 @@ def validate_evaluation_envelope(
             'data_inventory', 'authority_path', 'authority_sha256',
             'authority_image_count', 'authority_annotation_count',
             'authority_detection_count', 'annotation_authority_sha256',
-            'detection_authority_sha256'):
+            'detection_authority_sha256', 'image_corpus_digest_algorithm',
+            'image_corpus_authority_sha256', 'image_corpus_sha256',
+            'inventory_annotation_archive_sha256',
+            'inventory_image_archive_sha256'):
         if normalized_modes['flip']['protocol'][field] != (
                 normalized_modes['no_flip']['protocol'][field]):
             raise MetricError(f'evaluation mode protocol disagrees on {field}')
@@ -593,6 +993,7 @@ def validate_evaluation_envelope(
         'route': route,
         'calibration_split': calibration_split,
         'modes': MappingProxyType(normalized_modes),
+        'source': _freeze(source) if source is not None else None,
     })
 
 
@@ -627,7 +1028,25 @@ class CandidateResult:
             envelope = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError) as error:
             raise MetricError(f'cannot load evaluation artifact: {error}') from error
-        validated = validate_evaluation_envelope(envelope)
+        repository_root = _repository_root_from_artifacts(root)
+        source, candidate, authority = resolve_artifact_source(
+            envelope, repository_root=repository_root)
+        validated = validate_evaluation_envelope(
+            envelope,
+            expected_candidate_id=candidate.id,
+            expected_route=candidate.route,
+            expected_checkpoint_sha256=candidate.checkpoint_sha256,
+            expected_data_inventory_sha256=(
+                source['data_inventory_sha256']),
+            expected_authority_sha256=source['authority_sha256'],
+            expected_source_config=candidate.config.as_posix(),
+            expected_checkpoint=candidate.checkpoint.as_posix(),
+            expected_seed=candidate.seed,
+            expected_git_commit=source['git_commit'],
+            expected_source_binding=source,
+            expected_authority=authority,
+            require_source_binding=True,
+        )
         candidate_id = validated['candidate_id']
         route = validated['route']
         calibration_split = validated['calibration_split']
@@ -647,7 +1066,8 @@ class CandidateResult:
             provenance=provenance)
         latency, gpu_lease = _load_latency(
             latency_path, candidate_id=candidate_id, route=route,
-            provenance=provenance)
+            provenance=provenance, source=source, candidate=candidate,
+            authority=authority)
         if (
                 profile['config'] != protocol['source_config']
                 or profile['checkpoint'] != protocol['checkpoint']):
@@ -776,33 +1196,85 @@ def _load_profile(
 
 def _load_latency(
         path: Path, *, candidate_id: str, route: str,
-        provenance: Mapping[str, str]
+        provenance: Mapping[str, str], source: Mapping[str, str],
+        candidate: CandidateSpec, authority: Mapping[str, Any],
         ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     try:
         envelope = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as error:
         raise MetricError(f'cannot load latency artifact: {error}') from error
+    validated = validate_latency_envelope(
+        envelope, expected_candidate_id=candidate_id, expected_route=route,
+        expected_checkpoint_sha256=provenance['checkpoint_sha256'],
+        expected_data_inventory_sha256=provenance['data_inventory_sha256'],
+        expected_authority_sha256=source['authority_sha256'],
+        expected_source_config=candidate.config.as_posix(),
+        expected_checkpoint=candidate.checkpoint.as_posix(),
+        expected_git_commit=provenance['git_commit'],
+        expected_config_sha256=source['config_sha256'],
+        expected_source_binding=source,
+        expected_authority=authority,
+        require_source_binding=True)
+    return validated, validated['gpu_lease']
+
+
+def validate_latency_envelope(
+        envelope: object, *, expected_candidate_id: str | None = None,
+        expected_route: str | None = None,
+        expected_checkpoint_sha256: str | None = None,
+        expected_data_inventory_sha256: str | None = None,
+        expected_authority_sha256: str | None = None,
+        expected_source_config: str | None = None,
+        expected_checkpoint: str | None = None,
+        expected_git_commit: str | None = None,
+        expected_device_index: int | None = None,
+        expected_config_sha256: str | None = None,
+        expected_source_binding: Mapping[str, str] | None = None,
+        expected_authority: Mapping[str, Any] | None = None,
+        require_source_binding: bool = False) -> Mapping[str, Any]:
+    """Validate the one formal dual-mode latency stage envelope."""
     if (
             not isinstance(envelope, Mapping)
             or set(envelope) != {
                 'schema_version', 'candidate_id', 'stage', 'result'}
             or envelope['schema_version'] != 1
-            or envelope['candidate_id'] != candidate_id
             or envelope['stage'] != 'latency'):
         raise MetricError('latency artifact envelope identity mismatch')
+    candidate_id = envelope['candidate_id']
+    if not isinstance(candidate_id, str) or not candidate_id:
+        raise MetricError('latency candidate identity mismatch')
+    if expected_candidate_id is not None and candidate_id != expected_candidate_id:
+        raise MetricError('latency candidate identity mismatch')
     result = envelope['result']
     if (
             not isinstance(result, Mapping)
-            or set(result) != {
-                'route', 'provenance', 'protocol', 'modes', 'gpu_lease'}
-            or result['route'] != route):
+            or set(result) not in ({
+                'route', 'provenance', 'protocol', 'modes', 'gpu_lease',
+                'source'}, {
+                'route', 'provenance', 'protocol', 'modes', 'gpu_lease'})
+            or not isinstance(result['route'], str)
+            or not result['route']):
+        raise MetricError('latency artifact provenance or route mismatch')
+    source = result.get('source')
+    if require_source_binding and source is None:
+        raise MetricError('latency source manifest binding is required')
+    if source is not None:
+        if not isinstance(source, Mapping) or set(source) != _SOURCE_BINDING_FIELDS:
+            raise MetricError('latency source manifest binding is invalid')
+        if expected_source_binding is not None and dict(source) != dict(
+                expected_source_binding):
+            raise MetricError('latency source manifest binding mismatch')
+    if expected_route is not None and result['route'] != expected_route:
         raise MetricError('latency artifact provenance or route mismatch')
     latency_provenance = validate_provenance(result['provenance'])
-    shared_fields = {
-        'checkpoint_sha256', 'data_inventory_sha256', 'git_commit'}
-    if any(
-            latency_provenance[field] != provenance[field]
-            for field in shared_fields):
+    expected_provenance = {
+        'checkpoint_sha256': expected_checkpoint_sha256,
+        'data_inventory_sha256': expected_data_inventory_sha256,
+        'git_commit': expected_git_commit,
+        'config_sha256': expected_config_sha256,
+    }
+    if any(expected is not None and latency_provenance[field] != expected
+           for field, expected in expected_provenance.items()):
         raise MetricError('latency artifact provenance or route mismatch')
     protocol = result['protocol']
     protocol_fields = {
@@ -834,13 +1306,25 @@ def _load_latency(
     latency_data = protocol['data']
     if not isinstance(latency_data, Mapping):
         raise MetricError('latency data protocol is invalid')
-    _validate_recorded_coco_protocol({
+    data_protocol = _validate_recorded_coco_protocol({
         **latency_data,
         'batch_size': protocol['batch_size'],
         'source_config': protocol['source_config'],
         'checkpoint': protocol['checkpoint'],
         'data_inventory': protocol['data_inventory'],
-    })
+    }, expected_authority=expected_authority)
+    if (
+            expected_authority_sha256 is not None
+            and data_protocol['authority_sha256'] != expected_authority_sha256):
+        raise MetricError('latency corpus authority hash mismatch')
+    if (
+            expected_source_config is not None
+            and protocol['source_config'] != expected_source_config):
+        raise MetricError('latency source config mismatch')
+    if (
+            expected_checkpoint is not None
+            and protocol['checkpoint'] != expected_checkpoint):
+        raise MetricError('latency checkpoint path mismatch')
     modes = result['modes']
     summary_fields = {'median_ms', 'p90_ms', 'p95_ms', 'sample_count'}
     if not isinstance(modes, Mapping) or set(modes) != {'flip', 'no_flip'}:
@@ -864,7 +1348,11 @@ def _load_latency(
         raise MetricError(f'latency GPU lease provenance is invalid: {error}') from error
     if lease['stage_id'] != f'{candidate_id}:latency':
         raise MetricError('latency GPU lease provenance is invalid')
-    return _freeze(result), _freeze(lease)
+    if (
+            expected_device_index is not None
+            and lease['device_index'] != expected_device_index):
+        raise MetricError('latency GPU lease device mismatch')
+    return _freeze(result)
 
 
 def stage_envelope(
