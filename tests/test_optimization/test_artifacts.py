@@ -47,3 +47,18 @@ def test_optimization_output_returns_containment_checked_effective_path(tmp_path
     assert optimization_output_path(
         'work_dirs/optimization/run/result.json',
         repository_root=tmp_path) == expected.resolve()
+
+
+def test_optimization_output_rejects_symlinked_root_even_when_target_is_in_repo(
+        tmp_path):
+    from mambapose_opt.artifacts import optimization_output_path
+
+    work_dirs = tmp_path / 'work_dirs'
+    work_dirs.mkdir()
+    target = tmp_path / 'internal-artifacts'
+    target.mkdir()
+    (work_dirs / 'optimization').symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        optimization_output_path(
+            'work_dirs/optimization/result.json', repository_root=tmp_path)

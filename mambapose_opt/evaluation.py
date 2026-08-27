@@ -38,6 +38,7 @@ _COCO_ANNOTATION = 'data/coco/annotations/person_keypoints_val2017.json'
 _COCO_DETECTIONS = (
     'data/coco/person_detection_results/'
     'COCO_val2017_detections_AP_H_56_person.json')
+_COCO_AUTHORITY = 'optimization/coco_val2017_authority.json'
 
 
 def _file_sha256(path: Path) -> str:
@@ -87,20 +88,91 @@ def validate_coco_val_protocol(
     annotation_path = root / _COCO_ANNOTATION
     detection_path = root / _COCO_DETECTIONS
     inventory_path = root / 'data/inventory.json'
+    authority_path = root / _COCO_AUTHORITY
     try:
         annotation = json.loads(annotation_path.read_text(encoding='utf-8'))
         detections = json.loads(detection_path.read_text(encoding='utf-8'))
         inventory = json.loads(inventory_path.read_text(encoding='utf-8'))
+        authority = json.loads(authority_path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as error:
         raise MetricError(f'cannot verify COCO val assets: {error}') from error
+    authority_fields = {
+        'schema_version', 'dataset', 'split', 'annotation', 'images',
+        'detections'}
+    annotation_authority_fields = {
+        'path', 'sha256', 'image_count', 'annotation_count',
+        'inventory_asset_id', 'inventory_archive_sha256'}
+    image_authority_fields = {
+        'prefix', 'image_count', 'inventory_asset_id',
+        'inventory_archive_sha256'}
+    detection_authority_fields = {
+        'path', 'sha256', 'record_count', 'inventory_asset_id'}
+    if (
+            not isinstance(authority, Mapping)
+            or set(authority) != authority_fields
+            or authority.get('schema_version') != 1
+            or authority.get('dataset') != 'coco'
+            or authority.get('split') != 'val2017'
+            or not isinstance(authority.get('annotation'), Mapping)
+            or set(authority['annotation']) != annotation_authority_fields
+            or not isinstance(authority.get('images'), Mapping)
+            or set(authority['images']) != image_authority_fields
+            or not isinstance(authority.get('detections'), Mapping)
+            or set(authority['detections']) != detection_authority_fields):
+        raise MetricError('COCO val authority manifest is malformed')
+    annotation_authority = authority['annotation']
+    image_authority = authority['images']
+    detection_authority = authority['detections']
+    if (
+            any(
+                not isinstance(row['inventory_asset_id'], str)
+                or not row['inventory_asset_id']
+                for row in (
+                    annotation_authority, image_authority,
+                    detection_authority))
+            or len({
+                annotation_authority['inventory_asset_id'],
+                image_authority['inventory_asset_id'],
+                detection_authority['inventory_asset_id']}) != 3
+            or isinstance(annotation_authority['image_count'], bool)
+            or not isinstance(annotation_authority['image_count'], int)
+            or isinstance(image_authority['image_count'], bool)
+            or not isinstance(image_authority['image_count'], int)
+            or annotation_authority['path'] != _COCO_ANNOTATION
+            or image_authority['prefix'] != 'data/coco/val2017'
+            or detection_authority['path'] != _COCO_DETECTIONS
+            or annotation_authority['image_count'] != expected_image_count
+            or image_authority['image_count'] != expected_image_count
+            or isinstance(annotation_authority['annotation_count'], bool)
+            or not isinstance(annotation_authority['annotation_count'], int)
+            or annotation_authority['annotation_count'] <= 0
+            or isinstance(detection_authority['record_count'], bool)
+            or not isinstance(detection_authority['record_count'], int)
+            or detection_authority['record_count'] <= 0
+            or any(
+                not isinstance(authority_row[field], str)
+                or not _SHA256.fullmatch(authority_row[field])
+                for authority_row, fields in (
+                    (annotation_authority,
+                     ('sha256', 'inventory_archive_sha256')),
+                    (image_authority, ('inventory_archive_sha256',)),
+                    (detection_authority, ('sha256',)))
+                for field in fields)):
+        raise MetricError('COCO val authority manifest values are invalid')
     images = annotation.get('images') if isinstance(annotation, Mapping) else None
     annotations = annotation.get('annotations') if isinstance(annotation, Mapping) else None
     if (
             not isinstance(images, list) or len(images) != expected_image_count
-            or not isinstance(annotations, list)):
+            or not isinstance(annotations, list)
+            or len(annotations) != annotation_authority['annotation_count']):
         raise MetricError(
-            f'COCO val annotation must contain exactly {expected_image_count} images')
+            'COCO val annotation counts disagree with authority')
+    annotation_sha256 = _file_sha256(annotation_path)
+    if annotation_sha256 != annotation_authority['sha256']:
+        raise MetricError('COCO val annotation hash disagrees with authority')
     ids: set[int] = set()
+    file_names: set[str] = set()
+    file_identities: set[tuple[int, int]] = set()
     image_dir = root / data_root / 'val2017'
     for row in images:
         if (
@@ -109,28 +181,70 @@ def validate_coco_val_protocol(
                 or not isinstance(row.get('id'), int)
                 or row['id'] in ids
                 or not isinstance(row.get('file_name'), str)
+                or not row['file_name']
+                or row['file_name'] in file_names
+                or Path(row['file_name']).name != row['file_name']
                 or not (image_dir / row['file_name']).is_file()):
-            raise MetricError('COCO val image inventory is incomplete or invalid')
+            raise MetricError(
+                'COCO val image IDs, names, and files must be unique and valid')
+        stat = (image_dir / row['file_name']).stat()
+        identity = (stat.st_dev, stat.st_ino)
+        if identity in file_identities:
+            raise MetricError('COCO val image file identities must be unique')
         ids.add(row['id'])
+        file_names.add(row['file_name'])
+        file_identities.add(identity)
     if (
-            not isinstance(detections, list) or not detections
+            not isinstance(detections, list)
+            or len(detections) != detection_authority['record_count']
             or any(
                 not isinstance(row, Mapping) or row.get('image_id') not in ids
                 for row in detections)):
-        raise MetricError('COCO val detections are empty or reference unknown images')
+        raise MetricError('COCO val detections disagree with authority or image IDs')
     assets = inventory.get('assets') if isinstance(inventory, Mapping) else None
-    entries = [row for row in assets or [] if (
-        isinstance(row, Mapping) and row.get('id') == 'coco-val-detections')]
-    if len(entries) != 1 or entries[0].get('path') != _COCO_DETECTIONS:
+    if not isinstance(assets, list):
+        raise MetricError('data inventory assets are invalid')
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for row in assets:
+        if not isinstance(row, Mapping) or not isinstance(row.get('id'), str):
+            raise MetricError('data inventory assets are invalid')
+        if row['id'] in by_id:
+            raise MetricError('data inventory asset IDs must be unique')
+        by_id[row['id']] = row
+    required_assets = {
+        annotation_authority['inventory_asset_id']:
+            annotation_authority['inventory_archive_sha256'],
+        image_authority['inventory_asset_id']:
+            image_authority['inventory_archive_sha256'],
+        detection_authority['inventory_asset_id']:
+            detection_authority['sha256'],
+    }
+    if any(
+            asset_id not in by_id
+            or by_id[asset_id].get('sha256') != expected_hash
+            for asset_id, expected_hash in required_assets.items()):
+        raise MetricError('data inventory hashes disagree with COCO authority')
+    detection_entry = by_id[detection_authority['inventory_asset_id']]
+    if detection_entry.get('path') != _COCO_DETECTIONS:
         raise MetricError('data inventory lacks the official COCO val detections')
     detection_sha256 = _file_sha256(detection_path)
-    if entries[0].get('sha256') != detection_sha256:
-        raise MetricError('data inventory detection hash does not match actual asset')
+    if (
+            detection_entry.get('sha256') != detection_sha256
+            or detection_authority['sha256'] != detection_sha256):
+        raise MetricError(
+            'detection inventory/authority hash does not match actual asset')
     return {
         'dataset': 'coco', 'split': 'val2017', 'complete_split': True,
-        'annotation_sha256': _file_sha256(annotation_path),
+        'authority_path': _COCO_AUTHORITY,
+        'authority_sha256': _file_sha256(authority_path),
+        'authority_image_count': image_authority['image_count'],
+        'authority_annotation_count': annotation_authority['annotation_count'],
+        'authority_detection_count': detection_authority['record_count'],
+        'annotation_authority_sha256': annotation_authority['sha256'],
+        'detection_authority_sha256': detection_authority['sha256'],
+        'annotation_sha256': annotation_sha256,
         'detection_sha256': detection_sha256,
-        'inventory_detection_sha256': entries[0]['sha256'],
+        'inventory_detection_sha256': detection_entry['sha256'],
         'annotation_image_count': len(images),
         'annotation_record_count': len(annotations),
         'detection_record_count': len(detections),
@@ -303,8 +417,20 @@ def _validate_determinism(
 
 
 def _validate_recorded_coco_protocol(value: object) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise MetricError('evaluation protocol must be an object')
+    required = {
+        'dataset', 'split', 'complete_split', 'batch_size',
+        'authority_path', 'authority_sha256',
+        'authority_image_count', 'authority_annotation_count',
+        'authority_detection_count',
+        'annotation_authority_sha256', 'detection_authority_sha256',
+        'annotation_sha256', 'detection_sha256',
+        'inventory_detection_sha256', 'annotation_image_count',
+        'annotation_record_count', 'detection_record_count',
+        'verified_image_count', 'source_config', 'checkpoint',
+        'data_inventory'}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise MetricError(
+            'evaluation protocol must contain the exact authority fields')
     if (
             value.get('dataset') != 'coco'
             or value.get('split') != 'val2017'
@@ -314,14 +440,30 @@ def _validate_recorded_coco_protocol(value: object) -> Mapping[str, Any]:
             or value['batch_size'] <= 0):
         raise MetricError('evaluation protocol is not complete COCO val2017')
     for name in (
-            'annotation_sha256', 'detection_sha256',
-            'inventory_detection_sha256'):
+            'authority_sha256', 'annotation_authority_sha256',
+            'detection_authority_sha256', 'annotation_sha256',
+            'detection_sha256', 'inventory_detection_sha256'):
         if not isinstance(value.get(name), str) or not _SHA256.fullmatch(
                 value[name]):
             raise MetricError(f'evaluation protocol {name} is invalid')
-    if value['detection_sha256'] != value['inventory_detection_sha256']:
-        raise MetricError('evaluation detection hash disagrees with inventory')
+    if (
+            value['annotation_sha256'] != value['annotation_authority_sha256']
+            or value['detection_sha256'] != value['detection_authority_sha256']
+            or value['detection_sha256'] != value['inventory_detection_sha256']):
+        raise MetricError(
+            'evaluation recorded hashes disagree with corpus authority')
+    if (
+            value['authority_image_count'] != value['annotation_image_count']
+            or value['authority_image_count'] != value['verified_image_count']
+            or value['authority_annotation_count'] != (
+                value['annotation_record_count'])
+            or value['authority_detection_count'] != (
+                value['detection_record_count'])):
+        raise MetricError('evaluation recorded counts disagree with authority')
     counts = (
+        value.get('authority_image_count'),
+        value.get('authority_annotation_count'),
+        value.get('authority_detection_count'),
         value.get('annotation_image_count'),
         value.get('annotation_record_count'),
         value.get('detection_record_count'),
@@ -331,8 +473,14 @@ def _validate_recorded_coco_protocol(value: object) -> Mapping[str, Any]:
                 or item < 0 for item in counts)
             or value['annotation_image_count'] != 5000
             or value['verified_image_count'] != 5000
+            or value['authority_image_count'] != 5000
+            or value['authority_annotation_count'] <= 0
+            or value['authority_detection_count'] <= 0
+            or value['annotation_record_count'] == 0
             or value['detection_record_count'] == 0):
         raise MetricError('evaluation protocol COCO asset counts are invalid')
+    if value['authority_path'] != _COCO_AUTHORITY:
+        raise MetricError('evaluation protocol authority path is invalid')
     for name in ('source_config', 'checkpoint', 'data_inventory'):
         item = value.get(name)
         if (
@@ -343,6 +491,109 @@ def _validate_recorded_coco_protocol(value: object) -> Mapping[str, Any]:
     if value['data_inventory'] != 'data/inventory.json':
         raise MetricError('evaluation protocol data inventory path is invalid')
     return _freeze(value)
+
+
+def validate_evaluation_envelope(
+        value: object, *, expected_candidate_id: str | None = None,
+        expected_route: str | None = None,
+        expected_checkpoint_sha256: str | None = None,
+        expected_data_inventory_sha256: str | None = None,
+        expected_authority_sha256: str | None = None,
+        expected_source_config: str | None = None,
+        expected_checkpoint: str | None = None) -> Mapping[str, Any]:
+    """Validate the canonical formal dual-mode evaluation artifact."""
+    required = {'schema_version', 'candidate_id', 'stage', 'result'}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise MetricError('evaluation artifact must use the stage envelope')
+    if value['schema_version'] != 1:
+        raise MetricError('evaluation schema_version must be 1')
+    if value['stage'] != 'evaluate':
+        raise MetricError('evaluation artifact stage must be evaluate')
+    candidate_id = value['candidate_id']
+    if not isinstance(candidate_id, str) or not candidate_id:
+        raise MetricError('evaluation candidate_id must be non-empty')
+    if expected_candidate_id is not None and candidate_id != expected_candidate_id:
+        raise MetricError('evaluation candidate identity mismatch')
+    result = value['result']
+    if (
+            not isinstance(result, Mapping)
+            or set(result) != {'route', 'calibration_split', 'modes'}):
+        raise MetricError('evaluation result has invalid fields')
+    route = result['route']
+    if not isinstance(route, str) or not route:
+        raise MetricError('evaluation route must be non-empty')
+    if expected_route is not None and route != expected_route:
+        raise MetricError('evaluation route disagrees with candidate manifest')
+    calibration_split = result['calibration_split']
+    if calibration_split not in {None, 'train2017'}:
+        raise MetricError(
+            'calibration_split must be absent or train2017, never val2017')
+    modes = result['modes']
+    if not isinstance(modes, Mapping) or set(modes) != {'flip', 'no_flip'}:
+        raise MetricError('evaluation must contain both flip and no_flip modes')
+    normalized_modes: dict[str, Mapping[str, Any]] = {}
+    mode_fields = {'metrics', 'provenance', 'determinism', 'protocol'}
+    for name, row in modes.items():
+        if not isinstance(row, Mapping) or set(row) != mode_fields:
+            raise MetricError(f'evaluation {name} mode has invalid fields')
+        provenance = validate_provenance(row['provenance'])
+        determinism = _validate_determinism(row['determinism'], provenance)
+        protocol = _validate_recorded_coco_protocol(row['protocol'])
+        metrics = CocoMetrics.from_dict(row['metrics'])
+        if (
+                expected_checkpoint_sha256 is not None
+                and provenance['checkpoint_sha256'] != expected_checkpoint_sha256):
+            raise MetricError(
+                'evaluation checkpoint hash disagrees with candidate manifest')
+        if (
+                expected_data_inventory_sha256 is not None
+                and provenance['data_inventory_sha256'] != (
+                    expected_data_inventory_sha256)):
+            raise MetricError(
+                'evaluation data inventory hash disagrees with repository')
+        if (
+                expected_authority_sha256 is not None
+                and protocol['authority_sha256'] != expected_authority_sha256):
+            raise MetricError(
+                'evaluation corpus authority hash disagrees with repository')
+        if (
+                expected_source_config is not None
+                and protocol['source_config'] != expected_source_config):
+            raise MetricError(
+                'evaluation config path disagrees with candidate manifest')
+        if (
+                expected_checkpoint is not None
+                and protocol['checkpoint'] != expected_checkpoint):
+            raise MetricError(
+                'evaluation checkpoint path disagrees with candidate manifest')
+        normalized_modes[name] = MappingProxyType({
+            'metrics': metrics,
+            'provenance': MappingProxyType(provenance),
+            'determinism': determinism,
+            'protocol': protocol,
+        })
+    for field in ('checkpoint_sha256', 'data_inventory_sha256', 'git_commit'):
+        if normalized_modes['flip']['provenance'][field] != (
+                normalized_modes['no_flip']['provenance'][field]):
+            raise MetricError(f'evaluation mode provenance disagrees on {field}')
+    for field in (
+            'annotation_sha256', 'detection_sha256',
+            'inventory_detection_sha256', 'annotation_image_count',
+            'annotation_record_count', 'detection_record_count',
+            'verified_image_count', 'source_config', 'checkpoint',
+            'data_inventory', 'authority_path', 'authority_sha256',
+            'authority_image_count', 'authority_annotation_count',
+            'authority_detection_count', 'annotation_authority_sha256',
+            'detection_authority_sha256'):
+        if normalized_modes['flip']['protocol'][field] != (
+                normalized_modes['no_flip']['protocol'][field]):
+            raise MetricError(f'evaluation mode protocol disagrees on {field}')
+    return MappingProxyType({
+        'candidate_id': candidate_id,
+        'route': route,
+        'calibration_split': calibration_split,
+        'modes': MappingProxyType(normalized_modes),
+    })
 
 
 @dataclass(frozen=True)
@@ -376,55 +627,15 @@ class CandidateResult:
             envelope = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError) as error:
             raise MetricError(f'cannot load evaluation artifact: {error}') from error
-        required = {'schema_version', 'candidate_id', 'stage', 'result'}
-        if not isinstance(envelope, Mapping) or set(envelope) != required:
-            raise MetricError('evaluation artifact must use the stage envelope')
-        if envelope['schema_version'] != 1:
-            raise MetricError('evaluation schema_version must be 1')
-        if envelope['stage'] != 'evaluate':
-            raise MetricError('evaluation artifact stage must be evaluate')
-        candidate_id = envelope['candidate_id']
-        if not isinstance(candidate_id, str) or not candidate_id:
-            raise MetricError('evaluation candidate_id must be non-empty')
-        result = envelope['result']
-        result_fields = {'route', 'calibration_split', 'modes'}
-        if not isinstance(result, Mapping) or set(result) != result_fields:
-            raise MetricError('evaluation result has invalid fields')
-        route = result['route']
-        if not isinstance(route, str) or not route:
-            raise MetricError('evaluation route must be non-empty')
-        calibration_split = result['calibration_split']
-        if calibration_split not in {None, 'train2017'}:
-            raise MetricError(
-                'calibration_split must be absent or train2017, never val2017')
-        modes = result['modes']
-        if not isinstance(modes, Mapping) or set(modes) != {'flip', 'no_flip'}:
-            raise MetricError('evaluation must contain both flip and no_flip modes')
-        normalized_modes: dict[str, tuple[CocoMetrics, dict[str, str],
-                                          Mapping[str, Any], Mapping[str, Any]]] = {}
-        mode_fields = {'metrics', 'provenance', 'determinism', 'protocol'}
-        for name, row in modes.items():
-            if not isinstance(row, Mapping) or set(row) != mode_fields:
-                raise MetricError(f'evaluation {name} mode has invalid fields')
-            row_provenance = validate_provenance(row['provenance'])
-            row_determinism = _validate_determinism(
-                row['determinism'], row_provenance)
-            row_protocol = _validate_recorded_coco_protocol(row['protocol'])
-            normalized_modes[name] = (
-                CocoMetrics.from_dict(row['metrics']), row_provenance,
-                row_determinism, row_protocol)
-        for field in ('checkpoint_sha256', 'data_inventory_sha256', 'git_commit'):
-            if normalized_modes['flip'][1][field] != normalized_modes['no_flip'][1][field]:
-                raise MetricError(f'evaluation mode provenance disagrees on {field}')
-        for field in (
-                'annotation_sha256', 'detection_sha256',
-                'inventory_detection_sha256', 'annotation_image_count',
-                'annotation_record_count', 'detection_record_count',
-                'verified_image_count', 'source_config', 'checkpoint',
-                'data_inventory'):
-            if normalized_modes['flip'][3][field] != normalized_modes['no_flip'][3][field]:
-                raise MetricError(f'evaluation mode protocol disagrees on {field}')
-        metrics, provenance, determinism, protocol = normalized_modes[mode]
+        validated = validate_evaluation_envelope(envelope)
+        candidate_id = validated['candidate_id']
+        route = validated['route']
+        calibration_split = validated['calibration_split']
+        selected = validated['modes'][mode]
+        metrics = selected['metrics']
+        provenance = selected['provenance']
+        determinism = selected['determinism']
+        protocol = selected['protocol']
         profile: Mapping[str, Any] | None = None
         latency: Mapping[str, Any] | None = None
         gpu_lease: Mapping[str, Any] | None = None
@@ -447,7 +658,12 @@ class CandidateResult:
                 raise MetricError(
                     f'latency {field} disagrees with evaluation provenance')
         for field in (
-                'annotation_sha256', 'detection_sha256',
+                'authority_path', 'authority_sha256',
+                'authority_image_count', 'authority_annotation_count',
+                'authority_detection_count',
+                'annotation_authority_sha256',
+                'detection_authority_sha256', 'annotation_sha256',
+                'detection_sha256',
                 'inventory_detection_sha256', 'annotation_image_count',
                 'annotation_record_count', 'detection_record_count',
                 'verified_image_count'):
@@ -591,7 +807,9 @@ def _load_latency(
     protocol = result['protocol']
     protocol_fields = {
         'batch_size', 'warmup', 'iterations', 'timer', 'synchronize',
-        'scope', 'source_config', 'checkpoint', 'data_inventory', 'data'}
+        'scope', 'lease_max_age_seconds',
+        'lease_max_future_skew_seconds', 'source_config', 'checkpoint',
+        'data_inventory', 'data'}
     if (
             not isinstance(protocol, Mapping)
             or set(protocol) != protocol_fields
@@ -599,12 +817,19 @@ def _load_latency(
             or protocol.get('timer') != 'torch.cuda.Event'
             or protocol.get('synchronize') is not True
             or protocol.get('scope') != 'full_topdown_model'
+            or isinstance(protocol.get('lease_max_age_seconds'), bool)
+            or not isinstance(protocol.get('lease_max_age_seconds'), int)
+            or protocol.get('lease_max_age_seconds') != 300
+            or isinstance(protocol.get('lease_max_future_skew_seconds'), bool)
+            or not isinstance(
+                protocol.get('lease_max_future_skew_seconds'), int)
+            or protocol.get('lease_max_future_skew_seconds') != 30
             or isinstance(protocol.get('warmup'), bool)
             or not isinstance(protocol.get('warmup'), int)
-            or protocol['warmup'] < 0
+            or protocol['warmup'] != 50
             or isinstance(protocol.get('iterations'), bool)
             or not isinstance(protocol.get('iterations'), int)
-            or protocol['iterations'] <= 0):
+            or protocol['iterations'] != 200):
         raise MetricError('latency protocol is invalid')
     latency_data = protocol['data']
     if not isinstance(latency_data, Mapping):

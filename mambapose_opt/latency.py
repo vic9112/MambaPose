@@ -13,6 +13,10 @@ class LatencyError(ValueError):
     """Raised when a latency protocol or observed sample is invalid."""
 
 
+LEASE_MAX_AGE_SECONDS = 300
+LEASE_MAX_FUTURE_SKEW_SECONDS = 30
+
+
 class LatencyTimer(Protocol):
     def synchronize(self) -> None: ...
 
@@ -171,6 +175,8 @@ def build_latency_result(
             'timer': 'torch.cuda.Event',
             'synchronize': True,
             'scope': 'full_topdown_model',
+            'lease_max_age_seconds': LEASE_MAX_AGE_SECONDS,
+            'lease_max_future_skew_seconds': LEASE_MAX_FUTURE_SKEW_SECONDS,
         },
         'modes': {
             'flip': LatencySummary.from_samples_ms(flip).to_dict(),
