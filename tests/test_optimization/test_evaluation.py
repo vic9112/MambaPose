@@ -89,6 +89,8 @@ def _latency(candidate_id='full-s-v1'):
                 'batch_size': 1, 'warmup': 50, 'iterations': 200,
                 'timer': 'torch.cuda.Event', 'synchronize': True,
                 'scope': 'full_topdown_model',
+                'lease_max_age_seconds': 300,
+                'lease_max_future_skew_seconds': 30,
                 'source_config': 'configs/reproduction/coco_s_v1.py',
                 'checkpoint': (
                     'work_dirs/reproduction/runs/coco-s-v1/best.pth'),
@@ -96,6 +98,14 @@ def _latency(candidate_id='full-s-v1'):
                 'data': {
                     'dataset': 'coco', 'split': 'val2017',
                     'complete_split': True,
+                    'authority_path': (
+                        'optimization/coco_val2017_authority.json'),
+                    'authority_sha256': '5' * 64,
+                    'authority_image_count': 5000,
+                    'authority_annotation_count': 100,
+                    'authority_detection_count': 200,
+                    'annotation_authority_sha256': '1' * 64,
+                    'detection_authority_sha256': '2' * 64,
                     'annotation_sha256': '1' * 64,
                     'detection_sha256': '2' * 64,
                     'inventory_detection_sha256': '2' * 64,
@@ -130,6 +140,13 @@ def _evaluation(candidate_id='full-s-v1'):
             'protocol': {
                 'dataset': 'coco', 'split': 'val2017',
                 'batch_size': 1, 'complete_split': True,
+                'authority_path': 'optimization/coco_val2017_authority.json',
+                'authority_sha256': '5' * 64,
+                'authority_image_count': 5000,
+                'authority_annotation_count': 100,
+                'authority_detection_count': 200,
+                'annotation_authority_sha256': '1' * 64,
+                'detection_authority_sha256': '2' * 64,
                 'annotation_sha256': '1' * 64,
                 'detection_sha256': '2' * 64,
                 'inventory_detection_sha256': '2' * 64,
@@ -275,6 +292,38 @@ def test_candidate_result_requires_strict_profile_latency_and_lease(tmp_path):
         CandidateResult.from_artifacts(tmp_path)
 
 
+@pytest.mark.parametrize('warmup, iterations', [(0, 200), (50, 1)])
+def test_candidate_result_requires_formal_50_by_200_latency_protocol(
+        tmp_path, warmup, iterations):
+    from mambapose_opt.evaluation import CandidateResult, MetricError
+
+    _write_json(tmp_path / 'evaluate/evaluate.json', _evaluation())
+    _write_json(tmp_path / 'profile/profile.json', _profile())
+    latency = _latency()
+    latency['result']['protocol']['warmup'] = warmup
+    latency['result']['protocol']['iterations'] = iterations
+    for summary in latency['result']['modes'].values():
+        summary['sample_count'] = iterations
+    _write_json(tmp_path / 'latency/latency.json', latency)
+
+    with pytest.raises(MetricError, match='50|200|protocol'):
+        CandidateResult.from_artifacts(tmp_path)
+
+
+def test_recorded_evaluation_requires_authority_fields_and_nonzero_annotations():
+    from mambapose_opt.evaluation import (
+        MetricError, validate_evaluation_envelope)
+
+    missing = _evaluation()
+    del missing['result']['modes']['flip']['protocol']['authority_sha256']
+    with pytest.raises(MetricError, match='authority'):
+        validate_evaluation_envelope(missing)
+
+    empty = _evaluation()
+    empty['result']['modes']['flip']['protocol']['annotation_record_count'] = 0
+    with pytest.raises(MetricError, match='counts|annotation'):
+        validate_evaluation_envelope(empty)
+
 def test_formal_evaluation_runs_flip_and_no_flip_before_envelope(
         tmp_path, monkeypatch):
     import tools.optimization.evaluate_candidate as tool
@@ -321,14 +370,40 @@ def _coco_fixture(tmp_path):
     })
     _write_json(detection, [{'image_id': 1, 'bbox': [0, 0, 1, 1]}])
     import hashlib
+    annotation_hash = hashlib.sha256(annotation.read_bytes()).hexdigest()
     detection_hash = hashlib.sha256(detection.read_bytes()).hexdigest()
     _write_json(tmp_path / 'data/inventory.json', {
-        'schema_version': 1, 'assets': [{
-            'id': 'coco-val-detections',
+        'schema_version': 1, 'assets': [
+            {'id': 'coco-annotations', 'sha256': '3' * 64},
+            {'id': 'coco-val2017', 'sha256': '4' * 64},
+            {
+                'id': 'coco-val-detections',
+                'path': ('data/coco/person_detection_results/'
+                         'COCO_val2017_detections_AP_H_56_person.json'),
+                'sha256': detection_hash,
+            },
+        ],
+    })
+    _write_json(tmp_path / 'optimization/coco_val2017_authority.json', {
+        'schema_version': 1, 'dataset': 'coco', 'split': 'val2017',
+        'annotation': {
+            'path': 'data/coco/annotations/person_keypoints_val2017.json',
+            'sha256': annotation_hash, 'image_count': 1,
+            'annotation_count': 1,
+            'inventory_asset_id': 'coco-annotations',
+            'inventory_archive_sha256': '3' * 64,
+        },
+        'images': {
+            'prefix': 'data/coco/val2017', 'image_count': 1,
+            'inventory_asset_id': 'coco-val2017',
+            'inventory_archive_sha256': '4' * 64,
+        },
+        'detections': {
             'path': ('data/coco/person_detection_results/'
                      'COCO_val2017_detections_AP_H_56_person.json'),
-            'sha256': detection_hash,
-        }],
+            'sha256': detection_hash, 'record_count': 1,
+            'inventory_asset_id': 'coco-val-detections',
+        },
     })
     config = {
         'test_dataloader': {
@@ -381,6 +456,60 @@ def test_coco_protocol_preflight_rejects_altered_dataset_before_claim(tmp_path):
     with pytest.raises(ValueError, match='CocoDataset'):
         validate_coco_val_protocol(
             config, repository_root=tmp_path, expected_image_count=1)
+
+
+def test_coco_protocol_preflight_rejects_annotation_outside_authority(tmp_path):
+    from mambapose_opt.evaluation import validate_coco_val_protocol
+
+    config, _ = _coco_fixture(tmp_path)
+    annotation = tmp_path / (
+        'data/coco/annotations/person_keypoints_val2017.json')
+    value = json.loads(annotation.read_text())
+    value['annotations'].append({'id': 8, 'image_id': 1})
+    _write_json(annotation, value)
+
+    with pytest.raises(ValueError, match='annotation.*authority|hash'):
+        validate_coco_val_protocol(
+            config, repository_root=tmp_path, expected_image_count=1)
+
+
+def test_coco_protocol_rejects_malformed_authority_identity(tmp_path):
+    from mambapose_opt.evaluation import validate_coco_val_protocol
+
+    config, _ = _coco_fixture(tmp_path)
+    authority_path = tmp_path / 'optimization/coco_val2017_authority.json'
+    authority = json.loads(authority_path.read_text())
+    authority['annotation']['inventory_asset_id'] = []
+    _write_json(authority_path, authority)
+
+    with pytest.raises(ValueError, match='authority.*invalid|malformed'):
+        validate_coco_val_protocol(
+            config, repository_root=tmp_path, expected_image_count=1)
+
+
+def test_coco_protocol_rejects_unique_ids_aliasing_one_image_file(tmp_path):
+    from mambapose_opt.evaluation import validate_coco_val_protocol
+
+    config, _ = _coco_fixture(tmp_path)
+    annotation = tmp_path / (
+        'data/coco/annotations/person_keypoints_val2017.json')
+    value = json.loads(annotation.read_text())
+    value['images'] = [
+        {'id': image_id, 'file_name': '0001.jpg'}
+        for image_id in range(5000)]
+    value['annotations'] = [{'id': 1, 'image_id': 0}]
+    _write_json(annotation, value)
+    import hashlib
+    authority_path = tmp_path / 'optimization/coco_val2017_authority.json'
+    authority = json.loads(authority_path.read_text())
+    authority['annotation']['sha256'] = hashlib.sha256(
+        annotation.read_bytes()).hexdigest()
+    authority['annotation']['image_count'] = 5000
+    authority['images']['image_count'] = 5000
+    _write_json(authority_path, authority)
+
+    with pytest.raises(ValueError, match='unique|identity|name'):
+        validate_coco_val_protocol(config, repository_root=tmp_path)
 
 
 def test_candidate_result_rejects_envelope_identity_and_provenance_disagreement(

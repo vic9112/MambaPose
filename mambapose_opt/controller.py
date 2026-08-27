@@ -27,6 +27,7 @@ from .gpu_guard import (
     GpuLease,
     exclusive_cuda_stage,
 )
+from .evaluation import MetricError, validate_evaluation_envelope
 from .schema import CandidateSpec
 
 
@@ -393,20 +394,24 @@ class OptimizationController:
             raise ArtifactValidationError(
                 f'{stage} artifact result must be an object')
         if stage == 'evaluate':
-            result = value['result']
-            if set(result) != {'route', 'calibration_split', 'modes'}:
+            try:
+                validate_evaluation_envelope(
+                    value,
+                    expected_candidate_id=self.candidate.id,
+                    expected_route=self.candidate.route,
+                    expected_checkpoint_sha256=(
+                        self.candidate.checkpoint_sha256),
+                    expected_data_inventory_sha256=_sha256(
+                        self.repository_root / 'data/inventory.json'),
+                    expected_authority_sha256=_sha256(
+                        self.repository_root /
+                        'optimization/coco_val2017_authority.json'),
+                    expected_source_config=self.candidate.config.as_posix(),
+                    expected_checkpoint=self.candidate.checkpoint.as_posix(),
+                )
+            except (MetricError, OSError) as error:
                 raise ArtifactValidationError(
-                    'evaluate result must use the dual-mode schema')
-            modes = result.get('modes')
-            if not isinstance(modes, dict) or set(modes) != {'flip', 'no_flip'}:
-                raise ArtifactValidationError(
-                    'evaluate artifact must contain both evaluation modes')
-            fields = {'metrics', 'provenance', 'determinism', 'protocol'}
-            if any(
-                    not isinstance(row, dict) or set(row) != fields
-                    for row in modes.values()):
-                raise ArtifactValidationError(
-                    'evaluate mode rows do not match the formal schema')
+                    f'evaluate artifact is invalid: {error}') from error
         return 'optimization-stage-envelope-v1'
 
     def _validate_artifacts(

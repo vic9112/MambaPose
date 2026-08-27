@@ -1,5 +1,6 @@
 import pytest
 from pathlib import Path
+from datetime import datetime, timezone
 
 
 class FakeTimer:
@@ -72,6 +73,8 @@ def test_latency_protocol_requires_batch_one_both_flip_modes_and_lease():
         'timer': 'torch.cuda.Event',
         'synchronize': True,
         'scope': 'full_topdown_model',
+        'lease_max_age_seconds': 300,
+        'lease_max_future_skew_seconds': 30,
     }
     assert set(result['modes']) == {'flip', 'no_flip'}
     assert result['gpu_lease']['stage_id'] == 'full-s-v1:latency'
@@ -144,7 +147,8 @@ def test_active_gpu_lease_checks_boot_device_and_live_descendant(
     lock = tmp_path / 'gpu.lock'
     lease = {
         'stage_id': 'fixture:latency', 'pid': os.getpid(),
-        'boot_id': boot_id, 'timestamp': '2026-08-27T00:00:00+00:00',
+        'boot_id': boot_id,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
         'device_index': 2, 'allowed_pids': [os.getpid()],
     }
     lock.write_text(json.dumps(lease))
@@ -157,4 +161,29 @@ def test_active_gpu_lease_checks_boot_device_and_live_descendant(
         json.dump({**lease, 'boot_id': '11111111-1111-1111-1111-111111111111'}, owner)
         owner.flush()
         with pytest.raises(ValueError, match='different boot'):
+            tool._active_gpu_lease('fixture', 2)
+
+
+@pytest.mark.parametrize('timestamp', [
+    '2000-01-01T00:00:00+00:00',
+    '2999-01-01T00:00:00+00:00',
+])
+def test_active_gpu_lease_rejects_stale_or_future_timestamp(
+        tmp_path, monkeypatch, timestamp):
+    import fcntl
+    import json
+    import os
+    import tools.optimization.measure_latency as tool
+
+    lock = tmp_path / 'gpu.lock'
+    lock.write_text(json.dumps({
+        'stage_id': 'fixture:latency', 'pid': os.getpid(),
+        'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+        'timestamp': timestamp, 'device_index': 2,
+        'allowed_pids': [os.getpid()],
+    }))
+    monkeypatch.setattr(tool, '_canonical_gpu_lock', lambda: lock)
+    with lock.open('r+') as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match='timestamp|fresh'):
             tool._active_gpu_lease('fixture', 2)

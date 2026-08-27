@@ -22,6 +22,12 @@ def _candidate(repo_root):
     checkpoint.parent.mkdir(parents=True)
     config.write_text('model = dict(type="Fixture")\n')
     checkpoint.write_bytes(b'parent checkpoint')
+    inventory = repo_root / 'data/inventory.json'
+    authority = repo_root / 'optimization/coco_val2017_authority.json'
+    inventory.parent.mkdir(parents=True, exist_ok=True)
+    authority.parent.mkdir(parents=True, exist_ok=True)
+    inventory.write_text('{"fixture": "inventory"}\n')
+    authority.write_text('{"fixture": "authority"}\n')
     return CandidateSpec.from_dict({
         'id': 'fixture',
         'route': 'accuracy-first',
@@ -54,14 +60,61 @@ def _write_generic_artifact(path, stage, candidate_id='fixture'):
     path.parent.mkdir(parents=True, exist_ok=True)
     result = {}
     if stage == 'evaluate':
+        provenance = {
+            'checkpoint_sha256': hashlib.sha256(
+                b'parent checkpoint').hexdigest(),
+            'config_sha256': 'b' * 64,
+            'data_inventory_sha256': hashlib.sha256(
+                b'{"fixture": "inventory"}\n').hexdigest(),
+            'git_commit': 'd' * 40,
+        }
+        protocol = {
+            'dataset': 'coco', 'split': 'val2017',
+            'complete_split': True, 'batch_size': 1,
+            'authority_path': 'optimization/coco_val2017_authority.json',
+            'authority_sha256': hashlib.sha256(
+                b'{"fixture": "authority"}\n').hexdigest(),
+            'authority_image_count': 5000,
+            'authority_annotation_count': 11004,
+            'authority_detection_count': 104125,
+            'annotation_authority_sha256': '1' * 64,
+            'detection_authority_sha256': '2' * 64,
+            'annotation_sha256': '1' * 64,
+            'detection_sha256': '2' * 64,
+            'inventory_detection_sha256': '2' * 64,
+            'annotation_image_count': 5000,
+            'annotation_record_count': 11004,
+            'detection_record_count': 104125,
+            'verified_image_count': 5000,
+            'source_config': 'configs/candidate.py',
+            'checkpoint': 'checkpoints/parent.pth',
+            'data_inventory': 'data/inventory.json',
+        }
+        determinism = {
+            'python_seed': 0, 'numpy_seed': 0, 'torch_seed': 0,
+            'worker_count': 1,
+            'workers': [{
+                'worker_id': 0,
+                'torch_seed_source': 'torch.initial_seed()',
+                'python_seed_derivation': 'torch_seed % 2**32',
+                'numpy_seed_derivation': 'torch_seed % 2**32',
+            }],
+            'persistent_workers': False,
+            'order_hashes': {'0': 'e' * 64},
+            'provenance': provenance,
+        }
+        row = {
+            'metrics': {
+                'unit': 'percentage_points', 'AP': 72.8, 'AP50': 89.7,
+                'AP75': 80.5, 'APM': 69.4, 'APL': 79.2, 'AR': 78.2,
+            },
+            'provenance': provenance,
+            'determinism': determinism,
+            'protocol': protocol,
+        }
         result = {
             'route': 'accuracy-first', 'calibration_split': None,
-            'modes': {
-                'flip': {'metrics': {}, 'provenance': {},
-                         'determinism': {}, 'protocol': {}},
-                'no_flip': {'metrics': {}, 'provenance': {},
-                            'determinism': {}, 'protocol': {}},
-            },
+            'modes': {'flip': row, 'no_flip': row},
         }
     path.write_text(json.dumps({
         'schema_version': 1,
@@ -115,6 +168,50 @@ def test_controller_refuses_single_mode_evaluation_as_complete(tmp_path):
     path.write_text(json.dumps(payload))
 
     with pytest.raises(ArtifactValidationError, match='both.*modes'):
+        controller._artifact_schema('evaluate', path)
+
+
+def test_controller_refuses_empty_dual_mode_rows_as_complete(tmp_path):
+    from mambapose_opt.controller import (
+        ArtifactValidationError, OptimizationController)
+
+    candidate = _candidate(tmp_path)
+    campaign = tmp_path / 'work_dirs/optimization'
+    controller = OptimizationController(
+        campaign, candidate, lambda *args: None,
+        repository_root=tmp_path)
+    path = campaign / 'candidates/fixture/evaluate/evaluate.json'
+    _write_generic_artifact(path, 'evaluate')
+    payload = json.loads(path.read_text())
+    payload['result']['modes'] = {
+        'flip': {'metrics': {}, 'provenance': {},
+                 'determinism': {}, 'protocol': {}},
+        'no_flip': {'metrics': {}, 'provenance': {},
+                    'determinism': {}, 'protocol': {}},
+    }
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ArtifactValidationError, match='metrics|provenance'):
+        controller._artifact_schema('evaluate', path)
+
+
+def test_controller_binds_evaluation_to_repository_authority_hash(tmp_path):
+    from mambapose_opt.controller import (
+        ArtifactValidationError, OptimizationController)
+
+    candidate = _candidate(tmp_path)
+    campaign = tmp_path / 'work_dirs/optimization'
+    controller = OptimizationController(
+        campaign, candidate, lambda *args: None,
+        repository_root=tmp_path)
+    path = campaign / 'candidates/fixture/evaluate/evaluate.json'
+    _write_generic_artifact(path, 'evaluate')
+    payload = json.loads(path.read_text())
+    for row in payload['result']['modes'].values():
+        row['protocol']['authority_sha256'] = '0' * 64
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ArtifactValidationError, match='authority'):
         controller._artifact_schema('evaluate', path)
 
 

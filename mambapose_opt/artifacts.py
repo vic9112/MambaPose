@@ -21,7 +21,10 @@ def optimization_output_path(
         raise argparse.ArgumentTypeError(_MESSAGE)
     try:
         root = Path(repository_root).resolve(strict=False)
-        artifact_root = (root / Path(*_ARTIFACT_PARTS)).resolve(strict=False)
+        lexical_artifact_root = root / Path(*_ARTIFACT_PARTS)
+        artifact_root = lexical_artifact_root.resolve(strict=False)
+        if lexical_artifact_root.absolute() != artifact_root:
+            raise ValueError('optimization artifact root must not be symlinked')
         effective = (root / path).resolve(strict=False)
         artifact_root.relative_to(root)
         effective.relative_to(artifact_root)

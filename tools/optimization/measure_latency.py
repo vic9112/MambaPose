@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -29,8 +30,13 @@ from mambapose_opt.evaluation import stage_envelope, validate_coco_val_protocol
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.gpu_guard import controller_process_tree
 from mambapose_opt.latency import (
+    LEASE_MAX_AGE_SECONDS, LEASE_MAX_FUTURE_SKEW_SECONDS,
     build_latency_result, measure_latency_samples, validate_gpu_lease)
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
+
+
+LEASE_MAX_AGE = timedelta(seconds=LEASE_MAX_AGE_SECONDS)
+LEASE_MAX_FUTURE_SKEW = timedelta(seconds=LEASE_MAX_FUTURE_SKEW_SECONDS)
 
 
 def _sha256(path: Path) -> str:
@@ -105,6 +111,12 @@ def _active_gpu_lease(candidate_id: str, device_index: int) -> dict[str, Any]:
         raise ValueError('active GPU lease belongs to a different boot')
     if value['device_index'] != device_index:
         raise ValueError('active GPU lease device does not match latency device')
+    timestamp = datetime.fromisoformat(value['timestamp'])
+    now = datetime.now(timezone.utc)
+    if now - timestamp > LEASE_MAX_AGE:
+        raise ValueError('active GPU lease timestamp is stale')
+    if timestamp - now > LEASE_MAX_FUTURE_SKEW:
+        raise ValueError('active GPU lease timestamp is in the future')
     if os.getpid() not in controller_process_tree({value['pid']}):
         raise ValueError('latency process is not a live controller descendant')
     return value
