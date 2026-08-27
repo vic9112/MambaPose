@@ -56,10 +56,10 @@ class CandidateSpec:
             raise CandidateManifestError('candidate id must be a non-empty string')
 
         route = value['route']
-        if route not in _ROUTES:
+        if not isinstance(route, str) or route not in _ROUTES:
             raise CandidateManifestError(f'invalid route: {route!r}')
         kind = value['kind']
-        if kind not in _KINDS:
+        if not isinstance(kind, str) or kind not in _KINDS:
             raise CandidateManifestError(f'invalid kind: {kind!r}')
 
         config = _safe_relative_path(value['config'], 'config')

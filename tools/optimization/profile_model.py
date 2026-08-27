@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+OPTIMIZATION_ARTIFACTS = Path('work_dirs/optimization')
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
@@ -67,6 +68,18 @@ def _parse_shape(value: str) -> tuple[int, ...]:
     if len(shape) != 4 or any(dimension <= 0 for dimension in shape):
         raise argparse.ArgumentTypeError('shape must be four positive dimensions')
     return shape
+
+
+def _output_path(value: str) -> Path:
+    path = Path(value)
+    if (
+            path.is_absolute()
+            or any(part in {'.', '..'} for part in path.parts)
+            or path.parts[:2] != OPTIMIZATION_ARTIFACTS.parts):
+        raise argparse.ArgumentTypeError(
+            'output must be a repository-relative path under '
+            'work_dirs/optimization')
+    return REPOSITORY_ROOT / path
 
 
 def _candidate(manifest: Path, identifier: str) -> CandidateSpec:
@@ -126,7 +139,7 @@ def main() -> None:
     parser.add_argument('candidate_id')
     parser.add_argument('--manifest', type=Path,
                         default=REPOSITORY_ROOT / 'optimization/candidates.json')
-    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--output', type=_output_path, required=True)
     parser.add_argument('--input-shape', type=_parse_shape, default=(1, 3, 256, 192))
     args = parser.parse_args()
 
