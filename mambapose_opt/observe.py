@@ -59,6 +59,15 @@ def observe(
         and all(isinstance(run_id, str) for run_id in run_ids)
         else ())
     runs = state.get('runs') if isinstance(state.get('runs'), dict) else {}
+    current_run_id = state.get('current_run')
+    current_run = (
+        runs.get(current_run_id, {})
+        if isinstance(current_run_id, str) else {})
+    retry_not_before = current_run.get('retry_not_before')
+    retry_time = _parse_time(retry_not_before)
+    retry_remaining = (
+        max(0.0, (retry_time - now).total_seconds())
+        if retry_time is not None else None)
     completed_runs = sum(
         runs.get(run_id, {}).get('status') == 'complete'
         for run_id in expected)
@@ -70,9 +79,11 @@ def observe(
         health = 'failed'
     elif stage == 'complete':
         health = 'incomplete'
-    elif stage in {'running', 'retry_wait'}:
+    elif stage == 'retry_wait':
+        health = 'waiting'
+    elif stage == 'running':
         if heartbeat_age is None:
-            health = 'starting' if stage == 'running' else 'waiting'
+            health = 'starting'
         elif heartbeat_age <= heartbeat_max_age:
             health = 'running' if process_alive else 'failed'
         else:
@@ -100,12 +111,15 @@ def observe(
         'observed_at': now.isoformat(),
         'health': health,
         'stage': stage,
-        'current_run': state.get('current_run'),
+        'current_run': current_run_id,
         'generation': state.get('generation', 0),
         'heartbeat_age_seconds': heartbeat_age,
         'process_alive': process_alive,
         'pid': pid,
         'stage_id': heartbeat.get('stage_id'),
+        'retry_not_before': (
+            retry_not_before if isinstance(retry_not_before, str) else None),
+        'retry_remaining_seconds': retry_remaining,
         'completed_runs': completed_runs,
         'expected_runs': len(expected),
         'gpu_status': gpu_status,

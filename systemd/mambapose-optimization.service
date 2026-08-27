@@ -2,8 +2,7 @@
 Description=MambaPose hardware-friendly optimization campaign
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=infinity
-StartLimitBurst=4
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -15,8 +14,6 @@ ExecStart=/home/vicchen/workspace/MambaPose/.venv/bin/python /home/vicchen/works
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=30s
-RestartSteps=2
-RestartMaxDelaySec=2min
 KillMode=control-group
 TimeoutStopSec=5min
 UMask=0027

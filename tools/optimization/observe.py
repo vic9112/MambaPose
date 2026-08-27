@@ -14,7 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mambapose_opt.observe import observe
-from tools.optimization.run_campaign import _canonical_gpu_lock
+from tools.optimization.run_campaign import _validated_gpu_lock
 
 
 def main() -> int:
@@ -27,7 +27,7 @@ def main() -> int:
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     try:
-        gpu_lock_path = args.gpu_lock_path or _canonical_gpu_lock()
+        _, gpu_lock_path = _validated_gpu_lock(args.gpu_lock_path)
     except Exception as error:
         print(f'cannot derive canonical GPU lock: {error}', file=sys.stderr)
         return 1

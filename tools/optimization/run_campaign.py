@@ -194,7 +194,7 @@ def _select(
     return selected
 
 
-def _canonical_gpu_lock() -> Path:
+def _canonical_checkout_root() -> Path:
     result = subprocess.run(
         ['git', 'rev-parse', '--git-common-dir'],
         cwd=REPO_ROOT,
@@ -206,8 +206,25 @@ def _canonical_gpu_lock() -> Path:
     if not common.is_absolute():
         common = REPO_ROOT / common
     common = common.resolve()
-    checkout_root = common.parent if common.name == '.git' else common
-    return checkout_root / 'work_dirs/optimization/gpu.lock'
+    if common.name != '.git':
+        raise ValueError(
+            f'Git common directory is not a checkout .git directory: {common}')
+    return common.parent
+
+
+def _canonical_gpu_lock() -> Path:
+    return _canonical_checkout_root() / 'work_dirs/optimization/gpu.lock'
+
+
+def _validated_gpu_lock(override: Path | None) -> tuple[Path, Path]:
+    checkout_root = _canonical_checkout_root()
+    canonical = (
+        checkout_root / 'work_dirs/optimization/gpu.lock').resolve()
+    selected = Path(override or canonical).resolve()
+    if selected != canonical:
+        raise ValueError(
+            f'GPU lock override must equal canonical GPU lock: {canonical}')
+    return checkout_root, canonical
 
 
 def main() -> int:
@@ -222,7 +239,19 @@ def main() -> int:
     parser.add_argument('--gpu-lock-path', type=Path)
     args = parser.parse_args()
     if args.status:
-        return _status(args.campaign_root)
+        try:
+            campaign_root = args.campaign_root.resolve()
+            campaign_root.relative_to(REPO_ROOT.resolve())
+            if (
+                    campaign_root.name != 'optimization'
+                    or campaign_root.parent.name != 'work_dirs'):
+                raise ValueError(
+                    'optimization campaign root must end in '
+                    'work_dirs/optimization')
+        except (OSError, RuntimeError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return PERMANENT_EXIT
+        return _status(campaign_root)
 
     try:
         candidates = _select(
@@ -232,8 +261,9 @@ def main() -> int:
         return PERMANENT_EXIT
 
     try:
-        gpu_lock_path = args.gpu_lock_path or _canonical_gpu_lock()
-    except (OSError, subprocess.SubprocessError) as error:
+        shared_lock_root, gpu_lock_path = _validated_gpu_lock(
+            args.gpu_lock_path)
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
         print(f'cannot derive canonical GPU lock: {error}', file=sys.stderr)
         return PERMANENT_EXIT
     expected_run_ids = tuple(
@@ -241,30 +271,37 @@ def main() -> int:
         for candidate in candidates
         for stage in ('profile', 'calibrate', 'train', 'evaluate', 'latency',
                       'compare'))
-    runner = SubprocessStageRunner(
-        args.campaign_root, args.manifest, device_index=args.device_index)
-    for candidate in candidates:
-        controller = OptimizationController(
-            args.campaign_root,
-            candidate,
-            runner,
-            repository_root=REPO_ROOT,
-            device_index=args.device_index,
-            gpu_lock_path=gpu_lock_path,
-            expected_run_ids=expected_run_ids,
-        )
-        while True:
-            outcome = controller.run_next()
-            print(json.dumps({
-                'stage_id': outcome.stage_id,
-                'exit_code': outcome.exit_code,
-                'fingerprint': outcome.fingerprint,
-                'message': outcome.message,
-            }, sort_keys=True))
-            if outcome.exit_code != 0:
-                return outcome.exit_code
-            if outcome.stage == 'complete':
-                break
+    try:
+        runner = SubprocessStageRunner(
+            args.campaign_root, args.manifest, device_index=args.device_index)
+        for candidate in candidates:
+            controller = OptimizationController(
+                args.campaign_root,
+                candidate,
+                runner,
+                repository_root=REPO_ROOT,
+                device_index=args.device_index,
+                gpu_lock_path=gpu_lock_path,
+                shared_lock_root=shared_lock_root,
+                expected_run_ids=expected_run_ids,
+            )
+            while True:
+                outcome = controller.run_next()
+                print(json.dumps({
+                    'stage_id': outcome.stage_id,
+                    'exit_code': outcome.exit_code,
+                    'fingerprint': outcome.fingerprint,
+                    'message': outcome.message,
+                    'retry_not_before': outcome.retry_not_before,
+                    'retry_remaining_seconds': outcome.retry_remaining_seconds,
+                }, sort_keys=True))
+                if outcome.exit_code != 0:
+                    return outcome.exit_code
+                if outcome.stage == 'complete':
+                    break
+    except (OSError, RuntimeError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        return PERMANENT_EXIT
     return 0
 
 
