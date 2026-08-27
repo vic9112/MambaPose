@@ -103,7 +103,8 @@ def _parent_pid(stat_path: Path) -> int | None:
         return None
 
 
-def _controller_process_tree(roots: Collection[int]) -> tuple[int, ...]:
+def controller_process_tree(roots: Collection[int]) -> tuple[int, ...]:
+    """Resolve the live transitive process tree rooted at controller PIDs."""
     allowed = {int(pid) for pid in roots if int(pid) > 0}
     parents: dict[int, int] = {}
     try:
@@ -142,7 +143,7 @@ def exclusive_cuda_stage(
             raise ConcurrentCudaStage(
                 f'another CUDA stage owns {lock_path}') from error
 
-        process_tree = _controller_process_tree(allowed_pids)
+        process_tree = controller_process_tree(allowed_pids)
         permitted = set(process_tree)
         owners = query_compute_processes(device_index)
         external = tuple(owner for owner in owners if owner.pid not in permitted)

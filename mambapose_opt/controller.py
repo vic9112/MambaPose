@@ -5,12 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
 from typing import Callable, Mapping, Sequence
 
 from mambapose_repro.orchestrator import (
+    CampaignLock,
+    ConcurrentCampaign,
     PERMANENT_EXIT,
     TRANSIENT_EXIT,
     failure_fingerprint,
@@ -46,6 +49,19 @@ class StageOutcome:
     attempt: int = 0
     message: str = ''
     gpu_lease: GpuLease | None = None
+    artifact_evidence: tuple[Mapping[str, str], ...] = ()
+
+
+class ArtifactValidationError(ValueError):
+    """Raised when a stage artifact cannot prove its own identity."""
+
+
+class CheckpointRetentionError(ValueError):
+    """Raised before mutation when the bounded resume set is not provable."""
+
+
+class CampaignPlanError(ValueError):
+    """Raised when the immutable expected-run plan changes or is malformed."""
 
 
 def _sha256(path: Path) -> str:
@@ -73,21 +89,36 @@ def retain_checkpoints(
         resume_limit: int = 2) -> tuple[Path, ...]:
     """Retain one valid best checkpoint and two valid resume points."""
     checkpoint_dir = Path(checkpoint_dir)
-    candidates = tuple(checkpoint_dir.glob('*.pth'))
-    valid = tuple(path for path in candidates if validator(path))
+    best_candidates = tuple(checkpoint_dir.glob('best_*.pth'))
+    resume_candidates = tuple(
+        path for pattern in ('epoch_*.pth', 'iter_*.pth')
+        for path in checkpoint_dir.glob(pattern))
+    recognized = best_candidates + resume_candidates
+    try:
+        valid = tuple(path for path in recognized if validator(path))
+    except Exception as error:
+        raise CheckpointRetentionError(
+            f'checkpoint validation failed: {error}') from error
     best = sorted(
-        (path for path in valid if path.name.startswith('best_')),
+        (path for path in valid if path in best_candidates),
         key=_checkpoint_order,
         reverse=True,
     )[:1]
     resumes = sorted(
-        (path for path in valid if path.name.startswith(('epoch_', 'iter_'))),
+        (path for path in valid if path in resume_candidates),
         key=_checkpoint_order,
         reverse=True,
     )[:resume_limit]
+    if len(best) != 1:
+        raise CheckpointRetentionError(
+            'training completion requires one valid best checkpoint')
+    if len(resumes) != resume_limit:
+        raise CheckpointRetentionError(
+            f'training completion requires two valid resume checkpoints; '
+            f'found {len(resumes)}')
     kept = tuple(best + resumes)
     keep_set = set(kept)
-    for path in candidates:
+    for path in recognized:
         if path not in keep_set:
             path.unlink()
     return kept
@@ -105,24 +136,61 @@ class OptimizationController:
             repository_root: Path | None = None,
             stages: Sequence[str] = STAGES,
             device_index: int = 0,
+            gpu_lock_path: Path | None = None,
+            controller_lock_path: Path | None = None,
             allowed_pids: Sequence[int] | None = None,
             artifact_validator: ArtifactValidator | None = None,
-            checkpoint_validator: Callable[[Path], bool] | None = None):
+            checkpoint_validator: Callable[[Path], bool] | None = None,
+            expected_run_ids: Sequence[str] | None = None,
+            max_attempts: int = 3,
+            retry_delays: Sequence[int] = (30, 120, 600)):
         unknown = set(stages) - set(STAGES)
         if unknown:
             raise ValueError(f'unknown optimization stages: {sorted(unknown)}')
         if len(stages) != len(set(stages)):
             raise ValueError('optimization stages must be unique')
-        self.root = Path(root)
+        if max_attempts <= 0:
+            raise ValueError('max_attempts must be positive')
+        if not retry_delays or any(delay < 0 for delay in retry_delays):
+            raise ValueError('retry_delays must contain non-negative values')
         self.candidate = candidate
         self.runner = runner
         self.repository_root = Path(repository_root or Path.cwd()).resolve()
+        self.root = Path(root).resolve()
+        try:
+            self.root.relative_to(self.repository_root)
+        except ValueError as error:
+            raise ValueError(
+                'optimization campaign root must stay inside the repository') from error
+        if self.root.name != 'optimization' or self.root.parent.name != 'work_dirs':
+            raise ValueError(
+                'optimization campaign root must end in work_dirs/optimization')
         self.stages = tuple(stages)
         self.device_index = device_index
+        self.gpu_lock_path = Path(
+            gpu_lock_path or (
+                self.repository_root / 'work_dirs/optimization/gpu.lock')).resolve()
+        if (
+                self.gpu_lock_path.name != 'gpu.lock'
+                or self.gpu_lock_path.parent.name != 'optimization'
+                or self.gpu_lock_path.parent.parent.name != 'work_dirs'):
+            raise ValueError(
+                'optimization GPU lock must end in work_dirs/optimization/gpu.lock')
+        self.controller_lock_path = Path(
+            controller_lock_path or (self.root / 'controller.lock')).resolve()
+        if self.controller_lock_path != self.root / 'controller.lock':
+            raise ValueError(
+                'optimization controller lock must stay at '
+                'campaign-root/controller.lock')
         self.allowed_pids = tuple(allowed_pids or (os.getpid(),))
         self.artifact_validator = artifact_validator
         self.checkpoint_validator = (
             checkpoint_validator or self._checkpoint_is_valid)
+        self.expected_run_ids = tuple(
+            expected_run_ids or (
+                f'{self.candidate.id}:{stage}' for stage in self.stages))
+        self.max_attempts = max_attempts
+        self.retry_delays = tuple(retry_delays)
         self.store = StateStore(self.root)
 
     @staticmethod
@@ -142,7 +210,10 @@ class OptimizationController:
     def _next_stage(self) -> str | None:
         runs = self.store.read().get('runs', {})
         for stage in self.stages:
-            if runs.get(self._stage_id(stage), {}).get('status') != 'complete':
+            run = runs.get(self._stage_id(stage), {})
+            if (
+                    run.get('status') != 'complete'
+                    or not self._completed_evidence_valid(stage, run)):
                 return stage
         return None
 
@@ -182,37 +253,160 @@ class OptimizationController:
             message=message,
         )
 
-    def _artifacts_are_valid(self, stage: str, outcome: StageOutcome) -> bool:
+    def _artifact_schema(self, stage: str, path: Path) -> str:
+        try:
+            value = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ArtifactValidationError(
+                f'{stage} artifact is not valid JSON: {path}: {error}') from error
+        if not isinstance(value, dict):
+            raise ArtifactValidationError(
+                f'{stage} artifact root must be an object: {path}')
+        if stage == 'profile':
+            required = {
+                'schema_version', 'git_commit', 'candidate', 'config',
+                'checkpoint', 'checkpoint_sha256', 'input_shapes',
+                'output_shapes', 'parameters', 'modules',
+            }
+            if not required.issubset(value):
+                raise ArtifactValidationError(
+                    f'profile artifact is missing required fields: '
+                    f'{sorted(required - set(value))}')
+            if value.get('schema_version') != 1:
+                raise ArtifactValidationError(
+                    'profile artifact schema_version must be 1')
+            if value.get('candidate') != self.candidate.id:
+                raise ArtifactValidationError(
+                    'profile artifact candidate identity mismatch')
+            if value.get('config') != self.candidate.config.as_posix():
+                raise ArtifactValidationError(
+                    'profile artifact config identity mismatch')
+            if value.get('checkpoint') != self.candidate.checkpoint.as_posix():
+                raise ArtifactValidationError(
+                    'profile artifact checkpoint identity mismatch')
+            if value.get('checkpoint_sha256') != self.candidate.checkpoint_sha256:
+                raise ArtifactValidationError(
+                    'profile artifact checkpoint hash mismatch')
+            if not isinstance(value.get('parameters'), dict):
+                raise ArtifactValidationError(
+                    'profile artifact parameters must be an object')
+            if not isinstance(value.get('modules'), list):
+                raise ArtifactValidationError(
+                    'profile artifact modules must be a list')
+            return 'optimization-profile-v1'
+
+        required = {'schema_version', 'candidate_id', 'stage', 'result'}
+        if set(value) != required:
+            raise ArtifactValidationError(
+                f'{stage} artifact must use the versioned stage envelope')
+        if value.get('schema_version') != 1:
+            raise ArtifactValidationError(
+                f'{stage} artifact schema_version must be 1')
+        if value.get('candidate_id') != self.candidate.id:
+            raise ArtifactValidationError(
+                f'{stage} artifact candidate identity mismatch')
+        if value.get('stage') != stage:
+            raise ArtifactValidationError(
+                f'{stage} artifact stage identity mismatch')
+        if not isinstance(value.get('result'), dict):
+            raise ArtifactValidationError(
+                f'{stage} artifact result must be an object')
+        return 'optimization-stage-envelope-v1'
+
+    def _validate_artifacts(
+            self, stage: str, outcome: StageOutcome
+            ) -> tuple[Mapping[str, str], ...]:
         if not outcome.artifacts_valid or not outcome.artifacts:
-            return False
+            raise ArtifactValidationError(
+                f'{stage} runner did not supply validated artifacts')
+        evidence: list[Mapping[str, str]] = []
         for supplied in outcome.artifacts:
             path = Path(supplied).resolve()
             try:
                 path.relative_to(self.root.resolve())
             except ValueError:
-                return False
+                raise ArtifactValidationError(
+                    f'{stage} artifact escapes the campaign root: {path}')
             if not path.is_file():
-                return False
+                raise ArtifactValidationError(
+                    f'{stage} artifact is missing: {path}')
             expected = outcome.artifact_sha256.get(str(supplied))
-            if expected is None or expected != _sha256(path):
-                return False
-        return (
-            self.artifact_validator(stage, outcome)
-            if self.artifact_validator is not None else True)
+            actual = _sha256(path)
+            if expected is None or expected != actual:
+                raise ArtifactValidationError(
+                    f'{stage} artifact sha256 mismatch: {path}')
+            schema = self._artifact_schema(stage, path)
+            evidence.append({
+                'path': path.relative_to(self.root.resolve()).as_posix(),
+                'sha256': actual,
+                'schema': schema,
+            })
+        if (
+                self.artifact_validator is not None
+                and not self.artifact_validator(stage, outcome)):
+            raise ArtifactValidationError(
+                f'{stage} additional artifact validation failed')
+        return tuple(evidence)
 
-    def _record(self, outcome: StageOutcome, status: str) -> None:
+    def _completed_evidence_valid(
+            self, stage: str, run: Mapping[str, object]) -> bool:
+        evidence = run.get('artifact_evidence')
+        if not isinstance(evidence, list) or not evidence:
+            return False
+        artifacts: list[Path] = []
+        hashes: dict[str, str] = {}
+        try:
+            for record in evidence:
+                if not isinstance(record, dict):
+                    return False
+                relative = Path(record['path'])
+                if relative.is_absolute() or any(
+                        part in {'.', '..'} for part in relative.parts):
+                    return False
+                path = (self.root / relative).resolve()
+                path.relative_to(self.root.resolve())
+                if not path.is_file() or _sha256(path) != record['sha256']:
+                    return False
+                if self._artifact_schema(stage, path) != record['schema']:
+                    return False
+                artifacts.append(path)
+                hashes[str(path)] = record['sha256']
+            outcome = StageOutcome(
+                stage_id=self._stage_id(stage),
+                stage=stage,
+                candidate_id=self.candidate.id,
+                exit_code=0,
+                fingerprint=str(run.get('completion_fingerprint', 'complete')),
+                artifacts_valid=True,
+                artifacts=tuple(artifacts),
+                artifact_sha256=hashes,
+            )
+            return (
+                self.artifact_validator(stage, outcome)
+                if self.artifact_validator is not None else True)
+        except Exception:
+            return False
+
+    def _record(
+            self, outcome: StageOutcome, status: str,
+            **status_details: object) -> None:
         previous = self.store.read().get('runs', {}).get(outcome.stage_id, {})
         lineage = list(previous.get('retry_lineage', []))
-        lineage.append({
+        lineage_record = {
             'attempt': outcome.attempt,
+            'status': status,
             'exit_code': outcome.exit_code,
             'fingerprint': outcome.fingerprint,
             'timestamp': datetime.now(timezone.utc).isoformat(),
-        })
+            **status_details,
+        }
+        lineage.append(lineage_record)
         details = {
             'retry_lineage': lineage,
             'failure_fingerprint': outcome.fingerprint,
             'exit_code': outcome.exit_code,
+            'artifact_evidence': [dict(item) for item in outcome.artifact_evidence],
+            **status_details,
         }
         if outcome.message:
             details['message'] = outcome.message
@@ -228,8 +422,75 @@ class OptimizationController:
         self.store.transition(
             outcome.stage_id, status, attempt=outcome.attempt, **details)
 
+    def _start_attempt(self, stage_id: str, attempt: int) -> None:
+        previous = self.store.read().get('runs', {}).get(stage_id, {})
+        lineage = list(previous.get('retry_lineage', []))
+        lineage.append({
+            'attempt': attempt,
+            'status': 'started',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        })
+        self.store.transition(
+            stage_id, 'running', attempt=attempt, retry_lineage=lineage)
+
+    def _finish_transient(self, outcome: StageOutcome) -> StageOutcome:
+        if outcome.attempt < self.max_attempts:
+            delay = self.retry_delays[min(
+                outcome.attempt - 1, len(self.retry_delays) - 1)]
+            self._record(
+                outcome, 'retry_wait', retry_delay_seconds=delay)
+            return outcome
+        exhausted = self._failure(
+            outcome.stage,
+            outcome.attempt,
+            PERMANENT_EXIT,
+            f'{outcome.stage_id} exhausted {self.max_attempts} attempts; '
+            f'last failure {outcome.fingerprint}',
+        )
+        self._record(exhausted, 'exhausted')
+        return exhausted
+
+    def _ensure_campaign_plan(self) -> None:
+        expected = {
+            'schema_version': 1,
+            'run_ids': list(self.expected_run_ids),
+        }
+        path = self.root / 'campaign-plan.json'
+        if path.exists():
+            try:
+                actual = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError) as error:
+                raise CampaignPlanError(
+                    f'campaign plan is unreadable: {error}') from error
+            if actual != expected:
+                raise CampaignPlanError(
+                    f'campaign plan mismatch: expected {expected}, got {actual}')
+            return
+        self.store._atomic_json(path, expected)
+
     def run_next(self) -> StageOutcome:
         """Run the next incomplete stage and persist its terminal disposition."""
+        try:
+            with CampaignLock(self.controller_lock_path):
+                return self._run_next_locked()
+        except ConcurrentCampaign as error:
+            stage = self.stages[0]
+            return self._failure(stage, 0, TRANSIENT_EXIT, str(error))
+
+    def _run_next_locked(self) -> StageOutcome:
+        """Advance state while holding the controller-wide writer lock."""
+        try:
+            self._ensure_campaign_plan()
+        except CampaignPlanError as error:
+            stage = self.stages[0]
+            stage_id = self._stage_id(stage)
+            previous = self.store.read().get('runs', {}).get(stage_id, {})
+            attempt = int(previous.get('attempt', 0)) + 1
+            self._start_attempt(stage_id, attempt)
+            outcome = self._failure(
+                stage, attempt, PERMANENT_EXIT, str(error))
+            self._record(outcome, 'blocked')
+            return outcome
         stage = self._next_stage()
         if stage is None:
             return StageOutcome(
@@ -242,8 +503,18 @@ class OptimizationController:
             )
         stage_id = self._stage_id(stage)
         previous = self.store.read().get('runs', {}).get(stage_id, {})
-        attempt = int(previous.get('attempt', 0)) + 1
-        self.store.transition(stage_id, 'running', attempt=attempt)
+        previous_attempt = int(previous.get('attempt', 0))
+        if previous_attempt >= self.max_attempts:
+            exhausted = self._failure(
+                stage,
+                previous_attempt,
+                PERMANENT_EXIT,
+                f'{stage_id} exhausted {self.max_attempts} attempts',
+            )
+            self._record(exhausted, 'exhausted')
+            return exhausted
+        attempt = previous_attempt + 1
+        self._start_attempt(stage_id, attempt)
 
         error = self._preflight_error()
         if error is not None:
@@ -257,7 +528,7 @@ class OptimizationController:
         try:
             if stage in CUDA_STAGES:
                 with exclusive_cuda_stage(
-                        self.root / 'gpu.lock', self.device_index,
+                        self.gpu_lock_path, self.device_index,
                         self.allowed_pids, stage_id=stage_id) as acquired:
                     lease = acquired
                     outcome = self.runner(
@@ -268,8 +539,7 @@ class OptimizationController:
         except (ExternalGpuContention, ConcurrentCudaStage) as contention:
             outcome = self._failure(
                 stage, attempt, TRANSIENT_EXIT, str(contention))
-            self._record(outcome, 'retry_wait')
-            return outcome
+            return self._finish_transient(outcome)
         except Exception as error:  # fail closed around route-owned runners
             message = f'{type(error).__name__}: {error}'
             outcome = self._failure(
@@ -292,20 +562,22 @@ class OptimizationController:
                 'runner outcome identity does not match requested stage')
 
         if outcome.exit_code == TRANSIENT_EXIT:
-            self._record(outcome, 'retry_wait')
-            return outcome
+            return self._finish_transient(outcome)
         if outcome.exit_code != 0:
             normalized = (
                 outcome if outcome.exit_code == PERMANENT_EXIT else
                 replace(outcome, exit_code=PERMANENT_EXIT))
             self._record(normalized, 'blocked')
             return normalized
-        if not self._artifacts_are_valid(stage, outcome):
+        try:
+            evidence = self._validate_artifacts(stage, outcome)
+        except Exception as error:
             invalid = self._failure(
                 stage, attempt, PERMANENT_EXIT,
-                f'{stage_id} artifact validation failed')
+                f'{stage_id} artifact validation failed: {error}')
             self._record(invalid, 'blocked')
             return invalid
+        outcome = replace(outcome, artifact_evidence=evidence)
 
         if stage == 'train':
             checkpoint_dir = stage_dir / 'checkpoints'
@@ -314,7 +586,7 @@ class OptimizationController:
             try:
                 retain_checkpoints(
                     checkpoint_dir, validator=self.checkpoint_validator)
-            except OSError as error:
+            except Exception as error:
                 invalid = self._failure(
                     stage, attempt, PERMANENT_EXIT,
                     f'{stage_id} checkpoint retention failed: {error}')

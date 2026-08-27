@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Sequence
 
 
@@ -56,9 +57,37 @@ def _atomic_json(path: Path, value: object) -> None:
 class SubprocessStageRunner:
     """Execute route tools without a shell and return hashed artifacts."""
 
-    def __init__(self, campaign_root: Path, manifest_path: Path):
+    def __init__(
+            self, campaign_root: Path, manifest_path: Path,
+            *, device_index: int = 0, heartbeat_interval: float = 30.0):
         self.campaign_root = campaign_root
         self.manifest_path = manifest_path
+        self.device_index = device_index
+        self.heartbeat_interval = heartbeat_interval
+
+    def environment(self) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment.update({
+            'PYTHONNOUSERSITE': '1',
+            'CUDA_VISIBLE_DEVICES': str(self.device_index),
+            'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1',
+        })
+        return environment
+
+    def wait_with_heartbeat(
+            self, process: subprocess.Popen, heartbeat_path: Path,
+            payload: dict[str, object]) -> int:
+        while True:
+            returncode = process.poll()
+            _atomic_json(heartbeat_path, {
+                **payload,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'pid': process.pid,
+                'phase': 'exited' if returncode is not None else 'running',
+            })
+            if returncode is not None:
+                return returncode
+            time.sleep(self.heartbeat_interval)
 
     def _relative(self, path: Path) -> str:
         return path.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
@@ -98,12 +127,7 @@ class SubprocessStageRunner:
 
         log_path = stage_dir / f'attempt-{attempt}.log'
         heartbeat_path = self.campaign_root / 'heartbeat.json'
-        environment = os.environ.copy()
-        environment.update({
-            'PYTHONNOUSERSITE': '1',
-            'CUDA_VISIBLE_DEVICES': '0',
-            'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1',
-        })
+        environment = self.environment()
         with log_path.open('a', encoding='utf-8') as log:
             process = subprocess.Popen(
                 command,
@@ -114,14 +138,11 @@ class SubprocessStageRunner:
                 text=True,
                 start_new_session=False,
             )
-            _atomic_json(heartbeat_path, {
-                'timestamp': datetime.now(timezone.utc).isoformat(),
-                'pid': process.pid,
+            returncode = self.wait_with_heartbeat(process, heartbeat_path, {
                 'stage_id': f'{candidate.id}:{stage}',
                 'attempt': attempt,
                 'log_path': self._relative(log_path),
             })
-            returncode = process.wait()
 
         message = log_path.read_text(
             encoding='utf-8', errors='replace')[-4096:]
@@ -173,6 +194,22 @@ def _select(
     return selected
 
 
+def _canonical_gpu_lock() -> Path:
+    result = subprocess.run(
+        ['git', 'rev-parse', '--git-common-dir'],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = REPO_ROOT / common
+    common = common.resolve()
+    checkout_root = common.parent if common.name == '.git' else common
+    return checkout_root / 'work_dirs/optimization/gpu.lock'
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group(required=True)
@@ -182,6 +219,7 @@ def main() -> int:
     parser.add_argument('--manifest', type=Path, default=MANIFEST_PATH)
     parser.add_argument('--campaign-root', type=Path, default=CAMPAIGN_ROOT)
     parser.add_argument('--device-index', type=int, default=0)
+    parser.add_argument('--gpu-lock-path', type=Path)
     args = parser.parse_args()
     if args.status:
         return _status(args.campaign_root)
@@ -193,7 +231,18 @@ def main() -> int:
         print(str(error), file=sys.stderr)
         return PERMANENT_EXIT
 
-    runner = SubprocessStageRunner(args.campaign_root, args.manifest)
+    try:
+        gpu_lock_path = args.gpu_lock_path or _canonical_gpu_lock()
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f'cannot derive canonical GPU lock: {error}', file=sys.stderr)
+        return PERMANENT_EXIT
+    expected_run_ids = tuple(
+        f'{candidate.id}:{stage}'
+        for candidate in candidates
+        for stage in ('profile', 'calibrate', 'train', 'evaluate', 'latency',
+                      'compare'))
+    runner = SubprocessStageRunner(
+        args.campaign_root, args.manifest, device_index=args.device_index)
     for candidate in candidates:
         controller = OptimizationController(
             args.campaign_root,
@@ -201,6 +250,8 @@ def main() -> int:
             runner,
             repository_root=REPO_ROOT,
             device_index=args.device_index,
+            gpu_lock_path=gpu_lock_path,
+            expected_run_ids=expected_run_ids,
         )
         while True:
             outcome = controller.run_next()
