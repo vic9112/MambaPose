@@ -1,6 +1,7 @@
 _base_ = ['./pwl_silu.py']
 numeric_optimization = dict(
     pwl=dict(
+        candidate_id='pwl-gelu-s-v1',
         enabled_function='gelu', source='module',
         roles=(
             'backbone.layers.0.blocks.0.mlp.act',

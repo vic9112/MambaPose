@@ -373,7 +373,23 @@ def test_calibration_schema_rejects_strip_downgrade_and_unknown_version():
     with pytest.raises(CalibrationContractError, match='schema v1'):
         validate_calibration_artifact(downgraded)
 
-    for unknown_version in (3, True, [], None):
+    pwl = copy.deepcopy(valid)
+    pwl['schema_version'] = 3
+    pwl['candidate_id'] = 'pwl-silu-s-v1'
+    from mambapose_opt.pwl_artifacts import fit_pwl_observations
+    pwl['pwl_fit'] = fit_pwl_observations(
+        candidate_id='pwl-silu-s-v1',
+        policy={
+            'enabled_function': 'silu', 'source': 'module',
+            'roles': ('block.act',), 'domain': (-2.0, 2.0),
+            'segments': 4, 'grid_points': 129, 'saturation': 'clamp',
+            'qat_form': 'differentiable',
+            'selection_policy': 'observed-range-max-then-mean-v1',
+        },
+        observations={'block.act': [torch.tensor([-1.0, 0.0, 1.0])]})
+    assert validate_calibration_artifact(pwl) is pwl
+
+    for unknown_version in (4, True, [], None):
         unknown = copy.deepcopy(valid)
         unknown['schema_version'] = unknown_version
         with pytest.raises(CalibrationContractError, match='version'):
@@ -802,7 +818,8 @@ def test_ss2d_numeric_callback_is_opt_in_and_default_state_output_exact():
     assert {role for role, _ in records} == {
         'x_proj', 'dt_proj', 'scan_input_u', 'scan_input_dt',
         'transition_A', 'transition_B', 'transition_C', 'transition_D',
-        'transition_delta_bias', 'scan_output',
+        'transition_delta_bias', 'scan_output', 'transition_exp_input',
+        'transition_softplus_input',
     }
 
 

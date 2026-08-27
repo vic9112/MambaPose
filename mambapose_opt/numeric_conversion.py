@@ -11,7 +11,6 @@ from typing import Any, Mapping
 
 from mmengine.hooks import Hook
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from mmpose.registry import HOOKS
@@ -19,33 +18,24 @@ from mmpose.registry import HOOKS
 from mmpose.models.utils.hardware_friendly.fake_quant import (
     ConversionReport, QuantPolicy, QuantSpec, convert_for_fake_quant,
     export_int8_state)
-from mmpose.models.utils.hardware_friendly.pwl import fit_pwl
+from mmpose.models.utils.hardware_friendly.pwl import (
+    PiecewiseLinearApproximation)
+from mambapose_opt.pwl_artifacts import (
+    PWLArtifactError, PWLInstallationReport, load_pwl_fit_reference,
+    load_pwl_installation_reference, validate_pwl_fit_report)
 
 
 class NumericBindingError(ValueError):
     """Raised when a downstream numeric artifact no longer matches its input."""
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
 @dataclass(frozen=True)
 class NumericInputBinding:
     paths: tuple[tuple[str, str], ...]
     sha256: tuple[tuple[str, str], ...]
-
-
-@dataclass(frozen=True)
-class PWLInstallationReport:
-    """Exact runtime roles changed by one fitted nonlinear function."""
-
-    function_name: str
-    source: str
-    roles: tuple[str, ...]
-    domain: tuple[float, float]
-    segments: int
-    max_error: float
-    mean_error: float
-    saturation: str = 'clamp'
-    qat_form: str = 'differentiable'
-    hardware_latency_claimed: bool = False
 
 
 def _sha256(path: Path) -> str:
@@ -95,7 +85,11 @@ def numeric_stage_plan(
         return ('convert', 'export', 'profile', 'evaluate', 'latency')
     if kind == 'w8a8':
         return ('calibrate', 'convert', 'profile', 'evaluate', 'latency')
-    if kind in {'pwl', 'binary-qk'}:
+    if kind == 'pwl':
+        if not conditional:
+            raise ValueError(f'{kind} requires explicit conditional admission')
+        return ('calibrate', 'convert', 'profile', 'evaluate', 'latency')
+    if kind == 'binary-qk':
         if not conditional:
             raise ValueError(f'{kind} requires explicit conditional admission')
         return ('profile', 'evaluate', 'latency')
@@ -285,93 +279,111 @@ def _parent_and_leaf(model: nn.Module, name: str) -> tuple[nn.Module, str]:
     return (model.get_submodule(parent_name) if parent_name else model), leaf
 
 
-def _install_pwl_runtime(
-        model: nn.Module,
-        numeric_optimization: Mapping[str, Any]) -> PWLInstallationReport:
+def install_pwl_fit(
+        model: nn.Module, *, fit: Mapping[str, Any],
+        expected_report: PWLInstallationReport) -> PWLInstallationReport:
+    """Install only coefficients authenticated by a measured fit report."""
+    fitted = validate_pwl_fit_report(fit)
+    expected = {
+        'function_name': fitted['function_name'],
+        'source': fitted['source'],
+        'roles': tuple(fitted['operation_roles']),
+        'input_roles': tuple(
+            item['exact_input_role'] for item in fitted['input_roles']),
+        'domain': tuple(fitted['domain']),
+        'segments': fitted['segments'],
+        'in_domain_max_error': fitted['in_domain_error']['max'],
+        'in_domain_mean_error': fitted['in_domain_error']['mean'],
+        'observed_range': tuple(fitted['observed_range']),
+        'observed_range_max_error': fitted['observed_range_error']['max'],
+        'observed_range_mean_error': fitted['observed_range_error']['mean'],
+        'clamp_ratio': fitted['clamp']['ratio'],
+        'saturation': fitted['saturation'],
+        'qat_form': fitted['qat_form'],
+        'hardware_latency_claimed': False,
+        'exact_comparator': fitted['exact_comparator'],
+    }
+    if any(getattr(expected_report, name) != value
+           for name, value in expected.items()):
+        raise NumericBindingError(
+            'PWL installation report disagrees with measured fit')
     existing = getattr(model, '_numeric_pwl_installation_report', None)
     if existing is not None:
-        if not isinstance(existing, PWLInstallationReport):
+        if existing != expected_report:
             raise NumericBindingError('PWL runtime marker is invalid')
         return existing
-    value = numeric_optimization.get('pwl')
-    required = {
-        'enabled_function', 'source', 'roles', 'domain', 'segments',
-        'grid_points', 'saturation', 'qat_form'}
-    if not isinstance(value, Mapping) or set(value) != required:
-        raise NumericBindingError(
-            'PWL runtime requires an exact source/role/function contract')
-    function_name = value['enabled_function']
-    if not isinstance(function_name, str) or function_name not in {
-            'silu', 'gelu', 'softplus', 'exp'}:
-        raise NumericBindingError(
-            'PWL runtime must select exactly one supported function')
-    source = value['source']
-    if source not in {'module', 'ss2d-transition'}:
-        raise NumericBindingError('PWL source must be module or ss2d-transition')
-    roles = value['roles']
-    if (not isinstance(roles, (tuple, list)) or not roles
-            or any(not isinstance(role, str) or not role for role in roles)
-            or len(set(roles)) != len(roles)):
-        raise NumericBindingError('PWL roles must be unique exact module names')
-    roles = tuple(roles)
-    if value['saturation'] != 'clamp':
-        raise NumericBindingError('PWL saturation must be clamp')
-    if value['qat_form'] != 'differentiable':
-        raise NumericBindingError('PWL QAT form must be differentiable')
-    domain_value = value['domain']
-    if not isinstance(domain_value, (tuple, list)) or len(domain_value) != 2:
-        raise NumericBindingError('PWL domain must contain two bounds')
-    domain = (float(domain_value[0]), float(domain_value[1]))
-    reference = {
-        'silu': F.silu, 'gelu': F.gelu,
-        'softplus': F.softplus, 'exp': torch.exp}[function_name]
-    try:
-        approximation = fit_pwl(
-            reference, domain, int(value['segments']), int(value['grid_points']),
-            function_name=function_name)
-    except (TypeError, ValueError) as error:
-        raise NumericBindingError(f'invalid PWL fit contract: {error}') from error
+    coefficients = fitted['coefficients']
 
+    def approximation() -> PiecewiseLinearApproximation:
+        return PiecewiseLinearApproximation(
+            coefficients['breakpoints'], coefficients['slopes'],
+            coefficients['intercepts'],
+            function_name=fitted['function_name'],
+            max_error=fitted['in_domain_error']['max'],
+            mean_error=fitted['in_domain_error']['mean'])
+
+    roles = tuple(fitted['operation_roles'])
     modules = dict(model.named_modules())
     missing = tuple(role for role in roles if role not in modules)
     if missing:
         raise NumericBindingError(f'PWL roles are missing: {missing}')
-    if source == 'module':
-        expected = nn.SiLU if function_name == 'silu' else (
-            nn.GELU if function_name == 'gelu' else None)
+    if fitted['source'] == 'module':
+        expected_type = (
+            nn.SiLU if fitted['function_name'] == 'silu' else nn.GELU)
         invalid = tuple(
-            role for role in roles
-            if expected is None or type(modules[role]) is not expected)
+            role for role in roles if type(modules[role]) is not expected_type)
         if invalid:
             raise NumericBindingError(
                 f'PWL module roles have incompatible function: {invalid}')
-        for index, role in enumerate(roles):
-            fitted = approximation if index == 0 else fit_pwl(
-                reference, domain, int(value['segments']),
-                int(value['grid_points']), function_name=function_name)
+        for role in roles:
             parent, leaf = _parent_and_leaf(model, role)
-            setattr(parent, leaf, fitted)
+            setattr(parent, leaf, approximation())
     else:
-        if function_name not in {'softplus', 'exp'}:
-            raise NumericBindingError(
-                'functional SS2D source admits only softplus or exp')
         invalid = tuple(
             role for role in roles
             if not callable(getattr(modules[role], 'install_numeric_pwl', None)))
         if invalid:
             raise NumericBindingError(
-                f'PWL functional roles do not expose SS2D installation: {invalid}')
-        for index, role in enumerate(roles):
-            fitted = approximation if index == 0 else fit_pwl(
-                reference, domain, int(value['segments']),
-                int(value['grid_points']), function_name=function_name)
-            modules[role].install_numeric_pwl(function_name, fitted)
-    report = PWLInstallationReport(
-        function_name=function_name, source=source, roles=roles,
-        domain=domain, segments=approximation.segments,
-        max_error=approximation.max_error, mean_error=approximation.mean_error)
-    model._numeric_pwl_installation_report = report
-    return report
+                f'PWL functional roles do not expose SS2D installation: '
+                f'{invalid}')
+        for role in roles:
+            modules[role].install_numeric_pwl(
+                fitted['function_name'], approximation())
+    model._numeric_pwl_installation_report = expected_report
+    return expected_report
+
+
+def _install_pwl_runtime(
+        model: nn.Module,
+        numeric_optimization: Mapping[str, Any]) -> PWLInstallationReport:
+    value = numeric_optimization.get('pwl')
+    required = {
+        'enabled_function', 'source', 'roles', 'domain', 'segments',
+        'grid_points', 'saturation', 'qat_form', 'selection_policy',
+        'candidate_id', 'fit_artifact', 'installation_manifest'}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise NumericBindingError(
+            'PWL runtime requires fit artifact and installation manifest')
+    candidate_id = value['candidate_id']
+    if not isinstance(candidate_id, str) or not candidate_id:
+        raise NumericBindingError('PWL runtime candidate identity is invalid')
+    policy = {
+        name: value[name] for name in (
+            'enabled_function', 'source', 'roles', 'domain', 'segments',
+            'grid_points', 'saturation', 'qat_form', 'selection_policy')}
+    try:
+        fit = load_pwl_fit_reference(
+            value['fit_artifact'], repository_root=REPOSITORY_ROOT,
+            expected_candidate_id=candidate_id, expected_policy=policy)
+        installation = load_pwl_installation_reference(
+            value['installation_manifest'], repository_root=REPOSITORY_ROOT,
+            expected_candidate_id=candidate_id,
+            expected_fit_reference=value['fit_artifact'], expected_fit=fit)
+    except PWLArtifactError as error:
+        raise NumericBindingError(
+            f'PWL measured deployment binding is invalid: {error}') from error
+    return install_pwl_fit(
+        model, fit=fit, expected_report=installation['report_object'])
 
 
 @HOOKS.register_module()
@@ -406,4 +418,5 @@ __all__ = [
     'PWLInstallationReport',
     'NumericRuntimeHook', 'QuantPolicy', 'QuantSpec', 'apply_numeric_runtime',
     'bind_numeric_inputs', 'convert_for_fake_quant', 'export_int8_state',
-    'numeric_stage_plan', 'quant_policy_from_config', 'verify_numeric_inputs']
+    'install_pwl_fit', 'numeric_stage_plan', 'quant_policy_from_config',
+    'verify_numeric_inputs']

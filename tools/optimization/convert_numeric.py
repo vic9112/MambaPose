@@ -25,9 +25,13 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.checkpoints import authorize_manifest_candidate
 from mambapose_opt.numeric_conversion import (
-    bind_numeric_inputs, quant_policy_from_config, verify_numeric_inputs)
+    bind_numeric_inputs, install_pwl_fit, quant_policy_from_config,
+    verify_numeric_inputs)
 from mambapose_opt.numeric_calibration import validate_calibration_provenance
 from mambapose_opt.numeric_source import build_numeric_source_binding
+from mambapose_opt.pwl_artifacts import (
+    build_pwl_installation_manifest, validate_pwl_fit_report,
+    validate_pwl_installation_manifest)
 from mambapose_opt.schema import load_candidate_manifest
 from mmpose.models.utils.hardware_friendly import (
     convert_for_fake_quant, export_int8_state)
@@ -68,11 +72,15 @@ def _atomic_json(path: Path, value: dict) -> None:
 def convert(
         candidate, *, stage: str, output: Path, manifest_path: Path,
         calibration_artifact: Path | None = None) -> dict:
+    kind = candidate.features.get('numeric_kind')
     if candidate.route != 'ssm-quant-pwl' \
-            or candidate.features.get('numeric_kind') not in {
-                'weight-only', 'w8a8'}:
+            or kind not in {'weight-only', 'w8a8', 'pwl'}:
         raise ValueError(
-            'deterministic Stage A conversion admits W8/W8A8 only')
+            'deterministic Stage A conversion admits W8/W8A8/PWL only')
+    if kind == 'pwl' and calibration_artifact is None:
+        raise ValueError('PWL conversion requires completed calibration fit artifact')
+    if kind == 'pwl' and stage != 'convert':
+        raise ValueError('PWL conversion has one install stage and no packed export')
     authorized = authorize_manifest_candidate(
         REPOSITORY_ROOT, manifest_path, candidate.id)
     if authorized.candidate != candidate:
@@ -86,23 +94,29 @@ def convert(
     checkpoint_path = authorized.checkpoint_path
     config = Config.fromfile(config_path)
     calibration = None
-    if candidate.features.get('numeric_kind') == 'w8a8':
+    if kind in {'w8a8', 'pwl'}:
         if calibration_artifact is None:
-            raise ValueError('W8A8 conversion requires --calibration-artifact')
+            raise ValueError(
+                f'{kind} conversion requires --calibration-artifact')
         calibration_artifact = calibration_artifact.resolve()
         calibration_artifact.relative_to(REPOSITORY_ROOT.resolve())
         calibration = json.loads(calibration_artifact.read_text(encoding='utf-8'))
         validate_calibration_provenance(
             calibration, expected_candidate=candidate,
             repository_root=REPOSITORY_ROOT, manifest_path=manifest_path)
-        config.numeric_optimization.quant_policy.calibration_artifact = {
+        calibration_reference = {
             'path': calibration_artifact.relative_to(
                 REPOSITORY_ROOT).as_posix(),
             'sha256': _sha256(calibration_artifact),
         }
-    policy = quant_policy_from_config(
-        config.numeric_optimization.quant_policy,
-        calibration_artifact=calibration)
+        if kind == 'w8a8':
+            config.numeric_optimization.quant_policy.calibration_artifact = (
+                calibration_reference)
+    policy = (
+        quant_policy_from_config(
+            config.numeric_optimization.quant_policy,
+            calibration_artifact=calibration)
+        if kind != 'pwl' else None)
     runtime_paths = {
         'config': config_path,
         'checkpoint': checkpoint_path,
@@ -115,8 +129,68 @@ def convert(
 
     from mmpose.apis import init_model
     model = init_model(str(config_path), str(checkpoint_path), device='cpu')
-    report = convert_for_fake_quant(model, policy)
+    if kind == 'pwl':
+        pwl_policy = config.numeric_optimization.pwl
+        if pwl_policy.get('candidate_id') != candidate.id:
+            raise ValueError('PWL policy candidate identity is invalid')
+        fit = validate_pwl_fit_report(
+            calibration.get('pwl_fit'), expected_candidate_id=candidate.id,
+            expected_policy={
+                name: pwl_policy[name] for name in (
+                    'enabled_function', 'source', 'roles', 'domain',
+                    'segments', 'grid_points', 'saturation', 'qat_form',
+                    'selection_policy')})
+        installation = build_pwl_installation_manifest(
+            candidate_id=candidate.id, fit=fit,
+            fit_reference=calibration_reference)
+        installation_path = output.parent / 'pwl-installation.json'
+        _atomic_json(installation_path, installation)
+        installation_reference = {
+            'path': installation_path.relative_to(REPOSITORY_ROOT).as_posix(),
+            'sha256': _sha256(installation_path),
+        }
+        report = validate_pwl_installation_manifest(
+            installation, expected_candidate_id=candidate.id,
+            expected_fit_reference=calibration_reference)['report_object']
+        install_pwl_fit(model, fit=fit, expected_report=report)
+        config.numeric_optimization.pwl.fit_artifact = calibration_reference
+        config.numeric_optimization.pwl.installation_manifest = (
+            installation_reference)
+    else:
+        report = convert_for_fake_quant(model, policy)
     verify_numeric_inputs(binding)
+    if kind == 'pwl':
+        runtime_config = output.parent / 'resolved-runtime.py'
+        config.dump(runtime_config)
+        return {
+            'schema_version': 1,
+            'candidate_id': candidate.id,
+            'stage': stage,
+            'result': {
+                'source': source,
+                'runtime_bindings': {
+                    role: {
+                        'path': (
+                            candidate.checkpoint.as_posix()
+                            if role == 'checkpoint'
+                            else calibration_reference['path']
+                            if role == 'calibration'
+                            else candidate.config.as_posix()),
+                        'sha256': checksum,
+                    }
+                    for role, checksum in binding.sha256
+                },
+                'runtime_config': {
+                    'path': runtime_config.relative_to(
+                        REPOSITORY_ROOT).as_posix(),
+                    'sha256': _sha256(runtime_config),
+                },
+                'installation': installation_reference,
+                'operation_manifest': installation['operation_manifest'],
+                'latency_claim': (
+                    'none-pwl-pytorch-runtime-is-not-fpga-proof'),
+            },
+        }
     result = {
         'source': source,
         'runtime_bindings': {

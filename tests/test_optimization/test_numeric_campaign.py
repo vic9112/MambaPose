@@ -2110,7 +2110,8 @@ def test_initial_conditional_candidates_do_not_depend_on_recovery_training():
         {'numeric_kind': 'pwl', 'auto_run': False, 'conditional': True})
     assert _stages_for_candidate(w8a8) == (
         'calibrate', 'convert', 'profile', 'evaluate', 'latency')
-    assert _stages_for_candidate(pwl) == ('profile', 'evaluate', 'latency')
+    assert _stages_for_candidate(pwl) == (
+        'calibrate', 'convert', 'profile', 'evaluate', 'latency')
     assert Path('tools/optimization/train_candidate.py').is_file()
 
 

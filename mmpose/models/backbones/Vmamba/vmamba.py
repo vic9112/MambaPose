@@ -673,6 +673,7 @@ class SS2Dv2:
             xs = xs.view(B, -1, L)
             dts = dts.contiguous().view(B, -1, L)
             log_a = A_logs.to(torch.float)
+            self._observe_numeric("transition_exp_input", log_a)
             As = -(self._apply_numeric_pwl('exp', log_a)
                    if self._numeric_pwl_function == 'exp'
                    else torch.exp(log_a)) # (k * c, d_state)
@@ -686,9 +687,14 @@ class SS2Dv2:
 
             scan_delta_bias = delta_bias
             scan_delta_softplus = delta_softplus
+            softplus_input = None
+            if (self._numeric_observer_callback is not None
+                    or self._numeric_pwl_function == 'softplus'):
+                softplus_input = dts + delta_bias.view(1, -1, 1)
+                self._observe_numeric(
+                    "transition_softplus_input", softplus_input)
             if self._numeric_pwl_function == 'softplus':
-                dts = self._apply_numeric_pwl(
-                    'softplus', dts + delta_bias.view(1, -1, 1))
+                dts = self._apply_numeric_pwl('softplus', softplus_input)
                 scan_delta_bias = None
                 scan_delta_softplus = False
 

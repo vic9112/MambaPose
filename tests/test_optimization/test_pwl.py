@@ -5,6 +5,34 @@ from mmengine.config import Config
 from torch import nn
 
 
+def _install_measured_pwl(model, *, function_name, source, roles):
+    from mambapose_opt.numeric_conversion import install_pwl_fit
+    from mambapose_opt.pwl_artifacts import (
+        build_pwl_installation_manifest, fit_pwl_observations,
+        validate_pwl_installation_manifest)
+
+    policy = {
+        'enabled_function': function_name, 'source': source, 'roles': roles,
+        'domain': (-4.0, 4.0), 'segments': 4, 'grid_points': 129,
+        'saturation': 'clamp', 'qat_form': 'differentiable',
+        'selection_policy': 'observed-range-max-then-mean-v1',
+    }
+    fit = fit_pwl_observations(
+        candidate_id=f'pwl-{function_name}-test', policy=policy,
+        observations={
+            role: [torch.tensor([-3.0, -0.2, 1.3, 3.8])]
+            for role in roles})
+    reference = {'path': 'work_dirs/optimization/test/calibrate.json',
+                 'sha256': 'a' * 64}
+    manifest = build_pwl_installation_manifest(
+        candidate_id=f'pwl-{function_name}-test', fit=fit,
+        fit_reference=reference)
+    report = validate_pwl_installation_manifest(
+        manifest, expected_candidate_id=f'pwl-{function_name}-test',
+        expected_fit_reference=reference)['report_object']
+    return install_pwl_fit(model, fit=fit, expected_report=report)
+
+
 def test_pwl_rejects_unsorted_or_discontinuous_segments():
     from mmpose.models.utils.hardware_friendly import PiecewiseLinearApproximation
 
@@ -69,26 +97,13 @@ def test_disabled_pwl_is_bit_exact_and_has_no_state_keys():
 ])
 def test_pwl_runtime_replaces_only_explicit_module_roles_and_is_called(
         function_name, module_type):
-    from mambapose_opt.numeric_conversion import apply_numeric_runtime
     from mmpose.models.utils.hardware_friendly import PiecewiseLinearApproximation
 
     model = nn.ModuleDict({'selected': module_type(), 'untouched': module_type()})
     before_keys = tuple(model.state_dict())
-    config = {
-        'candidate_kind': 'pwl',
-        'pwl': {
-            'enabled_function': function_name,
-            'source': 'module',
-            'roles': ('selected',),
-            'domain': (-4.0, 4.0),
-            'segments': 4,
-            'grid_points': 129,
-            'saturation': 'clamp',
-            'qat_form': 'differentiable',
-        },
-    }
-
-    report = apply_numeric_runtime(model, config)
+    report = _install_measured_pwl(
+        model, function_name=function_name, source='module',
+        roles=('selected',))
     assert report.function_name == function_name
     assert report.source == 'module'
     assert report.roles == ('selected',)
@@ -123,24 +138,10 @@ class _FunctionalPWLHost(nn.Module):
 ])
 def test_pwl_runtime_installs_functional_ss2d_source_and_is_called(
         function_name, reference):
-    from mambapose_opt.numeric_conversion import apply_numeric_runtime
-
     model = nn.ModuleDict({'scan': _FunctionalPWLHost()})
-    config = {
-        'candidate_kind': 'pwl',
-        'pwl': {
-            'enabled_function': function_name,
-            'source': 'ss2d-transition',
-            'roles': ('scan',),
-            'domain': (-4.0, 4.0),
-            'segments': 4,
-            'grid_points': 129,
-            'saturation': 'clamp',
-            'qat_form': 'differentiable',
-        },
-    }
-
-    report = apply_numeric_runtime(model, config)
+    report = _install_measured_pwl(
+        model, function_name=function_name, source='ss2d-transition',
+        roles=('scan',))
     approximation = model['scan'].installed[function_name]
     calls = []
     approximation.register_forward_hook(lambda *_args: calls.append(True))
@@ -164,7 +165,7 @@ def test_pwl_runtime_default_off_is_operation_and_state_key_exact():
     torch.testing.assert_close(model(value), expected, rtol=0, atol=0)
 
 
-def test_pwl_runtime_rejects_ambiguous_function_or_role_source():
+def test_pwl_runtime_rejects_unfitted_ambiguous_function_or_role_source():
     from mambapose_opt.numeric_conversion import (
         NumericBindingError, apply_numeric_runtime)
 
@@ -178,11 +179,11 @@ def test_pwl_runtime_rejects_ambiguous_function_or_role_source():
             'qat_form': 'differentiable',
         },
     }
-    with pytest.raises(NumericBindingError, match='exactly one'):
+    with pytest.raises(NumericBindingError, match='fit artifact'):
         apply_numeric_runtime(model, base)
     base['pwl']['enabled_function'] = 'silu'
     base['pwl']['source'] = 'ss2d-transition'
-    with pytest.raises(NumericBindingError, match='functional'):
+    with pytest.raises(NumericBindingError, match='fit artifact'):
         apply_numeric_runtime(model, base)
 
 
@@ -196,23 +197,21 @@ def test_pwl_stage_config_installs_real_numeric_runtime_hook(name):
         for hook in config.custom_hooks)
 
 
-def test_numeric_runtime_hook_public_entrypoint_installs_pwl():
-    from mambapose_opt.numeric_conversion import NumericRuntimeHook
-    from mmpose.models.utils.hardware_friendly import PiecewiseLinearApproximation
+def test_numeric_runtime_hook_refuses_unfitted_pwl_policy():
+    from mambapose_opt.numeric_conversion import (
+        NumericBindingError, NumericRuntimeHook)
 
     model = nn.ModuleDict({'selected': nn.SiLU()})
-    report = NumericRuntimeHook.apply_to_model(model, {
-        'candidate_kind': 'pwl',
-        'pwl': {
-            'enabled_function': 'silu', 'source': 'module',
-            'roles': ('selected',), 'domain': (-4.0, 4.0),
-            'segments': 4, 'grid_points': 129, 'saturation': 'clamp',
-            'qat_form': 'differentiable',
-        },
-    })
-
-    assert report.function_name == 'silu'
-    assert isinstance(model['selected'], PiecewiseLinearApproximation)
+    with pytest.raises(NumericBindingError, match='fit artifact'):
+        NumericRuntimeHook.apply_to_model(model, {
+            'candidate_kind': 'pwl',
+            'pwl': {
+                'enabled_function': 'silu', 'source': 'module',
+                'roles': ('selected',), 'domain': (-4.0, 4.0),
+                'segments': 4, 'grid_points': 129, 'saturation': 'clamp',
+                'qat_form': 'differentiable',
+            },
+        })
 
 
 @pytest.mark.parametrize('function_name', ['softplus', 'exp'])

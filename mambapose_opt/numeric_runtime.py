@@ -53,30 +53,36 @@ def validate_numeric_convert_artifact(
             or not isinstance(value.get('result'), Mapping)):
         raise NumericRuntimeError('numeric convert envelope identity is invalid')
     kind = candidate.features.get('numeric_kind')
-    if kind not in {'weight-only', 'w8a8'}:
+    if kind not in {'weight-only', 'w8a8', 'pwl'}:
         raise NumericRuntimeError('numeric convert candidate kind is invalid')
-    if kind == 'w8a8':
+    if kind in {'w8a8', 'pwl'}:
         artifact_path = _repository_artifact_path(
             repository_root, artifact_path)
     result = value['result']
-    expected_fields = {
-        'source', 'runtime_bindings', 'conversion', 'precision_invariants',
-        'latency_claim'}
+    expected_fields = (
+        {'source', 'runtime_bindings', 'runtime_config', 'installation',
+         'operation_manifest', 'latency_claim'}
+        if kind == 'pwl' else
+        {'source', 'runtime_bindings', 'conversion', 'precision_invariants',
+         'latency_claim'})
     if kind == 'w8a8':
         expected_fields.add('runtime_config')
     if stage == 'export':
         expected_fields.add('export')
     if set(result) != expected_fields:
         raise NumericRuntimeError('numeric convert result fields are invalid')
-    if result.get('latency_claim') != (
-            'none-fake-quant-is-not-an-integer-kernel'):
-        raise NumericRuntimeError('numeric fake-QDQ latency claim is invalid')
+    expected_latency_claim = (
+        'none-pwl-pytorch-runtime-is-not-fpga-proof'
+        if kind == 'pwl' else
+        'none-fake-quant-is-not-an-integer-kernel')
+    if result.get('latency_claim') != expected_latency_claim:
+        raise NumericRuntimeError('numeric latency claim is invalid')
     source = validate_numeric_source_binding(
         result['source'], repository_root=repository_root,
         candidate=candidate, manifest_path=manifest_path)
     bindings = result['runtime_bindings']
     expected_roles = {'config', 'checkpoint', 'policy'}
-    if kind == 'w8a8':
+    if kind in {'w8a8', 'pwl'}:
         expected_roles.add('calibration')
     if not isinstance(bindings, Mapping) or set(bindings) != expected_roles:
         raise NumericRuntimeError('numeric runtime bindings are incomplete')
@@ -100,12 +106,12 @@ def validate_numeric_convert_artifact(
                     f'{error}') from error
         else:
             _file(repository_root, bindings[role], f'numeric {role}')
-    conversion = result['conversion']
+    conversion = result.get('conversion')
     conversion_fields = {
         'converted', 'skipped', 'original_weight_bytes',
         'simulated_weight_bytes', 'simulated_coverage', 'simulation_only',
         'integer_kernel_latency_claimed'}
-    if (not isinstance(conversion, Mapping)
+    if kind != 'pwl' and (not isinstance(conversion, Mapping)
             or set(conversion) != conversion_fields
             or not isinstance(conversion.get('converted'), list)
             or not conversion['converted']
@@ -129,14 +135,15 @@ def validate_numeric_convert_artifact(
     if not isinstance(numeric, Mapping):
         raise NumericRuntimeError('numeric policy config is missing')
     policy = numeric.get('quant_policy')
-    if (not isinstance(policy, Mapping)
+    if kind != 'pwl' and (
+            not isinstance(policy, Mapping)
             or conversion['converted'] != list(policy.get('allow', ()))
             or conversion['skipped'] != list(policy.get('deny', ()))
             or result['precision_invariants'] != dict(
                 numeric.get('precision_invariants', {}))):
         raise NumericRuntimeError(
             'numeric conversion report disagrees with policy')
-    if kind == 'w8a8':
+    if kind in {'w8a8', 'pwl'}:
         expected_calibration = (
             artifact_path.parent.parent / 'calibrate/calibrate.json')
         try:
@@ -144,19 +151,19 @@ def validate_numeric_convert_artifact(
                 repository_root).as_posix()
         except ValueError as error:
             raise NumericRuntimeError(
-                'W8A8 calibration stage escapes repository') from error
+                'numeric calibration stage escapes repository') from error
         calibration_reference = bindings.get('calibration')
         if (not isinstance(calibration_reference, Mapping)
                 or calibration_reference.get('path') != expected_relative):
             raise NumericRuntimeError(
-                'W8A8 calibration dependency is not the canonical stage output')
+                'numeric calibration dependency is not the canonical stage output')
         calibration_path = _file(
-            repository_root, calibration_reference, 'W8A8 calibration')
+            repository_root, calibration_reference, 'numeric calibration')
         try:
             calibration = json.loads(
                 calibration_path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError) as error:
-            raise NumericRuntimeError('W8A8 calibration is invalid JSON') from error
+            raise NumericRuntimeError('numeric calibration is invalid JSON') from error
         from .numeric_calibration import (
             CalibrationContractError, validate_calibration_provenance)
         try:
@@ -166,22 +173,67 @@ def validate_numeric_convert_artifact(
                 manifest_path=manifest_path)
         except CalibrationContractError as error:
             raise NumericRuntimeError(
-                f'W8A8 calibration contract is invalid: {error}') from error
+                f'numeric calibration contract is invalid: {error}') from error
         runtime_reference = result['runtime_config']
         expected_runtime = artifact_path.parent / 'resolved-runtime.py'
         if (not isinstance(runtime_reference, Mapping)
                 or runtime_reference.get('path') != expected_runtime.relative_to(
                     repository_root).as_posix()):
             raise NumericRuntimeError(
-                'W8A8 runtime config is not the canonical convert output')
+                'numeric runtime config is not the canonical convert output')
         runtime_path = _file(
-            repository_root, runtime_reference, 'W8A8 runtime config')
-        policy_config.numeric_optimization.quant_policy.calibration_artifact = {
-            'path': expected_relative,
-            'sha256': calibration_reference['sha256']}
+            repository_root, runtime_reference, 'numeric runtime config')
+        if kind == 'w8a8':
+            policy_config.numeric_optimization.quant_policy.calibration_artifact = {
+                'path': expected_relative,
+                'sha256': calibration_reference['sha256']}
+        else:
+            from .pwl_artifacts import (
+                PWLArtifactError, load_pwl_fit_reference,
+                load_pwl_installation_reference)
+            pwl_policy = numeric.get('pwl')
+            if (not isinstance(pwl_policy, Mapping)
+                    or pwl_policy.get('candidate_id') != candidate.id):
+                raise NumericRuntimeError('PWL policy candidate is invalid')
+            fit_policy = {
+                name: pwl_policy[name] for name in (
+                    'enabled_function', 'source', 'roles', 'domain',
+                    'segments', 'grid_points', 'saturation', 'qat_form',
+                    'selection_policy')}
+            try:
+                fit = load_pwl_fit_reference(
+                    calibration_reference, repository_root=repository_root,
+                    expected_candidate_id=candidate.id,
+                    expected_policy=fit_policy)
+                installation_reference = result.get('installation')
+                expected_installation = artifact_path.parent / (
+                    'pwl-installation.json')
+                if (not isinstance(installation_reference, Mapping)
+                        or installation_reference.get('path') !=
+                        expected_installation.relative_to(
+                            repository_root).as_posix()):
+                    raise NumericRuntimeError(
+                        'PWL installation is not canonical convert output')
+                installed = load_pwl_installation_reference(
+                    installation_reference, repository_root=repository_root,
+                    expected_candidate_id=candidate.id,
+                    expected_fit_reference=calibration_reference,
+                    expected_fit=fit)
+            except PWLArtifactError as error:
+                raise NumericRuntimeError(
+                    f'PWL fit/install binding is invalid: {error}') from error
+            if result.get('operation_manifest') != installed[
+                    'operation_manifest']:
+                raise NumericRuntimeError(
+                    'PWL operation manifest disagrees with installation')
+            policy_config.numeric_optimization.pwl.fit_artifact = {
+                'path': expected_relative,
+                'sha256': calibration_reference['sha256']}
+            policy_config.numeric_optimization.pwl.installation_manifest = (
+                dict(installation_reference))
         if Config.fromfile(runtime_path).to_dict() != policy_config.to_dict():
             raise NumericRuntimeError(
-                'W8A8 runtime config was not derived from candidate policy')
+                'numeric runtime config was not derived from candidate policy')
     if stage == 'export':
         exported = result['export']
         if (not isinstance(exported, Mapping)
@@ -774,14 +826,14 @@ def resolve_numeric_runtime(
             'checkpoint_sha256': candidate.checkpoint_sha256,
             'train': None,
         }
-    if candidate.features.get('numeric_kind') == 'w8a8' \
+    if candidate.features.get('numeric_kind') in {'w8a8', 'pwl'} \
             and candidate.features.get('recovery_candidate') is not True:
         conversion_path = downstream_output.parent.parent / 'convert/convert.json'
         try:
             conversion = json.loads(conversion_path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError) as error:
             raise NumericRuntimeError(
-                'W8A8 runtime requires completed convert artifact') from error
+                'numeric runtime requires completed convert artifact') from error
         validate_numeric_convert_artifact(
             conversion, candidate=candidate, repository_root=repository_root,
             manifest_path=manifest_path, artifact_path=conversion_path)
@@ -791,12 +843,12 @@ def resolve_numeric_runtime(
             candidate=candidate, manifest_path=manifest_path)
         runtime_config = _file(
             repository_root, result.get('runtime_config'),
-            'W8A8 runtime config')
+            'numeric runtime config')
         bindings = result.get('runtime_bindings')
         if (not isinstance(bindings, Mapping)
                 or set(bindings) != {
                     'config', 'checkpoint', 'policy', 'calibration'}):
-            raise NumericRuntimeError('W8A8 runtime bindings are incomplete')
+            raise NumericRuntimeError('numeric runtime bindings are incomplete')
         for name, reference in bindings.items():
             if name == 'checkpoint':
                 try:
@@ -804,11 +856,11 @@ def resolve_numeric_runtime(
                         repository_root, manifest_path, candidate, reference)
                 except ValueError as error:
                     raise NumericRuntimeError(
-                        f'W8A8 checkpoint binding is not authorized: '
+                        f'numeric checkpoint binding is not authorized: '
                         f'{error}') from error
             else:
-                _file(repository_root, reference, f'W8A8 {name}')
-        return {
+                _file(repository_root, reference, f'numeric {name}')
+        runtime = {
             'config_path': runtime_config,
             'config_sha256': result['runtime_config']['sha256'],
             'checkpoint_path': parent_checkpoint,
@@ -816,6 +868,9 @@ def resolve_numeric_runtime(
             'checkpoint_sha256': candidate.checkpoint_sha256,
             'train': None,
         }
+        if candidate.features.get('numeric_kind') == 'pwl':
+            runtime['pwl_installation'] = dict(result['installation'])
+        return runtime
     if candidate.features.get('recovery_candidate') is not True:
         return {
             'config_path': repository_root / candidate.config,
