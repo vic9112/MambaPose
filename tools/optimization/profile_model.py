@@ -129,7 +129,7 @@ def profile(
         'git_commit': commit,
         'candidate': candidate.id,
         'config': config_path.relative_to(REPOSITORY_ROOT).as_posix(),
-        'checkpoint': checkpoint.relative_to(REPOSITORY_ROOT).as_posix(),
+        'checkpoint': runtime['checkpoint_name'],
         'checkpoint_sha256': actual_checksum,
         'input_shapes': _shape_tree(input_tensor),
         'output_shapes': _shape_tree(outputs),

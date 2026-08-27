@@ -25,8 +25,8 @@ from mambapose_opt.determinism import (
     repeated_order_hash)
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 from mambapose_opt.artifacts import optimization_output_path
+from mambapose_opt.checkpoints import authorize_manifest_candidate
 from mambapose_opt.evaluation import resolve_project_asset_root
-from mambapose_opt.source import clean_git_commit
 
 
 def _output_path(value: str) -> Path:
@@ -63,16 +63,18 @@ def _atomic_json(path: Path, value: object) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def _git_commit() -> str:
-    return clean_git_commit(REPO_ROOT)
-
-
 def trace_candidate(
-        candidate: CandidateSpec, output: Path, *, epochs: int) -> dict:
+        candidate: CandidateSpec, output: Path, *, epochs: int,
+        manifest_path: Path | None = None) -> dict:
     """Validate frozen inputs before constructing any dataset and trace it."""
-    commit = _git_commit()
-    config_path = REPO_ROOT / candidate.config
-    checkpoint_path = REPO_ROOT / candidate.checkpoint
+    manifest = manifest_path or REPO_ROOT / 'optimization/candidates.json'
+    authorized = authorize_manifest_candidate(
+        REPO_ROOT, manifest, candidate.id)
+    if authorized.candidate != candidate:
+        raise ValueError('trace candidate differs from authorized manifest')
+    commit = authorized.source['git_commit']
+    config_path = authorized.config_path
+    checkpoint_path = authorized.checkpoint_path
     checkpoint_sha256 = _sha256(checkpoint_path)
     if checkpoint_sha256 != candidate.checkpoint_sha256:
         raise ValueError(f'checkpoint sha256 mismatch for {candidate.id}')
@@ -122,7 +124,9 @@ def main() -> int:
         parser.error('--epochs must be positive')
 
     candidate = _candidate(args.manifest, args.candidate_id)
-    trace_candidate(candidate, args.output, epochs=args.epochs)
+    trace_candidate(
+        candidate, args.output, epochs=args.epochs,
+        manifest_path=args.manifest)
     return 0
 
 

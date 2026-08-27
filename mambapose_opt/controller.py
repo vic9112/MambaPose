@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 from typing import Callable, Mapping, Sequence
 
 from mambapose_repro.orchestrator import (
@@ -30,6 +31,7 @@ from .gpu_guard import (
 from .evaluation import (
     MetricError, resolve_artifact_source, validate_evaluation_envelope,
     validate_latency_envelope, validate_live_coco_observation)
+from .checkpoints import authorize_manifest_candidate
 from .schema import CandidateSpec
 
 
@@ -264,26 +266,19 @@ class OptimizationController:
         return None
 
     def _preflight_error(self) -> str | None:
-        paths = {
-            'config': self.candidate.config,
-            'checkpoint': self.candidate.checkpoint,
-        }
-        resolved: dict[str, Path] = {}
-        for label, relative in paths.items():
-            path = (self.repository_root / relative).resolve()
-            try:
-                path.relative_to(self.repository_root)
-            except ValueError:
-                return f'{label} escapes repository root for {self.candidate.id}'
-            if not path.is_file():
-                return f'{label} is missing for {self.candidate.id}: {relative}'
-            resolved[label] = path
         try:
-            actual = _sha256(resolved['checkpoint'])
-        except OSError as error:
-            return f'cannot hash checkpoint for {self.candidate.id}: {error}'
-        if actual != self.candidate.checkpoint_sha256:
-            return f'checkpoint sha256 mismatch for {self.candidate.id}'
+            authorized = authorize_manifest_candidate(
+                self.repository_root, self.manifest_path, self.candidate.id)
+        except (
+                OSError, RuntimeError, subprocess.SubprocessError,
+                ValueError) as error:
+            return (
+                f'candidate authorization failed for {self.candidate.id}: '
+                f'{error}')
+        if authorized.candidate != self.candidate:
+            return (
+                f'candidate differs from authorized manifest for '
+                f'{self.candidate.id}')
         return None
 
     def _failure(
@@ -362,8 +357,7 @@ class OptimizationController:
                         downstream_output=path)
                     expected_config = runtime['config_path'].relative_to(
                         self.repository_root).as_posix()
-                    expected_checkpoint = runtime['checkpoint_path'].relative_to(
-                        self.repository_root).as_posix()
+                    expected_checkpoint = runtime['checkpoint_name']
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
                     validate_numeric_source_binding(
                         value['source'], repository_root=self.repository_root,
@@ -548,8 +542,7 @@ class OptimizationController:
                     runtime_config_path = runtime['config_path']
                     expected_config = runtime_config_path.relative_to(
                         self.repository_root).as_posix()
-                    expected_checkpoint = runtime['checkpoint_path'].relative_to(
-                        self.repository_root).as_posix()
+                    expected_checkpoint = runtime['checkpoint_name']
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
                 validated_evaluation = validate_evaluation_envelope(
                     value,
@@ -596,8 +589,7 @@ class OptimizationController:
                     runtime_config_path = runtime['config_path']
                     expected_config = runtime_config_path.relative_to(
                         self.repository_root).as_posix()
-                    expected_checkpoint = runtime['checkpoint_path'].relative_to(
-                        self.repository_root).as_posix()
+                    expected_checkpoint = runtime['checkpoint_name']
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
                     expected_config_sha = runtime['config_sha256']
                 validated_latency = validate_latency_envelope(

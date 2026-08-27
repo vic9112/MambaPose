@@ -92,9 +92,9 @@ _deterministic_config = build_deterministic_evaluation_config
 def _evaluate_mode(
         candidate: CandidateSpec, output: Path, *, flip_test: bool,
         checkpoint_sha256: str, git_commit: str,
-        checkpoint: Path | None = None,
-        config_path: Path | None = None) -> dict:
-    checkpoint = checkpoint or REPO_ROOT / candidate.checkpoint
+        checkpoint: Path,
+        config_path: Path | None = None,
+        checkpoint_name: str | None = None) -> dict:
     config_path = config_path or REPO_ROOT / candidate.config
     config = _deterministic_config(candidate, flip_test, config_path)
     protocol = validate_coco_val_protocol(config, repository_root=REPO_ROOT)
@@ -146,7 +146,8 @@ def _evaluate_mode(
             **protocol,
             'batch_size': int(config.test_dataloader.batch_size),
             'source_config': config_path.relative_to(REPO_ROOT).as_posix(),
-            'checkpoint': checkpoint.relative_to(REPO_ROOT).as_posix(),
+            'checkpoint': (
+                checkpoint_name or checkpoint.relative_to(REPO_ROOT).as_posix()),
             'data_inventory': 'data/inventory.json',
         },
     }
@@ -176,7 +177,8 @@ def evaluate(
         mode: _evaluate_mode(
             candidate, output, flip_test=mode == 'flip',
             checkpoint_sha256=checkpoint_sha256, git_commit=git_commit,
-            checkpoint=checkpoint, config_path=config_path)
+            checkpoint=checkpoint, config_path=config_path,
+            checkpoint_name=runtime['checkpoint_name'])
         for mode in modes
     }
     if (candidate.route == 'ssm-quant-pwl'

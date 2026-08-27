@@ -252,7 +252,7 @@ def measure_candidate(
     result['protocol']['data'] = data_protocol
     result['protocol'].update({
         'source_config': config_path.relative_to(REPO_ROOT).as_posix(),
-        'checkpoint': checkpoint.relative_to(REPO_ROOT).as_posix(),
+        'checkpoint': runtime['checkpoint_name'],
         'data_inventory': 'data/inventory.json',
     })
     if (_sha256(config_path) != runtime['config_sha256']

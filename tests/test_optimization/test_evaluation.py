@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -684,6 +685,16 @@ def test_formal_evaluation_runs_flip_and_no_flip_before_envelope(
     monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
     monkeypatch.setattr(tool, '_git_commit', lambda: 'd' * 40)
     monkeypatch.setattr(
+        tool, 'resolve_numeric_runtime',
+        lambda *args, **kwargs: {
+            'config_path': tmp_path / candidate.config,
+            'config_sha256': None,
+            'checkpoint_path': checkpoint,
+            'checkpoint_name': candidate.checkpoint.as_posix(),
+            'checkpoint_sha256': candidate.checkpoint_sha256,
+            'train': None,
+        })
+    monkeypatch.setattr(
         tool, 'build_source_binding',
         lambda **unused: {'manifest_path': 'optimization/candidates.json'})
     seen = []
@@ -705,10 +716,13 @@ def test_direct_evaluation_child_disables_bytecode_independent_of_parent(
     import tools.optimization.evaluate_candidate as tool
     from mambapose_opt.schema import CandidateSpec
 
+    checkpoint = tmp_path / 'model.pth'
+    checkpoint.write_bytes(b'checkpoint')
     candidate = CandidateSpec.from_dict({
         'id': 'fixture', 'route': 'accuracy-first', 'kind': 'float',
         'config': 'config.py', 'checkpoint': 'model.pth',
-        'checkpoint_sha256': 'a' * 64, 'seed': 0, 'features': {},
+        'checkpoint_sha256': hashlib.sha256(b'checkpoint').hexdigest(),
+        'seed': 0, 'features': {},
     })
     config = tool.Config(dict(
         test_dataloader=dict(
@@ -739,7 +753,8 @@ def test_direct_evaluation_child_disables_bytecode_independent_of_parent(
     monkeypatch.setattr(tool.subprocess, 'run', capture_run)
     tool._evaluate_mode(
         candidate, tmp_path / 'evaluate.json', flip_test=True,
-        checkpoint_sha256='a' * 64, git_commit='d' * 40)
+        checkpoint_sha256='a' * 64, git_commit='d' * 40,
+        checkpoint=checkpoint)
 
     assert captured_environment is not None
     assert captured_environment['PYTHONDONTWRITEBYTECODE'] == '1'

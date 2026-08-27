@@ -246,6 +246,17 @@ def test_latency_admission_rejects_unlocked_lease_before_model_or_cuda(
         'seed': 0, 'features': {},
     })
     monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(
+        tool, 'resolve_numeric_runtime',
+        lambda *args, **kwargs: {
+            'config_path': tmp_path / candidate.config,
+            'config_sha256': hashlib.sha256(
+                (tmp_path / candidate.config).read_bytes()).hexdigest(),
+            'checkpoint_path': checkpoint,
+            'checkpoint_name': candidate.checkpoint.as_posix(),
+            'checkpoint_sha256': candidate.checkpoint_sha256,
+            'train': None,
+        })
     monkeypatch.setattr(tool, '_git_commit', lambda: 'd' * 40)
     monkeypatch.setattr(tool, '_canonical_gpu_lock', lambda: lock)
     monkeypatch.setenv('MAMBAPOSE_PHYSICAL_DEVICE_INDEX', '0')

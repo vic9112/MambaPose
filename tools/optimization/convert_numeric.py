@@ -23,11 +23,11 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from mambapose_opt.artifacts import optimization_output_path
+from mambapose_opt.checkpoints import authorize_manifest_candidate
 from mambapose_opt.numeric_conversion import (
     bind_numeric_inputs, quant_policy_from_config, verify_numeric_inputs)
 from mambapose_opt.numeric_calibration import validate_calibration_provenance
 from mambapose_opt.numeric_source import build_numeric_source_binding
-from mambapose_opt.source import clean_git_commit
 from mambapose_opt.schema import load_candidate_manifest
 from mmpose.models.utils.hardware_friendly import (
     convert_for_fake_quant, export_int8_state)
@@ -73,9 +73,17 @@ def convert(
                 'weight-only', 'w8a8'}:
         raise ValueError(
             'deterministic Stage A conversion admits W8/W8A8 only')
-    commit = clean_git_commit(REPOSITORY_ROOT)
-    config_path = (REPOSITORY_ROOT / candidate.config).resolve()
-    checkpoint_path = (REPOSITORY_ROOT / candidate.checkpoint).resolve()
+    authorized = authorize_manifest_candidate(
+        REPOSITORY_ROOT, manifest_path, candidate.id)
+    if authorized.candidate != candidate:
+        raise ValueError('conversion candidate differs from authorized manifest')
+    commit = authorized.source['git_commit']
+    config_path = authorized.config_path
+    source = build_numeric_source_binding(
+        repository_root=REPOSITORY_ROOT, candidate=candidate,
+        manifest_path=manifest_path, policy_path=config_path,
+        git_commit=commit)
+    checkpoint_path = authorized.checkpoint_path
     config = Config.fromfile(config_path)
     calibration = None
     if candidate.features.get('numeric_kind') == 'w8a8':
@@ -110,10 +118,7 @@ def convert(
     report = convert_for_fake_quant(model, policy)
     verify_numeric_inputs(binding)
     result = {
-        'source': build_numeric_source_binding(
-            repository_root=REPOSITORY_ROOT, candidate=candidate,
-            manifest_path=manifest_path, policy_path=config_path,
-            git_commit=commit),
+        'source': source,
         'runtime_bindings': {
             role: {
                 'path': (

@@ -53,6 +53,52 @@ _SOURCE_BINDING_FIELDS = {
     'config_sha256', 'authority_path', 'authority_sha256'}
 
 
+def resolve_shared_asset_exposure(
+        repository_root: Path, asset_root: Path, relative_root: Path | str,
+        *, label: str) -> Path:
+    """Require one exact caller-visible link to a primary asset directory."""
+    root = Path(repository_root).resolve(strict=True)
+    primary = Path(asset_root).resolve(strict=True)
+    relative = Path(relative_root)
+    if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {'.', '..'} for part in relative.parts)):
+        raise MetricError(f'{label} exposure root is invalid')
+    expected = primary
+    for part in relative.parts:
+        expected = expected / part
+        if expected.is_symlink():
+            raise MetricError(
+                f'primary checkout {label} asset root must not use symlinks')
+    if not expected.is_dir():
+        raise MetricError(f'primary checkout {label} asset root is missing')
+    if root == primary:
+        return expected
+
+    exposed_parent = root
+    for part in relative.parts[:-1]:
+        exposed_parent = exposed_parent / part
+        if exposed_parent.is_symlink() or not exposed_parent.is_dir():
+            raise MetricError(
+                f'linked worktree {label} exposure parent is invalid')
+    exposed = exposed_parent / relative.parts[-1]
+    try:
+        target = Path(os.path.abspath(
+            exposed.parent / os.readlink(exposed)))
+    except OSError as error:
+        raise MetricError(
+            f'linked worktree {label} exposure is unreadable') from error
+    if (
+            not exposed.is_symlink()
+            or target != expected.absolute()
+            or exposed.resolve(strict=True) != expected.resolve(strict=True)):
+        raise MetricError(
+            f'linked worktree {label} exposure must target the Git common '
+            f'checkout asset root')
+    return expected
+
+
 def resolve_project_asset_root(repository_root: Path) -> Path:
     """Resolve the one approved shared-asset checkout for a Git worktree.
 
@@ -79,27 +125,8 @@ def resolve_project_asset_root(repository_root: Path) -> Path:
     if common.name != '.git' or not common.is_dir():
         raise MetricError('Git common directory is not an approved checkout')
     asset_root = common.parent.resolve(strict=True)
-    expected_data = asset_root / 'data'
-    exposed_data = root / 'data'
-    if root == asset_root:
-        if exposed_data.is_symlink() or not exposed_data.is_dir():
-            raise MetricError('primary checkout data asset root is invalid')
-    else:
-        try:
-            link_target = Path(os.path.abspath(
-                exposed_data.parent / os.readlink(exposed_data)))
-        except OSError as error:
-            raise MetricError(
-                'linked worktree shared data link is unreadable') from error
-        if (
-                not exposed_data.is_symlink()
-                or not expected_data.is_dir()
-                or link_target != expected_data.absolute()
-                or exposed_data.resolve(strict=True) != expected_data.resolve(
-                    strict=True)):
-            raise MetricError(
-                'linked worktree shared data must target the Git common '
-                'checkout asset root')
+    resolve_shared_asset_exposure(
+        root, asset_root, 'data', label='shared data')
     return asset_root
 
 

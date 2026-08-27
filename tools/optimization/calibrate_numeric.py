@@ -22,6 +22,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from mambapose_opt.artifacts import optimization_output_path
+from mambapose_opt.checkpoints import authorize_manifest_candidate
 from mambapose_opt.numeric_calibration import (
     CalibrationTargets, calibration_identity, discover_calibration_targets,
     validate_calibration_artifact)
@@ -72,19 +73,27 @@ def _target_dict(targets: CalibrationTargets) -> dict[str, list[str]]:
     }
 
 
-def audit(candidate, policy: Path) -> dict[str, Any]:
+def audit(
+        candidate, policy: Path, *, manifest_path: Path | None = None,
+        ) -> dict[str, Any]:
     """CPU checkpoint/config load audit; no dataset iteration or artifact write."""
     from mmpose.apis import init_model
 
+    manifest = manifest_path or REPOSITORY_ROOT / 'optimization/candidates.json'
+    authorized = authorize_manifest_candidate(
+        REPOSITORY_ROOT, manifest, candidate.id)
+    if authorized.candidate != candidate:
+        raise ValueError('calibration candidate differs from authorized manifest')
+    identity = _identity(candidate, policy)
     model = init_model(
-        str(REPOSITORY_ROOT / candidate.config),
-        str(REPOSITORY_ROOT / candidate.checkpoint),
+        str(authorized.config_path),
+        str(authorized.checkpoint_path),
         device='cpu')
     model.eval()
     targets = discover_calibration_targets(model)
     return {
         'status': 'audit-only',
-        'identity': _identity(candidate, policy),
+        'identity': identity,
         'model_mode': 'eval',
         'grad_enabled': False,
         'targets': _target_dict(targets),
@@ -230,19 +239,23 @@ def calibrate(
         raise ValueError('production numeric calibration requires cuda:0')
     if samples <= 0 or samples > 4096:
         raise ValueError('calibration samples must be in [1, 4096]')
-    _git_commit(require_clean=True)
+    manifest = manifest_path or REPOSITORY_ROOT / 'optimization/candidates.json'
+    authorized = authorize_manifest_candidate(
+        REPOSITORY_ROOT, manifest, candidate.id)
+    if authorized.candidate != candidate:
+        raise ValueError('calibration candidate differs from authorized manifest')
     identity_before = _identity(candidate, policy)
     from mmengine.config import Config
     from mmengine.runner import Runner
     from mmpose.apis import init_model
 
-    config = Config.fromfile(REPOSITORY_ROOT / candidate.config)
+    config = Config.fromfile(authorized.config_path)
     loader_config = dict(config.train_dataloader)
     loader_config.update(batch_size=1, num_workers=0, persistent_workers=False)
     loader_config['sampler'] = dict(type='DefaultSampler', shuffle=False)
     model = init_model(
-        str(REPOSITORY_ROOT / candidate.config),
-        str(REPOSITORY_ROOT / candidate.checkpoint),
+        str(authorized.config_path),
+        str(authorized.checkpoint_path),
         device=device)
     model.eval()
     if any(parameter.requires_grad for parameter in model.parameters()):
@@ -296,8 +309,7 @@ def calibrate(
         'stage': 'calibrate',
         'source': build_numeric_source_binding(
             repository_root=REPOSITORY_ROOT, candidate=target,
-            manifest_path=(manifest_path or
-                           REPOSITORY_ROOT / 'optimization/candidates.json'),
+            manifest_path=manifest,
             policy_path=policy),
         'identity': identity_after,
         'protocol': {
@@ -351,7 +363,7 @@ def main() -> int:
             _candidate(args.manifest, 'full-s-v1')
             if target.route == 'ssm-quant-pwl' else target)
         if args.audit_only:
-            value = audit(source, policy)
+            value = audit(source, policy, manifest_path=args.manifest)
             value['target_candidate_id'] = target.id
             print(json.dumps(value, indent=2, sort_keys=True))
             return 0

@@ -416,6 +416,274 @@ def test_numeric_source_accepts_only_common_checkout_reproduction_link(tmp_path)
             policy_path=linked / 'configs/candidate.py')
 
 
+def _linked_numeric_checkpoint_fixture(tmp_path):
+    from mambapose_opt.schema import load_candidate_manifest
+
+    main = tmp_path / 'main'
+    main.mkdir()
+    (main / 'configs').mkdir()
+    (main / 'optimization').mkdir()
+    (main / '.gitignore').write_text('/data\nwork_dirs/\n')
+    (main / 'configs/candidate.py').write_text('policy = True\n')
+    (main / 'optimization/coco_train2017_authority.json').write_text(
+        '{"split":"train2017"}\n')
+    (main / 'optimization/coco_val2017_authority.json').write_text(
+        '{"split":"val2017"}\n')
+    checkpoint_bytes = b'checkpoint'
+    checkpoint_sha = hashlib.sha256(checkpoint_bytes).hexdigest()
+    (main / 'optimization/candidates.json').write_text(json.dumps({
+        'schema_version': 1,
+        'candidates': [{
+            'id': 'numeric', 'route': 'ssm-quant-pwl',
+            'kind': 'fake-quant', 'config': 'configs/candidate.py',
+            'checkpoint': 'work_dirs/reproduction/model.pth',
+            'checkpoint_sha256': checkpoint_sha, 'seed': 0,
+            'features': {'numeric_kind': 'weight-only'},
+        }],
+    }))
+    _commit_fixture(main, 'linked numeric controller fixture')
+    (main / 'data').mkdir()
+    checkpoint = main / 'work_dirs/reproduction/model.pth'
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(checkpoint_bytes)
+    linked = tmp_path / 'linked'
+    subprocess.run(
+        ['git', 'worktree', 'add', '-q', '--detach', str(linked), 'HEAD'],
+        cwd=main, check=True)
+    (linked / 'data').symlink_to(main / 'data', target_is_directory=True)
+    (linked / 'work_dirs').mkdir()
+    (linked / 'work_dirs/reproduction').symlink_to(
+        main / 'work_dirs/reproduction', target_is_directory=True)
+    manifest = linked / 'optimization/candidates.json'
+    candidate = load_candidate_manifest(manifest)[0]
+    return {
+        'main': main, 'linked': linked, 'manifest': manifest,
+        'candidate': candidate, 'checkpoint': checkpoint,
+    }
+
+
+def test_numeric_controller_preflight_accepts_exact_common_checkout_checkpoint(
+        tmp_path):
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_opt.numeric_runtime import resolve_numeric_runtime
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    linked = fixture['linked']
+    manifest = fixture['manifest']
+    candidate = fixture['candidate']
+    controller = OptimizationController(
+        linked / 'work_dirs/optimization', candidate,
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError('preflight entered runner')),
+        repository_root=linked, manifest_path=manifest,
+        stages=('profile',))
+
+    assert controller._preflight_error() is None
+    runtime = resolve_numeric_runtime(
+        candidate, repository_root=linked, manifest_path=manifest,
+        downstream_output=(
+            linked / 'work_dirs/optimization/ssm-quant-pwl/numeric/0/'
+            'profile/profile.json'))
+    assert runtime['checkpoint_path'] == fixture['checkpoint'].resolve(strict=True)
+    assert runtime['checkpoint_name'] == candidate.checkpoint.as_posix()
+
+
+def test_runtime_canonicalizes_linked_checkpoint_for_non_numeric_route(tmp_path):
+    from mambapose_opt.numeric_runtime import resolve_numeric_runtime
+    from mambapose_opt.schema import load_candidate_manifest
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    manifest = fixture['main'] / 'optimization/candidates.json'
+    value = json.loads(manifest.read_text())
+    value['candidates'][0]['route'] = 'baseline'
+    value['candidates'][0]['kind'] = 'float'
+    value['candidates'][0]['features'] = {}
+    manifest.write_text(json.dumps(value))
+    _commit_fixture(fixture['main'], 'use non-numeric route')
+    linked_manifest = fixture['linked'] / 'optimization/candidates.json'
+    commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=fixture['main'], text=True).strip()
+    subprocess.run(
+        ['git', 'reset', '--hard', '-q', commit], cwd=fixture['linked'],
+        check=True)
+    candidate = load_candidate_manifest(linked_manifest)[0]
+
+    runtime = resolve_numeric_runtime(
+        candidate, repository_root=fixture['linked'],
+        manifest_path=linked_manifest,
+        downstream_output=(
+            fixture['linked'] /
+            'work_dirs/optimization/baseline/numeric/0/profile/profile.json'))
+
+    assert runtime['checkpoint_path'] == fixture['checkpoint'].resolve(strict=True)
+    assert runtime['checkpoint_name'] == candidate.checkpoint.as_posix()
+
+
+def test_numeric_shared_authorizer_rejects_alternate_same_byte_checkpoint_tree(
+        tmp_path):
+    from mambapose_opt.checkpoints import authorize_manifest_candidate
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, resolve_numeric_runtime)
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    linked = fixture['linked']
+    exposed = linked / 'work_dirs/reproduction'
+    exposed.unlink()
+    alternate = tmp_path / 'alternate-reproduction'
+    alternate.mkdir()
+    (alternate / 'model.pth').write_bytes(fixture['checkpoint'].read_bytes())
+    exposed.symlink_to(alternate, target_is_directory=True)
+
+    with pytest.raises(ValueError, match='Git common checkout'):
+        authorize_manifest_candidate(
+            linked, fixture['manifest'], fixture['candidate'].id)
+    with pytest.raises(NumericRuntimeError, match='authorized|symlink'):
+        resolve_numeric_runtime(
+            fixture['candidate'], repository_root=linked,
+            manifest_path=fixture['manifest'],
+            downstream_output=(
+                linked / 'work_dirs/optimization/ssm-quant-pwl/numeric/0/'
+                'profile/profile.json'))
+
+
+def test_numeric_runtime_rejects_primary_checkpoint_symlink_drift(tmp_path):
+    from mambapose_opt.checkpoints import authorize_manifest_candidate
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, resolve_numeric_runtime)
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    main = fixture['main']
+    primary = main / 'work_dirs/reproduction'
+    alternate = main / 'work_dirs/alternate-reproduction'
+    primary.rename(alternate)
+    primary.symlink_to(alternate, target_is_directory=True)
+
+    with pytest.raises(ValueError, match='primary checkout.*symlinks'):
+        authorize_manifest_candidate(
+            fixture['linked'], fixture['manifest'], fixture['candidate'].id)
+    with pytest.raises(NumericRuntimeError, match='authorized|symlink'):
+        resolve_numeric_runtime(
+            fixture['candidate'], repository_root=fixture['linked'],
+            manifest_path=fixture['manifest'],
+            downstream_output=(
+                fixture['linked'] /
+                'work_dirs/optimization/ssm-quant-pwl/numeric/0/'
+                'profile/profile.json'))
+
+
+def test_numeric_authority_rejects_hash_drift_before_runtime(tmp_path):
+    from mambapose_opt.checkpoints import authorize_manifest_candidate
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, resolve_numeric_runtime)
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    fixture['checkpoint'].write_bytes(b'drifted checkpoint')
+
+    with pytest.raises(ValueError, match='checkpoint sha256 mismatch'):
+        authorize_manifest_candidate(
+            fixture['linked'], fixture['manifest'], fixture['candidate'].id)
+    with pytest.raises(NumericRuntimeError, match='sha256 mismatch'):
+        resolve_numeric_runtime(
+            fixture['candidate'], repository_root=fixture['linked'],
+            manifest_path=fixture['manifest'],
+            downstream_output=(
+                fixture['linked'] /
+                'work_dirs/optimization/ssm-quant-pwl/numeric/0/'
+                'profile/profile.json'))
+
+
+def test_numeric_controller_rejects_unapproved_checkpoint_root(tmp_path):
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_opt.schema import load_candidate_manifest
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    main = fixture['main']
+    unapproved = main / 'models/model.pth'
+    unapproved.parent.mkdir()
+    unapproved.write_bytes(fixture['checkpoint'].read_bytes())
+    manifest = main / 'optimization/candidates.json'
+    value = json.loads(manifest.read_text())
+    value['candidates'][0]['checkpoint'] = 'models/model.pth'
+    manifest.write_text(json.dumps(value))
+    _commit_fixture(main, 'move numeric checkpoint to unapproved root')
+    candidate = load_candidate_manifest(manifest)[0]
+    controller = OptimizationController(
+        main / 'work_dirs/optimization', candidate, lambda *_args: None,
+        repository_root=main, manifest_path=manifest, stages=('profile',))
+
+    error = controller._preflight_error()
+
+    assert error is not None
+    assert 'approved shared asset root' in error
+
+
+def test_numeric_profile_consumes_canonical_checkpoint_and_records_logical_name(
+        tmp_path, monkeypatch):
+    import torch
+    from torch import nn
+
+    from tools.optimization import profile_model
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    captured = {}
+
+    class FixtureModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Conv2d(3, 1, 1)
+
+        def forward(self, inputs, **_kwargs):
+            return self.layer(inputs)
+
+    def initialize(config, checkpoint, *, device):
+        captured.update(
+            config=Path(config), checkpoint=Path(checkpoint), device=device)
+        return FixtureModel()
+
+    monkeypatch.setattr(profile_model, 'REPOSITORY_ROOT', fixture['linked'])
+    monkeypatch.setattr('mmpose.apis.init_model', initialize)
+
+    result = profile_model.profile(
+        fixture['candidate'], (1, 3, 4, 4),
+        manifest_path=fixture['manifest'],
+        output=(fixture['linked'] /
+                'work_dirs/optimization/ssm-quant-pwl/numeric/0/'
+                'profile/profile.json'))
+
+    assert captured['checkpoint'] == fixture['checkpoint'].resolve(strict=True)
+    assert captured['device'] == 'cpu'
+    assert result['checkpoint'] == fixture['candidate'].checkpoint.as_posix()
+    assert result['checkpoint_sha256'] == (
+        fixture['candidate'].checkpoint_sha256)
+
+
+def test_numeric_convert_rejects_alternate_same_byte_tree_before_model_load(
+        tmp_path, monkeypatch):
+    from tools.optimization import convert_numeric
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    exposed = fixture['linked'] / 'work_dirs/reproduction'
+    exposed.unlink()
+    alternate = tmp_path / 'alternate-reproduction'
+    alternate.mkdir()
+    (alternate / 'model.pth').write_bytes(fixture['checkpoint'].read_bytes())
+    exposed.symlink_to(alternate, target_is_directory=True)
+    entered = []
+    monkeypatch.setattr(convert_numeric, 'REPOSITORY_ROOT', fixture['linked'])
+    monkeypatch.setattr(
+        'mmpose.apis.init_model', lambda *_args, **_kwargs: entered.append(True))
+
+    with pytest.raises(ValueError, match='Git common checkout'):
+        convert_numeric.convert(
+            fixture['candidate'], stage='convert',
+            output=(fixture['linked'] /
+                    'work_dirs/optimization/ssm-quant-pwl/numeric/0/'
+                    'convert/convert.json'),
+            manifest_path=fixture['manifest'])
+
+    assert entered == []
+
+
 @pytest.mark.parametrize(
     ('numeric_kind', 'stage'),
     (('weight-only', 'convert'), ('weight-only', 'export'),
@@ -435,7 +703,8 @@ def test_real_numeric_producer_round_trips_public_and_controller_validation(
     (tmp_path / 'optimization').mkdir()
     (tmp_path / 'work_dirs/optimization').mkdir(parents=True)
     (tmp_path / '.gitignore').write_text('work_dirs/\n')
-    checkpoint = tmp_path / 'checkpoint.pth'
+    checkpoint = tmp_path / 'work_dirs/reproduction/checkpoint.pth'
+    checkpoint.parent.mkdir()
     checkpoint.write_bytes(b'checkpoint')
     checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     activation = (
@@ -464,12 +733,14 @@ def test_real_numeric_producer_round_trips_public_and_controller_validation(
         'candidates': [{
             'id': candidate_id, 'route': 'ssm-quant-pwl',
             'kind': 'fake-quant', 'config': 'configs/candidate.py',
-            'checkpoint': 'checkpoint.pth',
+            'checkpoint': 'work_dirs/reproduction/checkpoint.pth',
             'checkpoint_sha256': checkpoint_sha, 'seed': 0,
             'features': {'numeric_kind': numeric_kind, 'auto_run': False},
         }],
     }))
     (tmp_path / 'optimization/coco_train2017_authority.json').write_text('{}\n')
+    (tmp_path / 'optimization/coco_val2017_authority.json').write_text('{}\n')
+    (tmp_path / 'data').mkdir()
     _commit_fixture(tmp_path, 'producer fixture')
     candidate = load_candidate_manifest(manifest)[0]
     stage_dir = (
@@ -743,8 +1014,9 @@ def _w8a8_recovery_fixture(tmp_path, monkeypatch):
     (tmp_path / 'optimization').mkdir()
     (tmp_path / 'work_dirs/optimization').mkdir(parents=True)
     (tmp_path / '.gitignore').write_text('work_dirs/\n')
-    student_checkpoint = tmp_path / 'student.pth'
-    teacher_checkpoint = tmp_path / 'teacher.pth'
+    student_checkpoint = tmp_path / 'work_dirs/reproduction/student.pth'
+    teacher_checkpoint = tmp_path / 'work_dirs/reproduction/teacher.pth'
+    student_checkpoint.parent.mkdir()
     student_checkpoint.write_bytes(b'S-V1 parent')
     teacher_checkpoint.write_bytes(b'B teacher')
     student_sha = file_sha256(student_checkpoint)
@@ -785,11 +1057,11 @@ def _w8a8_recovery_fixture(tmp_path, monkeypatch):
         '        requires_attributed_error=True, max_preliminary_ap_drop=0.3,\n'
         '        resume_checkpoints=2, student_candidate="full-s-v1",\n'
         '        student_config="configs/reproduction/coco_s_v1.py",\n'
-        '        student_checkpoint="student.pth",\n'
+        '        student_checkpoint="work_dirs/reproduction/student.pth",\n'
         f'        student_checkpoint_sha256="{student_sha}",\n'
         '        teacher_candidate="coco-b-teacher",\n'
         '        teacher_config="configs/reproduction/coco_b.py",\n'
-        '        teacher_checkpoint="teacher.pth",\n'
+        '        teacher_checkpoint="work_dirs/reproduction/teacher.pth",\n'
         f'        teacher_checkpoint_sha256="{teacher_sha}"))\n')
     inventory_sha = _write_evaluation_authority(tmp_path)
     sha = 'a' * 64

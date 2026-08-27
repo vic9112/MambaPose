@@ -22,7 +22,7 @@ def _candidate(repo_root):
     from mambapose_opt.schema import CandidateSpec
 
     config = repo_root / 'configs/candidate.py'
-    checkpoint = repo_root / 'checkpoints/parent.pth'
+    checkpoint = repo_root / 'work_dirs/reproduction/parent.pth'
     config.parent.mkdir(parents=True)
     checkpoint.parent.mkdir(parents=True)
     config.write_text('model = dict(type="Fixture")\n')
@@ -70,7 +70,7 @@ def _candidate(repo_root):
         'route': 'accuracy-first',
         'kind': 'float',
         'config': 'configs/candidate.py',
-        'checkpoint': 'checkpoints/parent.pth',
+        'checkpoint': 'work_dirs/reproduction/parent.pth',
         'checkpoint_sha256': _sha256(checkpoint),
         'seed': 0,
         'features': {},
@@ -87,9 +87,10 @@ def _candidate(repo_root):
         }],
     }))
     if not (repo_root / '.git').exists():
+        (repo_root / '.gitignore').write_text('work_dirs/\n')
         subprocess.run(['git', 'init', '-q'], cwd=repo_root, check=True)
         subprocess.run(
-            ['git', 'add', 'configs/candidate.py',
+            ['git', 'add', '.gitignore', 'configs/candidate.py',
              'optimization/candidates.json',
              'optimization/coco_val2017_authority.json',
              'data/inventory.json'], cwd=repo_root, check=True)
@@ -173,7 +174,7 @@ def _write_generic_artifact(
             'detection_record_count': 104125,
             'verified_image_count': 5000,
             'source_config': 'configs/candidate.py',
-            'checkpoint': 'checkpoints/parent.pth',
+            'checkpoint': 'work_dirs/reproduction/parent.pth',
             'data_inventory': 'data/inventory.json',
             'inventory_projection': {
                 'inventory_path': 'data/inventory.json',
@@ -236,7 +237,7 @@ def _write_generic_artifact(
                     'lease_max_age_seconds': 300,
                     'lease_max_future_skew_seconds': 30,
                     'source_config': 'configs/candidate.py',
-                    'checkpoint': 'checkpoints/parent.pth',
+                    'checkpoint': 'work_dirs/reproduction/parent.pth',
                     'data_inventory': 'data/inventory.json', 'data': data,
                 },
                 'modes': {'flip': summary, 'no_flip': summary},
@@ -940,7 +941,12 @@ def test_isolated_campaign_roots_collide_on_canonical_gpu_lock(
     from mambapose_opt import gpu_guard
     from mambapose_opt.controller import OptimizationController
 
-    candidate = _candidate(tmp_path)
+    route_a = tmp_path / 'route-a'
+    route_b = tmp_path / 'route-b'
+    route_a.mkdir()
+    route_b.mkdir()
+    candidate = _candidate(route_a)
+    second_candidate = _candidate(route_b)
     monkeypatch.setattr(gpu_guard, 'query_compute_processes', lambda _: ())
     import mambapose_opt.controller as controller_module
     monkeypatch.setattr(
@@ -953,8 +959,8 @@ def test_isolated_campaign_roots_collide_on_canonical_gpu_lock(
         raise AssertionError('contended runner must not start')
 
     second = OptimizationController(
-        tmp_path / 'route-b/work_dirs/optimization', candidate,
-        second_runner, repository_root=tmp_path, stages=('evaluate',),
+        route_b / 'work_dirs/optimization', second_candidate,
+        second_runner, repository_root=route_b, stages=('evaluate',),
         gpu_lock_path=canonical_lock,
         shared_lock_root=tmp_path / 'shared')
 
@@ -965,8 +971,8 @@ def test_isolated_campaign_roots_collide_on_canonical_gpu_lock(
         return _outcome(stage, artifact)
 
     first = OptimizationController(
-        tmp_path / 'route-a/work_dirs/optimization', candidate,
-        first_runner, repository_root=tmp_path, stages=('evaluate',),
+        route_a / 'work_dirs/optimization', candidate,
+        first_runner, repository_root=route_a, stages=('evaluate',),
         gpu_lock_path=canonical_lock,
         shared_lock_root=tmp_path / 'shared')
 

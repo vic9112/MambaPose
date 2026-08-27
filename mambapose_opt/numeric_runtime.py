@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from .checkpoints import authorize_manifest_candidate
 from .numeric_source import (
     file_sha256, resolve_numeric_file, validate_numeric_config_closure,
     validate_numeric_source_binding)
@@ -207,8 +208,7 @@ def _evaluation_ap(
             expected_authority_sha256=source['authority_sha256'],
             expected_source_config=runtime['config_path'].relative_to(
                 repository_root).as_posix(),
-            expected_checkpoint=runtime['checkpoint_path'].relative_to(
-                repository_root).as_posix(),
+            expected_checkpoint=runtime['checkpoint_name'],
             expected_seed=candidate.seed,
             expected_git_commit=source['git_commit'],
             expected_source_binding=source, expected_authority=authority,
@@ -562,7 +562,9 @@ def _canonical_w8a8_recovery_config(
     expected.numeric_optimization.quant_policy.calibration_artifact = dict(
         calibration_reference)
     expected.work_dir = str(stage_dir / 'mmpose')
-    expected.load_from = str(repository_root / candidate.checkpoint)
+    expected.load_from = str(resolve_numeric_file(
+        repository_root, candidate.checkpoint,
+        'W8A8 recovery parent checkpoint').resolve(strict=True))
     expected.resume = False
     expected.randomness = dict(seed=candidate.seed, deterministic=True)
     return expected
@@ -715,13 +717,24 @@ def validate_numeric_train_artifact(
 def resolve_numeric_runtime(
         candidate: CandidateSpec, *, repository_root: Path,
         manifest_path: Path, downstream_output: Path) -> dict[str, Any]:
+    try:
+        authorized = authorize_manifest_candidate(
+            repository_root, manifest_path, candidate.id)
+    except ValueError as error:
+        raise NumericRuntimeError(
+            f'numeric runtime checkpoint is not authorized: {error}') from error
+    if authorized.candidate != candidate:
+        raise NumericRuntimeError(
+            'numeric runtime candidate differs from authorized manifest')
+    parent_checkpoint = authorized.checkpoint_path
     if candidate.route != 'ssm-quant-pwl':
         config_path = repository_root / candidate.config
         return {
             'config_path': config_path,
             'config_sha256': (
                 file_sha256(config_path) if config_path.is_file() else None),
-            'checkpoint_path': repository_root / candidate.checkpoint,
+            'checkpoint_path': parent_checkpoint,
+            'checkpoint_name': candidate.checkpoint.as_posix(),
             'checkpoint_sha256': candidate.checkpoint_sha256,
             'train': None,
         }
@@ -753,7 +766,8 @@ def resolve_numeric_runtime(
         return {
             'config_path': runtime_config,
             'config_sha256': result['runtime_config']['sha256'],
-            'checkpoint_path': repository_root / candidate.checkpoint,
+            'checkpoint_path': parent_checkpoint,
+            'checkpoint_name': candidate.checkpoint.as_posix(),
             'checkpoint_sha256': candidate.checkpoint_sha256,
             'train': None,
         }
@@ -761,7 +775,8 @@ def resolve_numeric_runtime(
         return {
             'config_path': repository_root / candidate.config,
             'config_sha256': file_sha256(repository_root / candidate.config),
-            'checkpoint_path': repository_root / candidate.checkpoint,
+            'checkpoint_path': parent_checkpoint,
+            'checkpoint_name': candidate.checkpoint.as_posix(),
             'checkpoint_sha256': candidate.checkpoint_sha256,
             'train': None,
         }
@@ -773,9 +788,12 @@ def resolve_numeric_runtime(
         value = json.loads(train_path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as error:
         raise NumericRuntimeError('numeric train artifact is unreadable') from error
-    return validate_numeric_train_artifact(
+    runtime = validate_numeric_train_artifact(
         value, candidate=candidate, repository_root=repository_root,
         manifest_path=manifest_path)
+    runtime['checkpoint_name'] = runtime['checkpoint_path'].relative_to(
+        repository_root).as_posix()
+    return runtime
 
 
 __all__ = [

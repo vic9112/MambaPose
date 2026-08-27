@@ -135,6 +135,7 @@ def test_trace_dataloader_help_is_directly_executable_without_user_site():
 def test_trace_refuses_bad_checkpoint_or_dirty_source_before_dataset_and_output(
         tmp_path, monkeypatch, failure):
     import tools.optimization.trace_dataloader as tool
+    from mambapose_opt.checkpoints import AuthorizedCandidate
     from mambapose_opt.schema import CandidateSpec
 
     (tmp_path / 'config.py').write_text('train_dataloader = dict()')
@@ -151,9 +152,12 @@ def test_trace_refuses_bad_checkpoint_or_dirty_source_before_dataset_and_output(
     output = tmp_path / 'work_dirs/optimization/trace.json'
     monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
     monkeypatch.setattr(
-        tool, '_git_commit',
-        lambda: (_ for _ in ()).throw(RuntimeError('dirty source'))
-        if failure == 'dirty' else 'd' * 40)
+        tool, 'authorize_manifest_candidate',
+        lambda *args: (
+            (_ for _ in ()).throw(RuntimeError('dirty source'))
+            if failure == 'dirty' else AuthorizedCandidate(
+                candidate, tmp_path / candidate.config, checkpoint,
+                {'git_commit': 'd' * 40})))
     monkeypatch.setattr(
         tool.Config, 'fromfile',
         lambda *args: (_ for _ in ()).throw(

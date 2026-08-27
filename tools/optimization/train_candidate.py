@@ -22,12 +22,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mambapose_opt.artifacts import optimization_output_path
+from mambapose_opt.checkpoints import authorize_manifest_candidate
 from mambapose_opt.numeric_source import (
     build_numeric_source_binding, file_sha256)
 from mambapose_opt.numeric_runtime import (
     validate_recovery_admission, validate_recovery_calibration_dependency)
 from mambapose_opt.schema import load_candidate_manifest
-from mambapose_opt.source import clean_git_commit
 
 
 def _candidate(path: Path, identifier: str):
@@ -85,8 +85,19 @@ def main() -> int:
         admission_path = stage_dir / 'recovery-admission.json'
         admission = _recovery_admission(
             admission_path, candidate, args.manifest)
-        commit = clean_git_commit(REPO_ROOT)
-        config = Config.fromfile(REPO_ROOT / candidate.config)
+        authorized = authorize_manifest_candidate(
+            REPO_ROOT, args.manifest, candidate.id)
+        if authorized.candidate != candidate:
+            raise ValueError(
+                'training candidate differs from authorized manifest')
+        commit = authorized.source['git_commit']
+        source = build_numeric_source_binding(
+            repository_root=REPO_ROOT, candidate=candidate,
+            manifest_path=args.manifest,
+            policy_path=REPO_ROOT / candidate.config,
+            git_commit=commit)
+        parent_checkpoint = authorized.checkpoint_path
+        config = Config.fromfile(authorized.config_path)
         dependency = {'recovery_admission': {
             'path': admission_path.relative_to(REPO_ROOT).as_posix(),
             'sha256': file_sha256(admission_path)}}
@@ -103,7 +114,7 @@ def main() -> int:
         work_dir = stage_dir / 'mmpose'
         resolved = stage_dir / 'resolved-train.py'
         config.work_dir = str(work_dir)
-        config.load_from = str(REPO_ROOT / candidate.checkpoint)
+        config.load_from = str(parent_checkpoint)
         config.resume = False
         config.randomness = dict(seed=candidate.seed, deterministic=True)
         config.dump(resolved)
@@ -149,10 +160,6 @@ def main() -> int:
                     dependency['screen_calibration']['sha256'],
             })
         _atomic_json(metadata_path, metadata)
-        source = build_numeric_source_binding(
-            repository_root=REPO_ROOT, candidate=candidate,
-            manifest_path=args.manifest, policy_path=REPO_ROOT / candidate.config,
-            git_commit=commit)
         _atomic_json(output, {
             'schema_version': 1, 'candidate_id': candidate.id, 'stage': 'train',
             'result': {

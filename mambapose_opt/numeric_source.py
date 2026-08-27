@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
-import os
 from pathlib import Path
 from pathlib import PurePosixPath
 import re
@@ -14,6 +13,7 @@ from typing import Any, Mapping
 
 from .schema import CandidateSpec, parse_candidate_manifest
 from .source import clean_git_commit
+from .evaluation import resolve_shared_asset_exposure
 
 
 class NumericSourceError(ValueError):
@@ -68,7 +68,7 @@ def _relative(root: Path, path: Path, label: str) -> str:
 
 
 def _approved_reproduction_link(
-        root: Path, relative: Path, link: Path, index: int) -> bool:
+        root: Path, relative: Path, _link: Path, index: int) -> bool:
     if tuple(relative.parts[:index + 1]) != ('work_dirs', 'reproduction'):
         return False
     try:
@@ -80,15 +80,12 @@ def _approved_reproduction_link(
             common = root / common
         common = common.resolve(strict=True)
         checkout = common.parent.resolve(strict=True)
-        raw_target = Path(os.readlink(link))
-        lexical_target = raw_target if raw_target.is_absolute() else link.parent / raw_target
-        expected = checkout / 'work_dirs/reproduction'
-        return (
-            common.name == '.git'
-            and root != checkout
-            and lexical_target.absolute() == expected.absolute()
-            and link.resolve(strict=True) == expected.resolve(strict=True)
-            and expected.is_dir())
+        if common.name != '.git' or root.resolve(strict=True) == checkout:
+            return False
+        resolve_shared_asset_exposure(
+            root, checkout, Path('work_dirs/reproduction'),
+            label='numeric checkpoint')
+        return True
     except (OSError, subprocess.CalledProcessError, ValueError):
         return False
 
