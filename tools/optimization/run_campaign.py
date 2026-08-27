@@ -103,12 +103,17 @@ class SubprocessStageRunner:
         python = str(REPO_ROOT / '.venv/bin/python')
         common = [candidate.id, '--output', self._relative(artifact)]
         if stage in {'convert', 'export'}:
-            return [
+            command = [
                 python, str(REPO_ROOT / 'tools/optimization/convert_numeric.py'),
                 candidate.id, '--stage', stage,
                 '--manifest', str(self.manifest_path),
                 '--output', self._relative(artifact),
             ]
+            if candidate.features.get('numeric_kind') == 'w8a8':
+                calibration = artifact.parent.parent / 'calibrate/calibrate.json'
+                command.extend([
+                    '--calibration-artifact', self._relative(calibration)])
+            return command
         if stage == 'calibrate' and candidate.route == 'ssm-quant-pwl':
             return [
                 python, str(REPO_ROOT / 'tools/optimization/calibrate_numeric.py'),

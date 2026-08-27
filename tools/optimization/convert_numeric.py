@@ -25,6 +25,9 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.numeric_conversion import (
     bind_numeric_inputs, quant_policy_from_config, verify_numeric_inputs)
+from mambapose_opt.numeric_calibration import validate_calibration_artifact
+from mambapose_opt.numeric_source import build_numeric_source_binding
+from mambapose_opt.source import clean_git_commit
 from mambapose_opt.schema import load_candidate_manifest
 from mmpose.models.utils.hardware_friendly import (
     convert_for_fake_quant, export_int8_state)
@@ -62,41 +65,62 @@ def _atomic_json(path: Path, value: dict) -> None:
         raise
 
 
-def convert(candidate, *, stage: str, output: Path) -> dict:
+def convert(
+        candidate, *, stage: str, output: Path, manifest_path: Path,
+        calibration_artifact: Path | None = None) -> dict:
     if candidate.route != 'ssm-quant-pwl' \
-            or candidate.features.get('numeric_kind') != 'weight-only':
+            or candidate.features.get('numeric_kind') not in {
+                'weight-only', 'w8a8'}:
         raise ValueError(
-            'deterministic Stage A conversion currently admits weight-only only')
-    status = subprocess.check_output(
-        ['git', 'status', '--porcelain'], cwd=REPOSITORY_ROOT,
-        text=True)
-    if status:
-        raise ValueError('production numeric conversion requires clean source')
+            'deterministic Stage A conversion admits W8/W8A8 only')
+    commit = clean_git_commit(REPOSITORY_ROOT)
     config_path = (REPOSITORY_ROOT / candidate.config).resolve()
     checkpoint_path = (REPOSITORY_ROOT / candidate.checkpoint).resolve()
     config = Config.fromfile(config_path)
+    calibration = None
+    if candidate.features.get('numeric_kind') == 'w8a8':
+        if calibration_artifact is None:
+            raise ValueError('W8A8 conversion requires --calibration-artifact')
+        calibration_artifact = calibration_artifact.resolve()
+        calibration_artifact.relative_to(REPOSITORY_ROOT.resolve())
+        calibration = json.loads(calibration_artifact.read_text(encoding='utf-8'))
+        validate_calibration_artifact(
+            calibration, expected_candidate_id=candidate.id)
+        config.numeric_optimization.quant_policy.calibration_artifact = {
+            'path': calibration_artifact.relative_to(
+                REPOSITORY_ROOT).as_posix(),
+            'sha256': _sha256(calibration_artifact),
+        }
     policy = quant_policy_from_config(
-        config.numeric_optimization.quant_policy)
+        config.numeric_optimization.quant_policy,
+        calibration_artifact=calibration)
     runtime_paths = {
         'config': config_path,
         'checkpoint': checkpoint_path,
         'policy': config_path,
     }
+    if calibration_artifact is not None:
+        runtime_paths['calibration'] = calibration_artifact
     binding = bind_numeric_inputs(runtime_paths)
     verify_numeric_inputs(binding)
 
     from mmpose.apis import init_model
     model = init_model(str(config_path), str(checkpoint_path), device='cpu')
     report = convert_for_fake_quant(model, policy)
+    verify_numeric_inputs(binding)
     result = {
-        'source_git_commit': subprocess.check_output(
-            ['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY_ROOT,
-            text=True).strip(),
+        'source': build_numeric_source_binding(
+            repository_root=REPOSITORY_ROOT, candidate=candidate,
+            manifest_path=manifest_path, policy_path=config_path,
+            git_commit=commit),
         'runtime_bindings': {
             role: {
-                'path': (candidate.checkpoint.as_posix()
-                         if role == 'checkpoint'
-                         else candidate.config.as_posix()),
+                'path': (
+                    candidate.checkpoint.as_posix() if role == 'checkpoint'
+                    else calibration_artifact.relative_to(
+                        REPOSITORY_ROOT).as_posix()
+                    if role == 'calibration'
+                    else candidate.config.as_posix()),
                 'sha256': checksum,
             }
             for role, checksum in binding.sha256
@@ -106,6 +130,13 @@ def convert(candidate, *, stage: str, output: Path) -> dict:
             config.numeric_optimization.precision_invariants),
         'latency_claim': 'none-fake-quant-is-not-an-integer-kernel',
     }
+    if calibration_artifact is not None:
+        runtime_config = output.parent / 'resolved-runtime.py'
+        config.dump(runtime_config)
+        result['runtime_config'] = {
+            'path': runtime_config.relative_to(REPOSITORY_ROOT).as_posix(),
+            'sha256': _sha256(runtime_config),
+        }
     if stage == 'export':
         packed_path = output.with_suffix('.int8.pt')
         packed = {
@@ -136,12 +167,16 @@ def main() -> int:
     parser.add_argument('--manifest', type=Path,
                         default=REPOSITORY_ROOT / 'optimization/candidates.json')
     parser.add_argument('--output', required=True)
+    parser.add_argument('--calibration-artifact', type=Path)
     args = parser.parse_args()
     try:
         output = optimization_output_path(
             args.output, repository_root=REPOSITORY_ROOT)
         candidate = _candidate(args.manifest, args.candidate_id)
-        _atomic_json(output, convert(candidate, stage=args.stage, output=output))
+        _atomic_json(output, convert(
+            candidate, stage=args.stage, output=output,
+            manifest_path=args.manifest,
+            calibration_artifact=args.calibration_artifact))
         return 0
     except (OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))

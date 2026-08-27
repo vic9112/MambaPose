@@ -566,9 +566,10 @@ class SS2Dv2:
         channel_first = self.channel_first
         to_fp32 = lambda *args: (_a.to(torch.float32) for _a in args)
 
-        if cascade2d and self._numeric_observer_callback is not None:
+        if cascade2d and (self._numeric_observer_callback is not None
+                          or self._numeric_pwl_function is not None):
             raise RuntimeError(
-                "numeric observation does not support cascade2d SS2D")
+                "numeric observation/PWL does not support cascade2d SS2D")
 
         B, D, H, W = x.shape
         D, N = A_logs.shape
@@ -671,7 +672,10 @@ class SS2Dv2:
 
             xs = xs.view(B, -1, L)
             dts = dts.contiguous().view(B, -1, L)
-            As = -torch.exp(A_logs.to(torch.float)) # (k * c, d_state)
+            log_a = A_logs.to(torch.float)
+            As = -(self._apply_numeric_pwl('exp', log_a)
+                   if self._numeric_pwl_function == 'exp'
+                   else torch.exp(log_a)) # (k * c, d_state)
             Bs = Bs.contiguous().view(B, K, N, L)
             Cs = Cs.contiguous().view(B, K, N, L)
             Ds = Ds.to(torch.float) # (K * c)
@@ -679,6 +683,14 @@ class SS2Dv2:
 
             if force_fp32:
                 xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
+
+            scan_delta_bias = delta_bias
+            scan_delta_softplus = delta_softplus
+            if self._numeric_pwl_function == 'softplus':
+                dts = self._apply_numeric_pwl(
+                    'softplus', dts + delta_bias.view(1, -1, 1))
+                scan_delta_bias = None
+                scan_delta_softplus = False
 
             self._observe_numeric("scan_input_u", xs)
             self._observe_numeric("scan_input_dt", dts)
@@ -688,7 +700,8 @@ class SS2Dv2:
             self._observe_numeric("transition_D", Ds)
             self._observe_numeric("transition_delta_bias", delta_bias)
             ys: torch.Tensor = selective_scan(
-                xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
+                xs, dts, As, Bs, Cs, Ds, scan_delta_bias,
+                scan_delta_softplus
             )
             self._observe_numeric("scan_output", ys)
             ys = ys.view(B, K, -1, H, W)
@@ -1041,6 +1054,7 @@ class SS2D(nn.Module, mamba_init, SS2Dv0, SS2Dv2, SS2Dv3):
         else:
             self.__initv2__(**kwargs)
         self._numeric_observer_callback = None
+        self._numeric_pwl_function = None
 
     def set_numeric_observer(self, callback=None):
         """Install a default-off calibration callback without model state."""
@@ -1052,6 +1066,20 @@ class SS2D(nn.Module, mamba_init, SS2Dv0, SS2Dv2, SS2Dv3):
         callback = self._numeric_observer_callback
         if callback is not None:
             callback(role, value.detach())
+
+    def install_numeric_pwl(self, function_name, approximation):
+        """Install one opt-in SS2D transition PWL after checkpoint loading."""
+        if function_name not in {'softplus', 'exp'}:
+            raise ValueError('SS2D transition PWL admits softplus or exp only')
+        if self._numeric_pwl_function is not None:
+            raise ValueError('SS2D already has a numeric PWL function')
+        self.add_module(f'_numeric_pwl_{function_name}', approximation)
+        self._numeric_pwl_function = function_name
+
+    def _apply_numeric_pwl(self, function_name, value):
+        if self._numeric_pwl_function != function_name:
+            raise RuntimeError('requested SS2D PWL function is not installed')
+        return getattr(self, f'_numeric_pwl_{function_name}')(value)
 
 
 # =====================================================

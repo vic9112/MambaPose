@@ -31,6 +31,7 @@ from mambapose_opt.evaluation import (
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 from mambapose_opt.source import clean_git_commit
+from mambapose_opt.numeric_runtime import resolve_numeric_runtime
 
 
 def _sha256(path: Path) -> str:
@@ -85,8 +86,9 @@ def _git_commit() -> str:
     return clean_git_commit(REPO_ROOT)
 
 
-def _deterministic_config(candidate: CandidateSpec, flip_test: bool) -> Config:
-    config = Config.fromfile(REPO_ROOT / candidate.config)
+def _deterministic_config(
+        candidate: CandidateSpec, flip_test: bool, config_path: Path) -> Config:
+    config = Config.fromfile(config_path)
     config.randomness = dict(seed=candidate.seed, deterministic=True)
     configured_imports = list(
         config.get('custom_imports', {}).get('imports', ()))
@@ -103,9 +105,12 @@ def _deterministic_config(candidate: CandidateSpec, flip_test: bool) -> Config:
 
 def _evaluate_mode(
         candidate: CandidateSpec, output: Path, *, flip_test: bool,
-        checkpoint_sha256: str, git_commit: str) -> dict:
-    checkpoint = REPO_ROOT / candidate.checkpoint
-    config = _deterministic_config(candidate, flip_test)
+        checkpoint_sha256: str, git_commit: str,
+        checkpoint: Path | None = None,
+        config_path: Path | None = None) -> dict:
+    checkpoint = checkpoint or REPO_ROOT / candidate.checkpoint
+    config_path = config_path or REPO_ROOT / candidate.config
+    config = _deterministic_config(candidate, flip_test, config_path)
     protocol = validate_coco_val_protocol(config, repository_root=REPO_ROOT)
     mode = 'flip' if flip_test else 'no-flip'
     resolved = output.parent / f'resolved-{mode}.py'
@@ -154,8 +159,8 @@ def _evaluate_mode(
         'protocol': {
             **protocol,
             'batch_size': int(config.test_dataloader.batch_size),
-            'source_config': candidate.config.as_posix(),
-            'checkpoint': candidate.checkpoint.as_posix(),
+            'source_config': config_path.relative_to(REPO_ROOT).as_posix(),
+            'checkpoint': checkpoint.relative_to(REPO_ROOT).as_posix(),
             'data_inventory': 'data/inventory.json',
         },
     }
@@ -165,23 +170,33 @@ def evaluate(
         candidate: CandidateSpec, output: Path, *,
         modes: tuple[str, ...] = ('flip', 'no_flip'),
         manifest_path: Path | None = None) -> dict:
-    checkpoint = REPO_ROOT / candidate.checkpoint
+    manifest = manifest_path or REPO_ROOT / 'optimization/candidates.json'
+    runtime = resolve_numeric_runtime(
+        candidate, repository_root=REPO_ROOT, manifest_path=manifest,
+        downstream_output=output)
+    checkpoint = runtime['checkpoint_path']
+    config_path = runtime['config_path']
     checkpoint_sha256 = _sha256(checkpoint)
-    if checkpoint_sha256 != candidate.checkpoint_sha256:
+    if checkpoint_sha256 != runtime['checkpoint_sha256']:
         raise ValueError(
             f'checkpoint sha256 mismatch for {candidate.id}: '
             f'{checkpoint_sha256}')
     git_commit = _git_commit()
     source = build_source_binding(
         repository_root=REPO_ROOT, candidate=candidate,
-        manifest_path=(manifest_path or REPO_ROOT / 'optimization/candidates.json'),
+        manifest_path=manifest,
         git_commit=git_commit)
     rows = {
         mode: _evaluate_mode(
             candidate, output, flip_test=mode == 'flip',
-            checkpoint_sha256=checkpoint_sha256, git_commit=git_commit)
+            checkpoint_sha256=checkpoint_sha256, git_commit=git_commit,
+            checkpoint=checkpoint, config_path=config_path)
         for mode in modes
     }
+    if (candidate.route == 'ssm-quant-pwl'
+            and (_sha256(config_path) != runtime['config_sha256']
+                 or _sha256(checkpoint) != runtime['checkpoint_sha256'])):
+        raise ValueError('evaluation runtime inputs changed during execution')
     return stage_envelope(candidate.id, 'evaluate', {
         'route': candidate.route,
         'calibration_split': None,

@@ -27,6 +27,9 @@ from mambapose_opt.inventory import collect_module_inventory, count_parameters
 from mambapose_opt.numeric_conversion import apply_numeric_runtime
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
+from mambapose_opt.numeric_runtime import resolve_numeric_runtime
+from mambapose_opt.numeric_source import build_numeric_source_binding
+from mambapose_opt.source import clean_git_commit
 
 
 def _sha256(path: Path) -> str:
@@ -86,19 +89,30 @@ def _candidate(manifest: Path, identifier: str) -> CandidateSpec:
     raise ValueError(f'candidate not found: {identifier}')
 
 
-def profile(candidate: CandidateSpec, input_shape: tuple[int, ...]) -> dict[str, Any]:
+def profile(
+        candidate: CandidateSpec, input_shape: tuple[int, ...], *,
+        manifest_path: Path | None = None,
+        output: Path | None = None) -> dict[str, Any]:
     """Load one candidate on CPU, validate its checkpoint, and inventory it."""
-    checkpoint = REPOSITORY_ROOT / candidate.checkpoint
+    manifest_path = manifest_path or REPOSITORY_ROOT / 'optimization/candidates.json'
+    commit = clean_git_commit(REPOSITORY_ROOT)
+    runtime = resolve_numeric_runtime(
+        candidate, repository_root=REPOSITORY_ROOT,
+        manifest_path=manifest_path,
+        downstream_output=(output or REPOSITORY_ROOT / 'work_dirs/optimization/'
+                           'profile/profile.json'))
+    checkpoint = runtime['checkpoint_path']
     actual_checksum = _sha256(checkpoint)
-    if actual_checksum != candidate.checkpoint_sha256:
+    if actual_checksum != runtime['checkpoint_sha256']:
         raise ValueError(
             f'checkpoint sha256 mismatch for {candidate.id}: '
             f'expected {candidate.checkpoint_sha256}, got {actual_checksum}')
 
     from mmpose.apis import init_model
 
-    config = Config.fromfile(REPOSITORY_ROOT / candidate.config)
-    model = init_model(str(REPOSITORY_ROOT / candidate.config),
+    config_path = runtime['config_path']
+    config = Config.fromfile(config_path)
+    model = init_model(str(config_path),
                        str(checkpoint), device='cpu')
     numeric = config.get('numeric_optimization')
     if numeric is not None:
@@ -107,13 +121,15 @@ def profile(candidate: CandidateSpec, input_shape: tuple[int, ...]) -> dict[str,
     with torch.inference_mode():
         outputs = model(input_tensor, data_samples=None, mode='tensor')
     parameters = count_parameters(model)
-    return {
+    if (_sha256(config_path) != runtime['config_sha256']
+            or _sha256(checkpoint) != runtime['checkpoint_sha256']):
+        raise ValueError('profile runtime inputs changed during execution')
+    result = {
         'schema_version': 1,
-        'git_commit': subprocess.check_output(
-            ['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY_ROOT, text=True).strip(),
+        'git_commit': commit,
         'candidate': candidate.id,
-        'config': candidate.config.as_posix(),
-        'checkpoint': candidate.checkpoint.as_posix(),
+        'config': config_path.relative_to(REPOSITORY_ROOT).as_posix(),
+        'checkpoint': checkpoint.relative_to(REPOSITORY_ROOT).as_posix(),
         'checkpoint_sha256': actual_checksum,
         'input_shapes': _shape_tree(input_tensor),
         'output_shapes': _shape_tree(outputs),
@@ -133,6 +149,13 @@ def profile(candidate: CandidateSpec, input_shape: tuple[int, ...]) -> dict[str,
             for record in collect_module_inventory(model)
         ],
     }
+    if candidate.route == 'ssm-quant-pwl':
+        result['source'] = build_numeric_source_binding(
+            repository_root=REPOSITORY_ROOT, candidate=candidate,
+            manifest_path=manifest_path,
+            policy_path=REPOSITORY_ROOT / candidate.config,
+            git_commit=commit)
+    return result
 
 
 def main() -> None:
@@ -145,7 +168,9 @@ def main() -> None:
     args = parser.parse_args()
 
     candidate = _candidate(args.manifest, args.candidate_id)
-    _atomic_json(args.output, profile(candidate, args.input_shape))
+    _atomic_json(args.output, profile(
+        candidate, args.input_shape, manifest_path=args.manifest,
+        output=args.output))
 
 
 if __name__ == '__main__':

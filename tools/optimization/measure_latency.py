@@ -39,6 +39,7 @@ from mambapose_opt.latency import (
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 from mambapose_opt.numeric_conversion import apply_numeric_runtime
 from mambapose_opt.source import clean_git_commit
+from mambapose_opt.numeric_runtime import resolve_numeric_runtime
 
 
 LEASE_MAX_AGE = timedelta(seconds=LEASE_MAX_AGE_SECONDS)
@@ -135,13 +136,13 @@ def _git_commit() -> str:
 
 
 def _latency_admission(
-        candidate: CandidateSpec, *, device_index: int) -> dict[str, Any]:
+        candidate: CandidateSpec, *, device_index: int,
+        checkpoint: Path, checkpoint_sha256: str,
+        config_path: Path) -> dict[str, Any]:
     commit = _git_commit()
-    checkpoint = REPO_ROOT / candidate.checkpoint
     checkpoint_hash = _sha256(checkpoint)
-    if checkpoint_hash != candidate.checkpoint_sha256:
+    if checkpoint_hash != checkpoint_sha256:
         raise ValueError(f'checkpoint sha256 mismatch for {candidate.id}')
-    config_path = REPO_ROOT / candidate.config
     inventory_path = resolve_project_asset_root(REPO_ROOT) / 'data/inventory.json'
     config_hash = _sha256(config_path)
     inventory_hash = _sha256(inventory_path)
@@ -158,19 +159,28 @@ def _latency_admission(
 def measure_candidate(
         candidate: CandidateSpec, *, warmup: int, repeats: int,
         device_index: int | None = None,
-        manifest_path: Path | None = None) -> dict:
+        manifest_path: Path | None = None,
+        output: Path | None = None) -> dict:
     if device_index is None:
         try:
             device_index = int(os.environ['MAMBAPOSE_PHYSICAL_DEVICE_INDEX'])
         except (KeyError, ValueError) as error:
             raise ValueError('physical GPU device index is required') from error
-    admission = _latency_admission(candidate, device_index=device_index)
+    manifest = manifest_path or REPO_ROOT / 'optimization/candidates.json'
+    runtime = resolve_numeric_runtime(
+        candidate, repository_root=REPO_ROOT, manifest_path=manifest,
+        downstream_output=(output or REPO_ROOT / 'work_dirs/optimization/'
+                           'latency/latency.json'))
+    checkpoint = runtime['checkpoint_path']
+    config_path = runtime['config_path']
+    admission = _latency_admission(
+        candidate, device_index=device_index, checkpoint=checkpoint,
+        checkpoint_sha256=runtime['checkpoint_sha256'],
+        config_path=config_path)
     source = build_source_binding(
         repository_root=REPO_ROOT, candidate=candidate,
-        manifest_path=(manifest_path or REPO_ROOT / 'optimization/candidates.json'),
+        manifest_path=manifest,
         git_commit=admission['git_commit'])
-    checkpoint = REPO_ROOT / candidate.checkpoint
-    config_path = REPO_ROOT / candidate.config
     config = Config.fromfile(config_path)
     data_protocol = validate_coco_val_protocol(
         config, repository_root=REPO_ROOT)
@@ -215,10 +225,13 @@ def measure_candidate(
     })
     result['protocol']['data'] = data_protocol
     result['protocol'].update({
-        'source_config': candidate.config.as_posix(),
-        'checkpoint': candidate.checkpoint.as_posix(),
+        'source_config': config_path.relative_to(REPO_ROOT).as_posix(),
+        'checkpoint': checkpoint.relative_to(REPO_ROOT).as_posix(),
         'data_inventory': 'data/inventory.json',
     })
+    if (_sha256(config_path) != runtime['config_sha256']
+            or _sha256(checkpoint) != runtime['checkpoint_sha256']):
+        raise ValueError('latency runtime inputs changed during execution')
     return stage_envelope(candidate.id, 'latency', result)
 
 
@@ -234,7 +247,7 @@ def main() -> int:
     candidate = _candidate(args.manifest, args.candidate_id)
     _atomic_json(args.output, measure_candidate(
         candidate, warmup=args.warmup, repeats=args.iterations,
-        manifest_path=args.manifest))
+        manifest_path=args.manifest, output=args.output))
     return 0
 
 

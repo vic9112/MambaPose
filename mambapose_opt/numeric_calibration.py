@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import math
 from typing import Any, Mapping
 import zipfile
 
@@ -162,6 +163,11 @@ def _verified_dataset_authority(
         raise CalibrationContractError(
             'official annotation archive cannot be verified') from error
 
+    if (_sha256(train_archive) != train_archive_sha256
+            or _sha256(annotation_archive) != annotation_archive_sha256):
+        raise CalibrationContractError(
+            'official archive content changed during dataset verification')
+
     return {
         'inventory': 'data/inventory.json',
         'inventory_sha256': _sha256(inventory_path),
@@ -299,8 +305,8 @@ def discover_calibration_targets(model: nn.Module) -> CalibrationTargets:
 def validate_calibration_artifact(
         value: Mapping[str, Any], *,
         expected_candidate_id: str | None = None) -> Mapping[str, Any]:
-    required = {'schema_version', 'candidate_id', 'stage', 'identity',
-                'protocol', 'hooks'}
+    required = {'schema_version', 'candidate_id', 'stage', 'source',
+                'identity', 'protocol', 'hooks'}
     if not isinstance(value, Mapping) or set(value) != required:
         raise CalibrationContractError(
             'calibration artifact fields do not match schema v1')
@@ -313,9 +319,53 @@ def validate_calibration_artifact(
         raise CalibrationContractError(
             'calibration artifact target candidate mismatch')
     identity = value['identity']
-    if not isinstance(identity, Mapping) or identity.get('split') != 'train2017' \
-            or identity.get('candidate_id') != 'full-s-v1':
+    identity_fields = {
+        'candidate_id', 'config', 'config_sha256', 'checkpoint',
+        'checkpoint_sha256', 'policy', 'policy_sha256', 'split', 'dataset',
+        'git_commit'}
+    if (not isinstance(identity, Mapping) or set(identity) != identity_fields
+            or identity.get('split') != 'train2017'
+            or identity.get('candidate_id') != 'full-s-v1'
+            or identity.get('config') != 'configs/reproduction/coco_s_v1.py'
+            or not isinstance(identity.get('git_commit'), str)
+            or not re.fullmatch(r'[0-9a-f]{40}', identity['git_commit'])
+            or any(not isinstance(identity.get(field), str)
+                   or not re.fullmatch(r'[0-9a-f]{64}', identity[field])
+                   for field in (
+                       'config_sha256', 'checkpoint_sha256',
+                       'policy_sha256'))):
         raise CalibrationContractError('calibration identity must bind train2017')
+    dataset = identity['dataset']
+    dataset_fields = {
+        'annotation', 'annotation_sha256', 'image_prefix', 'inventory',
+        'inventory_sha256', 'train_archive', 'train_archive_sha256',
+        'image_count', 'image_content_algorithm',
+        'image_content_aggregate_sha256', 'image_order_algorithm',
+        'image_order_sha256', 'annotation_archive',
+        'annotation_archive_sha256', 'annotation_member',
+        'annotation_member_sha256'}
+    if (not isinstance(dataset, Mapping) or set(dataset) != dataset_fields
+            or dataset.get('annotation') !=
+            'data/coco/annotations/person_keypoints_train2017.json'
+            or dataset.get('image_prefix') != 'data/coco/train2017'
+            or dataset.get('inventory') != 'data/inventory.json'
+            or dataset.get('image_count') != 118287
+            or dataset.get('image_content_algorithm') !=
+            'sha256-zip-member-bytes-v1'
+            or dataset.get('image_order_algorithm') !=
+            'sha256-zip-central-directory-order-v1'
+            or dataset.get('annotation_member') !=
+            'annotations/person_keypoints_train2017.json'
+            or any(not isinstance(dataset.get(field), str)
+                   or not re.fullmatch(r'[0-9a-f]{64}', dataset[field])
+                   for field in (
+                       'annotation_sha256', 'inventory_sha256',
+                       'train_archive_sha256',
+                       'image_content_aggregate_sha256',
+                       'image_order_sha256', 'annotation_archive_sha256',
+                       'annotation_member_sha256'))):
+        raise CalibrationContractError(
+            'calibration dataset authority is incomplete')
     protocol = value['protocol']
     if not isinstance(protocol, Mapping):
         raise CalibrationContractError('calibration protocol is invalid')
@@ -334,8 +384,13 @@ def validate_calibration_artifact(
             r'[0-9a-f]{64}', protocol['sample_order_sha256']):
         raise CalibrationContractError('calibration sample order hash is invalid')
     hooks = value['hooks']
-    if not isinstance(hooks, Mapping) or not isinstance(
-            hooks.get('records'), Mapping) or not hooks['records']:
+    if (not isinstance(hooks, Mapping)
+            or set(hooks) not in (
+                {'records', 'required_records', 'unsupported_internals'},
+                {'records', 'required_records', 'unsupported_internals',
+                 'activation_scales'})
+            or not isinstance(hooks.get('records'), Mapping)
+            or not hooks['records']):
         raise CalibrationContractError('calibration hook records are missing')
     required_records = hooks.get('required_records')
     if not isinstance(required_records, list) or not required_records \
@@ -357,7 +412,53 @@ def validate_calibration_artifact(
     if unexpected_records:
         raise CalibrationContractError(
             f'calibration hook records are unexpected: {unexpected_records}')
+    record_fields = {
+        'granularity', 'sample_count', 'zero_count', 'underflow_count',
+        'overflow_count', 'max_abs', 'range', 'percentiles', 'algorithm',
+        'histogram_bins', 'histogram_domain', 'percentile_bound_valid',
+        'relative_error_bound', 'outlier_ratio_above_p99_bin', 'token_ids',
+        'observed_shape'}
+    for name, record in hooks['records'].items():
+        numeric = record.get('range') if isinstance(record, Mapping) else None
+        if (not isinstance(record, Mapping) or set(record) != record_fields
+                or record.get('granularity') not in {
+                    'tensor', 'channel', 'token'}
+                or not isinstance(record.get('sample_count'), int)
+                or isinstance(record.get('sample_count'), bool)
+                or record['sample_count'] <= 0
+                or any(not isinstance(record.get(field), int)
+                       or isinstance(record.get(field), bool)
+                       or record[field] < 0 for field in (
+                           'zero_count', 'underflow_count', 'overflow_count'))
+                or not isinstance(numeric, list) or len(numeric) != 2
+                or any(not isinstance(item, (int, float))
+                       or isinstance(item, bool) or not math.isfinite(item)
+                       for item in numeric)
+                or record.get('algorithm') != 'fixed-log2-histogram-v1'
+                or record.get('histogram_bins') != 256
+                or not isinstance(record.get('percentile_bound_valid'), bool)):
+            raise CalibrationContractError(
+                f'calibration hook record schema is invalid: {name}')
+        bounded = record['percentile_bound_valid']
+        if bounded != (
+                record['underflow_count'] == 0 and record['overflow_count'] == 0):
+            raise CalibrationContractError(
+                f'calibration hook percentile bound is inconsistent: {name}')
     if not isinstance(hooks.get('unsupported_internals'), list):
         raise CalibrationContractError(
             'calibration unsupported internals must be explicit')
+    if 'activation_scales' in hooks:
+        scales = hooks['activation_scales']
+        if not isinstance(scales, Mapping):
+            raise CalibrationContractError(
+                'calibration activation scales must be a role mapping')
+        for role, record in scales.items():
+            if (not isinstance(role, str) or not role
+                    or not isinstance(record, Mapping)
+                    or set(record) != {
+                        'source_record', 'granularity', 'scale'}
+                    or record.get('granularity') not in {'tensor', 'channel'}
+                    or record.get('source_record') not in hooks['records']):
+                raise CalibrationContractError(
+                    f'calibration activation scale is invalid for {role!r}')
     return value

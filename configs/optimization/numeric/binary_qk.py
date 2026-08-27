@@ -7,7 +7,7 @@ numeric_optimization = dict(
     qk_ste=True, preserve_scale=True, softmax='floating', value='floating',
     attention_accumulation='floating', output_projection='floating',
     report='theoretical-changed-multiplies-separate-from-latency',
-    stage_order=('train', 'profile', 'evaluate', 'latency', 'compare'),
+    stage_order=('profile', 'evaluate', 'latency'),
     train_envelope=dict(
         recovery='one-bounded-qat-and-distillation-run',
         requires_attributed_error=True, max_preliminary_ap_drop=0.3),

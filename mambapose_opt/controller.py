@@ -314,8 +314,13 @@ class OptimizationController:
         if stage == 'calibrate' and self.candidate.route == 'ssm-quant-pwl':
             try:
                 from .numeric_calibration import validate_calibration_artifact
+                from .numeric_source import validate_numeric_source_binding
                 validate_calibration_artifact(
                     value, expected_candidate_id=self.candidate.id)
+                validate_numeric_source_binding(
+                    value['source'], repository_root=self.repository_root,
+                    candidate=self.candidate,
+                    manifest_path=self.manifest_path)
             except ValueError as error:
                 raise ArtifactValidationError(
                     f'numeric calibration artifact is invalid: {error}') from error
@@ -326,6 +331,8 @@ class OptimizationController:
                 'checkpoint', 'checkpoint_sha256', 'input_shapes',
                 'output_shapes', 'parameters', 'modules',
             }
+            if self.candidate.route == 'ssm-quant-pwl':
+                required.add('source')
             if set(value) != required:
                 raise ArtifactValidationError(
                     'profile artifact fields do not match profile schema v1')
@@ -340,13 +347,36 @@ class OptimizationController:
             if value.get('candidate') != self.candidate.id:
                 raise ArtifactValidationError(
                     'profile artifact candidate identity mismatch')
-            if value.get('config') != self.candidate.config.as_posix():
+            expected_config = self.candidate.config.as_posix()
+            expected_checkpoint = self.candidate.checkpoint.as_posix()
+            expected_checkpoint_sha = self.candidate.checkpoint_sha256
+            if self.candidate.route == 'ssm-quant-pwl':
+                try:
+                    from .numeric_runtime import resolve_numeric_runtime
+                    from .numeric_source import validate_numeric_source_binding
+                    runtime = resolve_numeric_runtime(
+                        self.candidate, repository_root=self.repository_root,
+                        manifest_path=self.manifest_path,
+                        downstream_output=path)
+                    expected_config = runtime['config_path'].relative_to(
+                        self.repository_root).as_posix()
+                    expected_checkpoint = runtime['checkpoint_path'].relative_to(
+                        self.repository_root).as_posix()
+                    expected_checkpoint_sha = runtime['checkpoint_sha256']
+                    validate_numeric_source_binding(
+                        value['source'], repository_root=self.repository_root,
+                        candidate=self.candidate,
+                        manifest_path=self.manifest_path)
+                except ValueError as error:
+                    raise ArtifactValidationError(
+                        f'numeric profile source/runtime is invalid: {error}') from error
+            if value.get('config') != expected_config:
                 raise ArtifactValidationError(
                     'profile artifact config identity mismatch')
-            if value.get('checkpoint') != self.candidate.checkpoint.as_posix():
+            if value.get('checkpoint') != expected_checkpoint:
                 raise ArtifactValidationError(
                     'profile artifact checkpoint identity mismatch')
-            if value.get('checkpoint_sha256') != self.candidate.checkpoint_sha256:
+            if value.get('checkpoint_sha256') != expected_checkpoint_sha:
                 raise ArtifactValidationError(
                     'profile artifact checkpoint hash mismatch')
             input_shape = value.get('input_shapes')
@@ -415,9 +445,20 @@ class OptimizationController:
         if self.candidate.route == 'ssm-quant-pwl' and stage in {
                 'convert', 'export'}:
             result = value['result']
+            try:
+                from .numeric_source import validate_numeric_source_binding
+                validate_numeric_source_binding(
+                    result.get('source'), repository_root=self.repository_root,
+                    candidate=self.candidate,
+                    manifest_path=self.manifest_path)
+            except ValueError as error:
+                raise ArtifactValidationError(
+                    f'numeric stage source binding is invalid: {error}') from error
             bindings = result.get('runtime_bindings')
-            if not isinstance(bindings, dict) or set(bindings) != {
-                    'config', 'checkpoint', 'policy'}:
+            expected_bindings = {'config', 'checkpoint', 'policy'}
+            if self.candidate.features.get('numeric_kind') == 'w8a8':
+                expected_bindings.add('calibration')
+            if not isinstance(bindings, dict) or set(bindings) != expected_bindings:
                 raise ArtifactValidationError(
                     'numeric stage runtime bindings are incomplete')
             for role, binding in bindings.items():
@@ -438,6 +479,23 @@ class OptimizationController:
                     'none-fake-quant-is-not-an-integer-kernel'):
                 raise ArtifactValidationError(
                     'numeric fake-quant stage made an invalid latency claim')
+            if self.candidate.features.get('numeric_kind') == 'w8a8':
+                runtime_config = result.get('runtime_config')
+                if not isinstance(runtime_config, dict) or set(runtime_config) != {
+                        'path', 'sha256'}:
+                    raise ArtifactValidationError(
+                        'W8A8 runtime config reference is invalid')
+                runtime_path = (
+                    self.repository_root / str(runtime_config['path'])).resolve()
+                try:
+                    runtime_path.relative_to(self.repository_root)
+                except ValueError as error:
+                    raise ArtifactValidationError(
+                        'W8A8 runtime config escapes repository') from error
+                if (not runtime_path.is_file()
+                        or _sha256(runtime_path) != runtime_config['sha256']):
+                    raise ArtifactValidationError(
+                        'W8A8 runtime config hash mismatch')
             if stage == 'export':
                 exported = result.get('export')
                 if not isinstance(exported, dict) or set(exported) != {
@@ -456,6 +514,17 @@ class OptimizationController:
                         or export_path.stat().st_size != exported['bytes']:
                     raise ArtifactValidationError(
                         'numeric export reference hash or size mismatch')
+        if stage == 'train' and self.candidate.route == 'ssm-quant-pwl':
+            try:
+                from .numeric_runtime import validate_numeric_train_artifact
+                validate_numeric_train_artifact(
+                    value, candidate=self.candidate,
+                    repository_root=self.repository_root,
+                    manifest_path=self.manifest_path)
+            except ValueError as error:
+                raise ArtifactValidationError(
+                    f'numeric train artifact is invalid: {error}') from error
+            return 'numeric-train-v1'
         if stage == 'evaluate':
             try:
                 source, source_candidate, authority = resolve_artifact_source(
@@ -464,15 +533,30 @@ class OptimizationController:
                 if source_candidate != self.candidate:
                     raise MetricError(
                         'evaluate source candidate disagrees with controller')
+                expected_config = self.candidate.config.as_posix()
+                expected_checkpoint = self.candidate.checkpoint.as_posix()
+                expected_checkpoint_sha = self.candidate.checkpoint_sha256
+                runtime_config_path = self.repository_root / self.candidate.config
+                if self.candidate.route == 'ssm-quant-pwl':
+                    from .numeric_runtime import resolve_numeric_runtime
+                    runtime = resolve_numeric_runtime(
+                        self.candidate, repository_root=self.repository_root,
+                        manifest_path=self.manifest_path,
+                        downstream_output=path)
+                    runtime_config_path = runtime['config_path']
+                    expected_config = runtime_config_path.relative_to(
+                        self.repository_root).as_posix()
+                    expected_checkpoint = runtime['checkpoint_path'].relative_to(
+                        self.repository_root).as_posix()
+                    expected_checkpoint_sha = runtime['checkpoint_sha256']
                 validated_evaluation = validate_evaluation_envelope(
                     value,
                     expected_candidate_id=self.candidate.id,
                     expected_route=self.candidate.route,
-                    expected_checkpoint_sha256=(
-                        self.candidate.checkpoint_sha256),
+                    expected_checkpoint_sha256=expected_checkpoint_sha,
                     expected_authority_sha256=source['authority_sha256'],
-                    expected_source_config=self.candidate.config.as_posix(),
-                    expected_checkpoint=self.candidate.checkpoint.as_posix(),
+                    expected_source_config=expected_config,
+                    expected_checkpoint=expected_checkpoint,
                     expected_seed=self.candidate.seed,
                     expected_git_commit=source['git_commit'],
                     expected_source_binding=source,
@@ -481,11 +565,11 @@ class OptimizationController:
                 )
                 from mmengine.config import Config
                 config = Config.fromfile(
-                    self.repository_root / self.candidate.config)
+                    runtime_config_path)
                 validate_live_coco_observation(
                     validated_evaluation['modes']['flip']['protocol'],
                     config=config, repository_root=self.repository_root)
-            except (MetricError, OSError) as error:
+            except (MetricError, OSError, ValueError) as error:
                 raise ArtifactValidationError(
                     f'evaluate artifact is invalid: {error}') from error
         if stage == 'latency':
@@ -496,18 +580,35 @@ class OptimizationController:
                 if source_candidate != self.candidate:
                     raise MetricError(
                         'latency source candidate disagrees with controller')
+                expected_config = self.candidate.config.as_posix()
+                expected_checkpoint = self.candidate.checkpoint.as_posix()
+                expected_checkpoint_sha = self.candidate.checkpoint_sha256
+                expected_config_sha = source['config_sha256']
+                runtime_config_path = self.repository_root / self.candidate.config
+                if self.candidate.route == 'ssm-quant-pwl':
+                    from .numeric_runtime import resolve_numeric_runtime
+                    runtime = resolve_numeric_runtime(
+                        self.candidate, repository_root=self.repository_root,
+                        manifest_path=self.manifest_path,
+                        downstream_output=path)
+                    runtime_config_path = runtime['config_path']
+                    expected_config = runtime_config_path.relative_to(
+                        self.repository_root).as_posix()
+                    expected_checkpoint = runtime['checkpoint_path'].relative_to(
+                        self.repository_root).as_posix()
+                    expected_checkpoint_sha = runtime['checkpoint_sha256']
+                    expected_config_sha = runtime['config_sha256']
                 validated_latency = validate_latency_envelope(
                     value,
                     expected_candidate_id=self.candidate.id,
                     expected_route=self.candidate.route,
-                    expected_checkpoint_sha256=(
-                        self.candidate.checkpoint_sha256),
+                    expected_checkpoint_sha256=expected_checkpoint_sha,
                     expected_authority_sha256=source['authority_sha256'],
-                    expected_source_config=self.candidate.config.as_posix(),
-                    expected_checkpoint=self.candidate.checkpoint.as_posix(),
+                    expected_source_config=expected_config,
+                    expected_checkpoint=expected_checkpoint,
                     expected_device_index=self.device_index,
                     expected_git_commit=source['git_commit'],
-                    expected_config_sha256=source['config_sha256'],
+                    expected_config_sha256=expected_config_sha,
                     expected_source_binding=source,
                     expected_authority=authority,
                     require_source_binding=True,
@@ -522,9 +623,9 @@ class OptimizationController:
                 validate_live_coco_observation(
                     validated_latency['protocol']['data'],
                     config=Config.fromfile(
-                        self.repository_root / self.candidate.config),
+                        runtime_config_path),
                     repository_root=self.repository_root)
-            except (MetricError, OSError) as error:
+            except (MetricError, OSError, ValueError) as error:
                 raise ArtifactValidationError(
                     f'latency artifact is invalid: {error}') from error
         return 'optimization-stage-envelope-v1'

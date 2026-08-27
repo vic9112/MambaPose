@@ -84,3 +84,25 @@ def test_observer_state_dict_resume_is_exact():
     assert resumed.token_ids == ('left', 'right')
     assert resumed.summary() == observer.summary()
     torch.testing.assert_close(resumed.max_abs, observer.max_abs)
+
+
+def test_histogram_overflow_invalidates_bounded_percentile_claim_and_resumes():
+    from mmpose.models.utils.hardware_friendly import ActivationRangeObserver
+
+    first = ActivationRangeObserver('tensor')
+    second = ActivationRangeObserver('tensor')
+    first(torch.tensor([2.0 ** 40]))
+    second(torch.tensor([2.0 ** -40]))
+    first.merge(second)
+    summary = first.summary(percentiles=(1.0,))
+
+    assert summary['overflow_count'] == 1
+    assert summary['underflow_count'] == 1
+    assert summary['percentile_bound_valid'] is False
+    assert summary['relative_error_bound'] is None
+    assert summary['percentiles'] == {'1.0': None}
+    assert summary['outlier_ratio_above_p99_bin'] is None
+
+    resumed = ActivationRangeObserver('tensor')
+    resumed.load_state_dict(first.state_dict())
+    assert resumed.summary(percentiles=(1.0,)) == summary

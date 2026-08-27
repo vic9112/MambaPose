@@ -51,10 +51,12 @@ class QuantPolicy:
     allow: tuple[str, ...]
     deny: tuple[str, ...] = ()
     spec: QuantSpec = QuantSpec()
+    role_specs: tuple[tuple[str, QuantSpec], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'allow', tuple(self.allow))
         object.__setattr__(self, 'deny', tuple(self.deny))
+        object.__setattr__(self, 'role_specs', tuple(self.role_specs))
         names = self.allow + self.deny
         if any(not isinstance(name, str) or not name or name.startswith('.')
                or name.endswith('.') or '..' in name for name in names):
@@ -68,6 +70,16 @@ class QuantPolicy:
         if overlap:
             raise ValueError(
                 f'module roles cannot be both allowed and denied: {sorted(overlap)}')
+        role_names = tuple(name for name, _spec in self.role_specs)
+        if role_names and (len(set(role_names)) != len(role_names)
+                           or set(role_names) != set(self.allow)):
+            raise ValueError('per-role quant specs must exactly cover allowed roles')
+        if any(not isinstance(spec, QuantSpec)
+               for _name, spec in self.role_specs):
+            raise ValueError('per-role quant specs must contain QuantSpec values')
+
+    def spec_for(self, role: str) -> QuantSpec:
+        return dict(self.role_specs).get(role, self.spec)
 
 
 @dataclass(frozen=True)
@@ -219,9 +231,9 @@ def convert_for_fake_quant(
     for name in policy.allow:
         module = modules[name]
         wrapper = (
-            FakeQuantLinear.from_float(module, policy.spec)
+            FakeQuantLinear.from_float(module, policy.spec_for(name))
             if isinstance(module, nn.Linear)
-            else FakeQuantConv2d.from_float(module, policy.spec))
+            else FakeQuantConv2d.from_float(module, policy.spec_for(name)))
         parent, leaf = _parent_and_leaf(model, name)
         setattr(parent, leaf, wrapper)
         elements = module.weight.numel()

@@ -38,8 +38,7 @@ numeric_optimization = dict(
     candidate_kind='weight-only',
     simulation_only=True,
     integer_kernel_latency_claimed=False,
-    stage_order=('convert', 'export', 'profile', 'evaluate', 'latency',
-                 'compare'),
+    stage_order=('convert', 'export', 'profile', 'evaluate', 'latency'),
     quant_policy=dict(
         allow=(
             _backbone_roles + _pif_roles + _attention_roles

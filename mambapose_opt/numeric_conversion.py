@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
 from mmengine.hooks import Hook
+import torch
+import torch.nn.functional as F
 from torch import nn
 
 from mmpose.registry import HOOKS
@@ -15,6 +18,7 @@ from mmpose.registry import HOOKS
 from mmpose.models.utils.hardware_friendly.fake_quant import (
     ConversionReport, QuantPolicy, QuantSpec, convert_for_fake_quant,
     export_int8_state)
+from mmpose.models.utils.hardware_friendly.pwl import fit_pwl
 
 
 class NumericBindingError(ValueError):
@@ -25,6 +29,22 @@ class NumericBindingError(ValueError):
 class NumericInputBinding:
     paths: tuple[tuple[str, str], ...]
     sha256: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class PWLInstallationReport:
+    """Exact runtime roles changed by one fitted nonlinear function."""
+
+    function_name: str
+    source: str
+    roles: tuple[str, ...]
+    domain: tuple[float, float]
+    segments: int
+    max_error: float
+    mean_error: float
+    saturation: str = 'clamp'
+    qat_form: str = 'differentiable'
+    hardware_latency_claimed: bool = False
 
 
 def _sha256(path: Path) -> str:
@@ -63,21 +83,29 @@ def numeric_stage_plan(
         kind: str, *, conditional: bool) -> tuple[str, ...]:
     """Return the immutable Route 3 order without admitting invasive work."""
     if kind == 'observer':
-        return ('calibrate', 'compare')
+        return ('calibrate',)
     if kind == 'weight-only':
-        return ('convert', 'export', 'profile', 'evaluate', 'latency', 'compare')
+        return ('convert', 'export', 'profile', 'evaluate', 'latency')
     if kind == 'w8a8':
-        return ('calibrate', 'convert', 'train', 'profile', 'evaluate',
-                'latency', 'compare')
+        return ('calibrate', 'convert', 'profile', 'evaluate', 'latency')
     if kind in {'pwl', 'binary-qk'}:
         if not conditional:
             raise ValueError(f'{kind} requires explicit conditional admission')
-        return ('train', 'profile', 'evaluate', 'latency', 'compare')
+        return ('profile', 'evaluate', 'latency')
     raise ValueError(f'unsupported numeric candidate kind: {kind!r}')
 
 
-def quant_policy_from_config(value: Mapping[str, object]) -> QuantPolicy:
-    if not isinstance(value, Mapping) or set(value) != {'allow', 'deny', 'spec'}:
+def quant_policy_from_config(
+        value: Mapping[str, object], *,
+        calibration_artifact: Mapping[str, Any] | None = None) -> QuantPolicy:
+    allowed_fields = {
+        'allow', 'deny', 'spec', 'activation_observers',
+        'calibration_artifact'}
+    measured_fields = {
+        'allow', 'deny', 'spec', 'activation_observers'}
+    if (not isinstance(value, Mapping)
+            or set(value) not in (
+                {'allow', 'deny', 'spec'}, measured_fields, allowed_fields)):
         raise NumericBindingError(
             'quant policy config must contain allow, deny, and spec')
     spec_value = value['spec']
@@ -85,8 +113,56 @@ def quant_policy_from_config(value: Mapping[str, object]) -> QuantPolicy:
         raise NumericBindingError('quant policy spec must be a mapping')
     scale = spec_value.get('activation_scale')
     if scale == 'runtime-calibration-artifact':
-        raise NumericBindingError(
-            'W8A8 conversion requires a verified calibration artifact')
+        if calibration_artifact is None:
+            raise NumericBindingError(
+                'W8A8 conversion requires a verified calibration artifact')
+        from mambapose_opt.numeric_calibration import (
+            CalibrationContractError, validate_calibration_artifact)
+        try:
+            validate_calibration_artifact(calibration_artifact)
+        except CalibrationContractError as error:
+            raise NumericBindingError(
+                f'W8A8 calibration artifact is invalid: {error}') from error
+        observers = value.get('activation_observers')
+        if not isinstance(observers, Mapping):
+            raise NumericBindingError(
+                'W8A8 policy requires explicit per-role activation observers')
+        allow = tuple(value['allow'])
+        if set(observers) != set(allow):
+            raise NumericBindingError(
+                'activation observers must exactly cover allowed roles')
+        measured = calibration_artifact['hooks'].get('activation_scales')
+        if not isinstance(measured, Mapping) or set(measured) != set(allow):
+            raise NumericBindingError(
+                'calibration activation scales must exactly cover allowed roles')
+        common = dict(spec_value)
+        common['activation_bits'] = None
+        common['activation_scale'] = None
+        try:
+            base_spec = QuantSpec(**common)
+            role_specs = []
+            for role in allow:
+                record = measured[role]
+                if (not isinstance(record, Mapping)
+                        or set(record) != {'source_record', 'granularity', 'scale'}
+                        or record['source_record'] != observers[role]
+                        or record['granularity'] not in {'tensor', 'channel'}):
+                    raise NumericBindingError(
+                        f'activation scale binding is invalid for {role}')
+                role_scale = record['scale']
+                if isinstance(role_scale, list):
+                    role_scale = tuple(role_scale)
+                role_value = dict(spec_value)
+                role_value['activation_scale'] = role_scale
+                role_specs.append((role, QuantSpec(**role_value)))
+            return QuantPolicy(
+                allow=allow, deny=tuple(value['deny']), spec=base_spec,
+                role_specs=tuple(role_specs))
+        except (TypeError, ValueError) as error:
+            if isinstance(error, NumericBindingError):
+                raise
+            raise NumericBindingError(
+                f'invalid measured W8A8 policy: {error}') from error
     normalized = dict(spec_value)
     if isinstance(scale, list):
         normalized['activation_scale'] = tuple(scale)
@@ -100,11 +176,13 @@ def quant_policy_from_config(value: Mapping[str, object]) -> QuantPolicy:
 
 def apply_numeric_runtime(
         model: nn.Module, numeric_optimization: Mapping[str, Any]
-        ) -> ConversionReport | None:
+        ) -> ConversionReport | PWLInstallationReport | None:
     """Apply the config-bound fake-QDQ policy once to an instantiated model."""
     if not isinstance(numeric_optimization, Mapping):
         raise NumericBindingError('numeric runtime config must be a mapping')
     kind = numeric_optimization.get('candidate_kind')
+    if kind == 'pwl':
+        return _install_pwl_runtime(model, numeric_optimization)
     if kind not in {'weight-only', 'w8a8'}:
         return None
     existing = getattr(model, '_numeric_conversion_report', None)
@@ -115,9 +193,131 @@ def apply_numeric_runtime(
     policy_value = numeric_optimization.get('quant_policy')
     if not isinstance(policy_value, Mapping):
         raise NumericBindingError('numeric runtime quant policy is missing')
+    calibration = None
+    reference = policy_value.get('calibration_artifact')
+    if reference is not None:
+        if (not isinstance(reference, Mapping)
+                or set(reference) != {'path', 'sha256'}):
+            raise NumericBindingError('calibration artifact reference is invalid')
+        relative = Path(str(reference['path']))
+        root = Path(__file__).resolve().parents[1]
+        if (relative.is_absolute() or any(
+                part in {'.', '..'} for part in relative.parts)
+                or relative.parts[:2] != ('work_dirs', 'optimization')):
+            raise NumericBindingError('calibration artifact path is unsafe')
+        path = root / relative
+        cursor = root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise NumericBindingError(
+                    'calibration artifact path must not use symlinks')
+        if (not path.is_file() or not isinstance(reference['sha256'], str)
+                or _sha256(path) != reference['sha256']):
+            raise NumericBindingError('calibration artifact hash changed')
+        try:
+            calibration = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as error:
+            raise NumericBindingError(
+                'calibration artifact is not valid JSON') from error
     report = convert_for_fake_quant(
-        model, quant_policy_from_config(policy_value))
+        model, quant_policy_from_config(
+            policy_value, calibration_artifact=calibration))
     model._numeric_conversion_report = report
+    return report
+
+
+def _parent_and_leaf(model: nn.Module, name: str) -> tuple[nn.Module, str]:
+    parent_name, _, leaf = name.rpartition('.')
+    return (model.get_submodule(parent_name) if parent_name else model), leaf
+
+
+def _install_pwl_runtime(
+        model: nn.Module,
+        numeric_optimization: Mapping[str, Any]) -> PWLInstallationReport:
+    existing = getattr(model, '_numeric_pwl_installation_report', None)
+    if existing is not None:
+        if not isinstance(existing, PWLInstallationReport):
+            raise NumericBindingError('PWL runtime marker is invalid')
+        return existing
+    value = numeric_optimization.get('pwl')
+    required = {
+        'enabled_function', 'source', 'roles', 'domain', 'segments',
+        'grid_points', 'saturation', 'qat_form'}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise NumericBindingError(
+            'PWL runtime requires an exact source/role/function contract')
+    function_name = value['enabled_function']
+    if not isinstance(function_name, str) or function_name not in {
+            'silu', 'gelu', 'softplus', 'exp'}:
+        raise NumericBindingError(
+            'PWL runtime must select exactly one supported function')
+    source = value['source']
+    if source not in {'module', 'ss2d-transition'}:
+        raise NumericBindingError('PWL source must be module or ss2d-transition')
+    roles = value['roles']
+    if (not isinstance(roles, (tuple, list)) or not roles
+            or any(not isinstance(role, str) or not role for role in roles)
+            or len(set(roles)) != len(roles)):
+        raise NumericBindingError('PWL roles must be unique exact module names')
+    roles = tuple(roles)
+    if value['saturation'] != 'clamp':
+        raise NumericBindingError('PWL saturation must be clamp')
+    if value['qat_form'] != 'differentiable':
+        raise NumericBindingError('PWL QAT form must be differentiable')
+    domain_value = value['domain']
+    if not isinstance(domain_value, (tuple, list)) or len(domain_value) != 2:
+        raise NumericBindingError('PWL domain must contain two bounds')
+    domain = (float(domain_value[0]), float(domain_value[1]))
+    reference = {
+        'silu': F.silu, 'gelu': F.gelu,
+        'softplus': F.softplus, 'exp': torch.exp}[function_name]
+    try:
+        approximation = fit_pwl(
+            reference, domain, int(value['segments']), int(value['grid_points']),
+            function_name=function_name)
+    except (TypeError, ValueError) as error:
+        raise NumericBindingError(f'invalid PWL fit contract: {error}') from error
+
+    modules = dict(model.named_modules())
+    missing = tuple(role for role in roles if role not in modules)
+    if missing:
+        raise NumericBindingError(f'PWL roles are missing: {missing}')
+    if source == 'module':
+        expected = nn.SiLU if function_name == 'silu' else (
+            nn.GELU if function_name == 'gelu' else None)
+        invalid = tuple(
+            role for role in roles
+            if expected is None or type(modules[role]) is not expected)
+        if invalid:
+            raise NumericBindingError(
+                f'PWL module roles have incompatible function: {invalid}')
+        for index, role in enumerate(roles):
+            fitted = approximation if index == 0 else fit_pwl(
+                reference, domain, int(value['segments']),
+                int(value['grid_points']), function_name=function_name)
+            parent, leaf = _parent_and_leaf(model, role)
+            setattr(parent, leaf, fitted)
+    else:
+        if function_name not in {'softplus', 'exp'}:
+            raise NumericBindingError(
+                'functional SS2D source admits only softplus or exp')
+        invalid = tuple(
+            role for role in roles
+            if not callable(getattr(modules[role], 'install_numeric_pwl', None)))
+        if invalid:
+            raise NumericBindingError(
+                f'PWL functional roles do not expose SS2D installation: {invalid}')
+        for index, role in enumerate(roles):
+            fitted = approximation if index == 0 else fit_pwl(
+                reference, domain, int(value['segments']),
+                int(value['grid_points']), function_name=function_name)
+            modules[role].install_numeric_pwl(function_name, fitted)
+    report = PWLInstallationReport(
+        function_name=function_name, source=source, roles=roles,
+        domain=domain, segments=approximation.segments,
+        max_error=approximation.max_error, mean_error=approximation.mean_error)
+    model._numeric_pwl_installation_report = report
     return report
 
 
@@ -145,6 +345,7 @@ class NumericRuntimeHook(Hook):
 
 __all__ = [
     'ConversionReport', 'NumericBindingError', 'NumericInputBinding',
+    'PWLInstallationReport',
     'NumericRuntimeHook', 'QuantPolicy', 'QuantSpec', 'apply_numeric_runtime',
     'bind_numeric_inputs', 'convert_for_fake_quant', 'export_int8_state',
     'numeric_stage_plan', 'quant_policy_from_config', 'verify_numeric_inputs']

@@ -34,6 +34,8 @@ class ActivationRangeObserver(nn.Module):
             'histogram', torch.zeros(self._BINS, dtype=torch.int64))
         self.register_buffer('sample_count', torch.zeros((), dtype=torch.int64))
         self.register_buffer('zero_count', torch.zeros((), dtype=torch.int64))
+        self.register_buffer('underflow_count', torch.zeros((), dtype=torch.int64))
+        self.register_buffer('overflow_count', torch.zeros((), dtype=torch.int64))
         self.register_buffer('minimum', torch.full((), float('inf')))
         self.register_buffer('maximum', torch.full((), -float('inf')))
         self._observed_shape: tuple[int, ...] | None = None
@@ -131,14 +133,26 @@ class ActivationRangeObserver(nn.Module):
         nonzero = absolute[absolute != 0]
         histogram = torch.zeros_like(self.histogram)
         if nonzero.numel():
+            lower = 2 ** self._MIN_EXP
+            upper = 2 ** self._MAX_EXP
+            underflow = nonzero < lower
+            overflow = nonzero > upper
+            bounded = nonzero[~(underflow | overflow)]
             width = (self._MAX_EXP - self._MIN_EXP) / self._BINS
-            indices = torch.floor(
-                (torch.log2(nonzero.clamp(2 ** self._MIN_EXP,
-                                           2 ** self._MAX_EXP))
-                 - self._MIN_EXP) / width).to(torch.int64)
-            indices.clamp_(0, self._BINS - 1)
-            histogram = torch.bincount(
-                indices, minlength=self._BINS).to(self.histogram.device)
+            if bounded.numel():
+                indices = torch.floor(
+                    (torch.log2(bounded) - self._MIN_EXP) / width
+                ).to(torch.int64)
+                indices.clamp_(0, self._BINS - 1)
+                histogram = torch.bincount(
+                    indices, minlength=self._BINS).to(self.histogram.device)
+            current_underflow = underflow.sum()
+            current_overflow = overflow.sum()
+        else:
+            current_underflow = torch.zeros((), dtype=torch.int64,
+                                                device=absolute.device)
+            current_overflow = torch.zeros((), dtype=torch.int64,
+                                               device=absolute.device)
 
         if self._observed_shape is None:
             self._observed_shape = shape
@@ -150,6 +164,10 @@ class ActivationRangeObserver(nn.Module):
         self.histogram.add_(histogram)
         self.sample_count.add_(value.numel())
         self.zero_count.add_((absolute == 0).sum().to(self.zero_count.device))
+        self.underflow_count.add_(current_underflow.to(
+            self.underflow_count.device))
+        self.overflow_count.add_(current_overflow.to(
+            self.overflow_count.device))
         self.minimum.copy_(torch.minimum(
             self.minimum, value.detach().amin().to(self.minimum)))
         self.maximum.copy_(torch.maximum(
@@ -174,6 +192,10 @@ class ActivationRangeObserver(nn.Module):
         self.histogram.add_(other.histogram.to(self.histogram.device))
         self.sample_count.add_(other.sample_count.to(self.sample_count.device))
         self.zero_count.add_(other.zero_count.to(self.zero_count.device))
+        self.underflow_count.add_(other.underflow_count.to(
+            self.underflow_count.device))
+        self.overflow_count.add_(other.overflow_count.to(
+            self.overflow_count.device))
         self.minimum.copy_(torch.minimum(
             self.minimum, other.minimum.to(self.minimum)))
         self.maximum.copy_(torch.maximum(
@@ -200,21 +222,28 @@ class ActivationRangeObserver(nn.Module):
     def summary(self, *, percentiles: Iterable[float] = (0.5, 0.9, 0.99,
                                                           0.999)) -> dict:
         width = (self._MAX_EXP - self._MIN_EXP) / self._BINS
+        percentile_values = tuple(float(value) for value in percentiles)
+        bounded = not bool(
+            self.underflow_count.item() or self.overflow_count.item())
         return {
             'granularity': self.granularity,
             'sample_count': int(self.sample_count.item()),
             'zero_count': int(self.zero_count.item()),
+            'underflow_count': int(self.underflow_count.item()),
+            'overflow_count': int(self.overflow_count.item()),
             'max_abs': self.max_abs.detach().cpu().tolist(),
             'range': [float(self.minimum), float(self.maximum)],
             'percentiles': {
-                str(value): self._percentile(float(value))
-                for value in percentiles
+                str(value): (self._percentile(value) if bounded else None)
+                for value in percentile_values
             },
             'algorithm': 'fixed-log2-histogram-v1',
             'histogram_bins': self._BINS,
             'histogram_domain': [2 ** self._MIN_EXP, 2 ** self._MAX_EXP],
-            'relative_error_bound': 2 ** width - 1,
-            'outlier_ratio_above_p99_bin': self._outlier_ratio(0.99),
+            'percentile_bound_valid': bounded,
+            'relative_error_bound': (2 ** width - 1 if bounded else None),
+            'outlier_ratio_above_p99_bin': (
+                self._outlier_ratio(0.99) if bounded else None),
             'token_ids': list(self._token_ids) if self._token_ids else None,
             'observed_shape': list(self._observed_shape)
             if self._observed_shape is not None else None,

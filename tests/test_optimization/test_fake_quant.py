@@ -124,3 +124,29 @@ def test_exported_int8_state_is_separate_from_fp32_master_storage():
     assert exported['0.weight']['scales'].shape == (3,)
     assert model[0].weight.dtype == torch.float32
     torch.testing.assert_close(model[0].weight, master)
+
+
+def test_w8a8_policy_uses_exact_heterogeneous_per_role_activation_scales():
+    from mmpose.models.utils.hardware_friendly import (
+        FakeQuantLinear, QuantPolicy, QuantSpec, convert_for_fake_quant)
+
+    model = nn.ModuleDict({
+        'narrow': nn.Linear(3, 2), 'wide': nn.Linear(7, 2)})
+    policy = QuantPolicy(
+        allow=('narrow', 'wide'),
+        spec=QuantSpec(activation_bits=None),
+        role_specs=(
+            ('narrow', QuantSpec(
+                activation_bits=8, activation_scale=(0.1, 0.2, 0.3))),
+            ('wide', QuantSpec(
+                activation_bits=8,
+                activation_scale=(0.01, 0.02, 0.03, 0.04,
+                                  0.05, 0.06, 0.07))),
+        ))
+
+    convert_for_fake_quant(model, policy)
+    assert isinstance(model['narrow'], FakeQuantLinear)
+    assert isinstance(model['wide'], FakeQuantLinear)
+    assert model['narrow'].spec.activation_scale != model['wide'].spec.activation_scale
+    assert model['narrow'](torch.randn(2, 3)).shape == (2, 2)
+    assert model['wide'](torch.randn(2, 7)).shape == (2, 2)

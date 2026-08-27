@@ -169,17 +169,29 @@ def test_calibration_artifact_requires_deterministic_order_and_exact_hooks():
     from mambapose_opt.numeric_calibration import (
         CalibrationContractError, validate_calibration_artifact)
 
+    record = {
+        'granularity': 'tensor', 'sample_count': 2, 'zero_count': 0,
+        'underflow_count': 0, 'overflow_count': 0, 'max_abs': 1.0,
+        'range': [-1.0, 1.0],
+        'percentiles': {'0.5': 1.0},
+        'algorithm': 'fixed-log2-histogram-v1', 'histogram_bins': 256,
+        'histogram_domain': [2 ** -32, 2 ** 32],
+        'percentile_bound_valid': True, 'relative_error_bound': 0.2,
+        'outlier_ratio_above_p99_bin': 0.0, 'token_ids': None,
+        'observed_shape': [],
+    }
     artifact = {
         'schema_version': 1,
         'candidate_id': 'full-s-v1',
         'stage': 'calibrate',
-        'identity': {'candidate_id': 'full-s-v1', 'split': 'train2017'},
+        'source': {},
+        'identity': _valid_identity(),
         'protocol': {
             'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
             'worker_count': 0, 'sample_count': 2,
             'sample_order_sha256': 'a' * 64,
         },
-        'hooks': {'records': {'attention.0.q': {'sample_count': 2}},
+        'hooks': {'records': {'attention.0.q': record},
                   'required_records': ['attention.0.q'],
                   'unsupported_internals': []},
     }
@@ -249,3 +261,32 @@ def test_calibration_cli_exposes_only_manifest_bound_inputs():
     assert '--policy' in result.stdout
     assert '--npy' not in result.stdout
     assert '--metadata' not in result.stdout
+def _valid_identity():
+    sha = 'a' * 64
+    return {
+        'candidate_id': 'full-s-v1',
+        'config': 'configs/reproduction/coco_s_v1.py',
+        'config_sha256': sha, 'checkpoint': 'checkpoint.pth',
+        'checkpoint_sha256': sha, 'policy': 'policy.py',
+        'policy_sha256': sha, 'split': 'train2017',
+        'git_commit': 'b' * 40,
+        'dataset': {
+            'annotation':
+                'data/coco/annotations/person_keypoints_train2017.json',
+            'annotation_sha256': sha,
+            'image_prefix': 'data/coco/train2017',
+            'inventory': 'data/inventory.json', 'inventory_sha256': sha,
+            'train_archive': 'downloads/train2017.zip',
+            'train_archive_sha256': sha, 'image_count': 118287,
+            'image_content_algorithm': 'sha256-zip-member-bytes-v1',
+            'image_content_aggregate_sha256': sha,
+            'image_order_algorithm':
+                'sha256-zip-central-directory-order-v1',
+            'image_order_sha256': sha,
+            'annotation_archive': 'downloads/annotations.zip',
+            'annotation_archive_sha256': sha,
+            'annotation_member':
+                'annotations/person_keypoints_train2017.json',
+            'annotation_member_sha256': sha,
+        },
+    }

@@ -26,6 +26,8 @@ from mambapose_opt.numeric_calibration import (
     CalibrationTargets, calibration_identity, discover_calibration_targets,
     validate_calibration_artifact)
 from mambapose_opt.schema import load_candidate_manifest
+from mambapose_opt.numeric_source import build_numeric_source_binding
+from mambapose_opt.source import clean_git_commit
 from mmpose.models.utils.hardware_friendly import ActivationRangeObserver
 
 
@@ -43,11 +45,7 @@ def _git_commit(*, require_clean: bool) -> str:
         ['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY_ROOT,
         text=True).strip()
     if require_clean:
-        status = subprocess.check_output(
-            ['git', 'status', '--porcelain'], cwd=REPOSITORY_ROOT,
-            text=True)
-        if status:
-            raise ValueError('production calibration requires clean source')
+        return clean_git_commit(REPOSITORY_ROOT)
     return commit
 
 
@@ -132,10 +130,16 @@ class _HookSession:
                 lambda _module, _inputs, output, role=f'{name}.output':
                 self._record(role, output)))
         for name in self.targets.vmamba_in_proj + self.targets.vmamba_out_proj:
+            self.handles.append(modules[name].register_forward_pre_hook(
+                lambda _module, inputs, role=f'{name}.input':
+                self._record(role, inputs)))
             self.handles.append(modules[name].register_forward_hook(
                 lambda _module, _inputs, output, role=name:
                 self._record(role, output, 'channel')))
         for name in self.targets.attention_qkv:
+            self.handles.append(modules[name].register_forward_pre_hook(
+                lambda _module, inputs, role=f'{name}.input':
+                self._record(role, inputs)))
             def qkv_hook(_module, _inputs, output, role=name):
                 if not isinstance(output, torch.Tensor) or output.shape[-1] % 3:
                     raise ValueError(f'{role} Q/K/V output is not divisible by three')
@@ -151,6 +155,9 @@ class _HookSession:
                 lambda _module, _inputs, output, role=f'{name}.output':
                 self._record(role, output, 'token')))
         for name in self.targets.heatmap_projection:
+            self.handles.append(modules[name].register_forward_pre_hook(
+                lambda _module, inputs, role=f'{name}.input':
+                self._record(role, inputs)))
             self.handles.append(modules[name].register_forward_hook(
                 lambda _module, _inputs, output, role=name:
                 self._record(role, output, 'channel')))
@@ -184,11 +191,15 @@ def _required_records(targets: CalibrationTargets) -> tuple[str, ...]:
         tuple(f'{name}.{side}' for name in targets.ss2d_boundaries
               for side in ('input', 'output'))
         + targets.vmamba_in_proj + targets.vmamba_out_proj
+        + tuple(f'{name}.input' for name in (
+            targets.vmamba_in_proj + targets.vmamba_out_proj))
         + tuple(f'{name}.{role}' for name in targets.attention_qkv
                 for role in ('q', 'k', 'v'))
+        + tuple(f'{name}.input' for name in targets.attention_qkv)
         + tuple(f'{name}.{side}' for name in targets.pif_boundaries
                 for side in ('input', 'output'))
         + targets.heatmap_projection
+        + tuple(f'{name}.input' for name in targets.heatmap_projection)
         + targets.transition_parameters
         + tuple(f'{name}.{role}' for name in targets.functional_observers
                 for role in functional_roles)
@@ -214,12 +225,13 @@ def _sample_ids(batch: Any) -> tuple[str, ...]:
 
 def calibrate(
         candidate, policy: Path, *, samples: int, device: str,
-        target_candidate_id: str | None = None) -> dict:
+        target_candidate=None, manifest_path: Path | None = None) -> dict:
     if device != 'cuda:0':
         raise ValueError('production numeric calibration requires cuda:0')
     if samples <= 0 or samples > 4096:
         raise ValueError('calibration samples must be in [1, 4096]')
     _git_commit(require_clean=True)
+    identity_before = _identity(candidate, policy)
     from mmengine.config import Config
     from mmengine.runner import Runner
     from mmpose.apis import init_model
@@ -254,11 +266,40 @@ def calibrate(
             raise ValueError(
                 f'calibration observed {observed} samples, expected {samples}')
         records = session.records()
+    from mmengine.config import Config
+    target_config = Config.fromfile(policy)
+    policy_value = target_config.numeric_optimization.get('quant_policy', {})
+    activation_observers = policy_value.get('activation_observers', {})
+    activation_scales = {}
+    for role, source_record in activation_observers.items():
+        summary = records.get(source_record)
+        if not isinstance(summary, dict):
+            raise ValueError(
+                f'activation observer record is missing for {role}: '
+                f'{source_record}')
+        if not summary.get('percentile_bound_valid'):
+            raise ValueError(
+                f'activation observer range is outside bounded domain: {role}')
+        maximum = max(abs(item) for item in summary['range'])
+        activation_scales[role] = {
+            'source_record': source_record,
+            'granularity': 'tensor',
+            'scale': maximum / 127.0 if maximum else 1.0,
+        }
+    target = target_candidate or candidate
+    identity_after = _identity(candidate, policy)
+    if identity_after != identity_before:
+        raise ValueError('calibration inputs changed during production run')
     artifact = {
         'schema_version': 1,
-        'candidate_id': target_candidate_id or candidate.id,
+        'candidate_id': target.id,
         'stage': 'calibrate',
-        'identity': _identity(candidate, policy),
+        'source': build_numeric_source_binding(
+            repository_root=REPOSITORY_ROOT, candidate=target,
+            manifest_path=(manifest_path or
+                           REPOSITORY_ROOT / 'optimization/candidates.json'),
+            policy_path=policy),
+        'identity': identity_after,
         'protocol': {
             'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
             'worker_count': 0, 'sample_count': observed,
@@ -268,6 +309,7 @@ def calibrate(
             'records': records,
             'required_records': list(_required_records(targets)),
             'unsupported_internals': list(targets.unsupported_internals),
+            'activation_scales': activation_scales,
         },
     }
     validate_calibration_artifact(artifact)
@@ -319,7 +361,7 @@ def main() -> int:
             args.output, repository_root=REPOSITORY_ROOT)
         _atomic_json(output, calibrate(
             source, policy, samples=args.samples, device=args.device,
-            target_candidate_id=target.id))
+            target_candidate=target, manifest_path=args.manifest))
         return 0
     except (OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))
