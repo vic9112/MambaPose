@@ -1,8 +1,10 @@
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -58,8 +60,8 @@ def _write_generic_artifact(path, stage, candidate_id='fixture'):
     }))
 
 
-def _write_profile_artifact(path, candidate):
-    path.write_text(json.dumps({
+def _profile_artifact_value(candidate):
+    return {
         'schema_version': 1,
         'git_commit': 'a' * 40,
         'candidate': candidate.id,
@@ -73,8 +75,17 @@ def _write_profile_artifact(path, candidate):
             'bytes_by_dtype': {'torch.float32': 4},
             'by_prefix': {'model': 1},
         },
-        'modules': [],
-    }))
+        'modules': [{
+            'name': '',
+            'kind': 'FixtureModel',
+            'parameters': 1,
+            'hazard': None,
+        }],
+    }
+
+
+def _write_profile_artifact(path, candidate):
+    path.write_text(json.dumps(_profile_artifact_value(candidate)))
 
 
 def _mock_lease(monkeypatch, entered):
@@ -131,11 +142,13 @@ def test_contention_returns_75_and_retry_lineage_is_append_only(
 
     monkeypatch.setattr(controller, 'exclusive_cuda_stage', contended)
     campaign = tmp_path / 'work_dirs/optimization'
+    clock = [datetime(2026, 8, 27, tzinfo=timezone.utc)]
     instance = OptimizationController(
         campaign, candidate, lambda *args: None,
-        repository_root=tmp_path, stages=('train',))
+        repository_root=tmp_path, stages=('train',), now=lambda: clock[0])
 
     first = instance.run_next()
+    clock[0] += timedelta(seconds=30)
     second = instance.run_next()
 
     assert first.exit_code == second.exit_code == 75
@@ -161,6 +174,66 @@ def test_contention_returns_75_and_retry_lineage_is_append_only(
     ]
     waits = [event for event in events if event['status'] == 'retry_wait']
     assert [event['attempt'] for event in waits] == [1, 2]
+
+
+def test_retry_deadline_survives_restart_without_consuming_an_attempt(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController, StageOutcome
+    from mambapose_repro.state import StateStore
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+    campaign = tmp_path / 'work_dirs/optimization'
+    clock = [datetime(2026, 8, 27, 1, 2, 3, tzinfo=timezone.utc)]
+    calls = []
+
+    def runner(candidate, stage, stage_dir, attempt):
+        calls.append(attempt)
+        if attempt == 1:
+            return StageOutcome(
+                'fixture:evaluate', 'evaluate', 'fixture', 75,
+                'transient-first')
+        artifact = stage_dir / 'evaluate.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    first = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('evaluate',), retry_delays=(30,), now=lambda: clock[0]
+    ).run_next()
+    stored_after_first = StateStore(campaign).read()
+    deadline = '2026-08-27T01:02:33+00:00'
+
+    assert first.exit_code == 75
+    assert stored_after_first['runs']['fixture:evaluate'][
+        'retry_not_before'] == deadline
+
+    clock[0] += timedelta(seconds=29)
+    waiting = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('evaluate',), retry_delays=(30,), now=lambda: clock[0]
+    ).run_next()
+
+    assert waiting.exit_code == 75
+    assert waiting.retry_not_before == deadline
+    assert waiting.retry_remaining_seconds == pytest.approx(1.0)
+    assert calls == [1]
+    assert StateStore(campaign).read() == stored_after_first
+
+    clock[0] += timedelta(seconds=1)
+    resumed = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('evaluate',), retry_delays=(30,), now=lambda: clock[0]
+    ).run_next()
+
+    assert resumed.exit_code == 0
+    assert calls == [1, 2]
+    lineage = StateStore(campaign).read()[
+        'runs']['fixture:evaluate']['retry_lineage']
+    assert [(item['attempt'], item['status']) for item in lineage] == [
+        (1, 'started'), (1, 'retry_wait'),
+        (2, 'started'), (2, 'complete'),
+    ]
 
 
 def test_invalid_config_or_checkpoint_hash_returns_78_without_runner(
@@ -408,6 +481,63 @@ def test_existing_profile_schema_is_accepted(tmp_path, monkeypatch):
     assert result.exit_code == 0
 
 
+@pytest.mark.parametrize(
+    'mutate',
+    [
+        lambda value: value.update({'unexpected': True}),
+        lambda value: value.pop('output_shapes'),
+        lambda value: value.update({'git_commit': 'not-a-full-commit'}),
+        lambda value: value.update({'input_shapes': [1, 3, 0, 192]}),
+        lambda value: value.update({'input_shapes': []}),
+        lambda value: value.update({'output_shapes': None}),
+        lambda value: value.update({'output_shapes': []}),
+        lambda value: value.update({'parameters': {}}),
+        lambda value: value['parameters'].update({'total': -1}),
+        lambda value: value['parameters'].update({
+            'total': 1, 'trainable': 2}),
+        lambda value: value['parameters'].update({'by_prefix': {}}),
+        lambda value: value.update({'modules': []}),
+        lambda value: value.update({'modules': [{
+            'name': '', 'kind': 'FixtureModel', 'parameters': -1,
+            'hazard': None,
+        }]}),
+        lambda value: value.update({'modules': [{
+            'name': '', 'kind': 'FixtureModel', 'parameters': 1,
+            'hazard': 7,
+        }]}),
+    ],
+    ids=[
+        'extra-field', 'missing-field', 'invalid-commit', 'nonpositive-input',
+        'empty-input', 'null-output', 'empty-output', 'empty-parameters',
+        'negative-total', 'trainable-exceeds-total', 'empty-parameter-map',
+        'empty-modules', 'negative-module-parameters', 'untyped-hazard',
+    ],
+)
+def test_profile_v1_rejects_reviewer_malformed_structures(
+        tmp_path, monkeypatch, mutate):
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_repro.state import StateStore
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'profile.json'
+        value = _profile_artifact_value(candidate)
+        mutate(value)
+        artifact.write_text(json.dumps(value))
+        return _outcome(stage, artifact)
+
+    campaign = tmp_path / 'work_dirs/optimization'
+    result = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('profile',)).run_next()
+
+    assert result.exit_code == 78
+    assert StateStore(campaign).read()[
+        'runs']['fixture:profile']['status'] == 'blocked'
+
+
 def test_complete_stage_evidence_is_persisted_and_revalidated(
         tmp_path, monkeypatch):
     from mambapose_opt.controller import OptimizationController
@@ -463,7 +593,8 @@ def test_isolated_campaign_roots_collide_on_canonical_gpu_lock(
     second = OptimizationController(
         tmp_path / 'route-b/work_dirs/optimization', candidate,
         second_runner, repository_root=tmp_path, stages=('evaluate',),
-        gpu_lock_path=canonical_lock)
+        gpu_lock_path=canonical_lock,
+        shared_lock_root=tmp_path / 'shared')
 
     def first_runner(candidate, stage, stage_dir, attempt):
         nested_results.append(second.run_next())
@@ -474,7 +605,8 @@ def test_isolated_campaign_roots_collide_on_canonical_gpu_lock(
     first = OptimizationController(
         tmp_path / 'route-a/work_dirs/optimization', candidate,
         first_runner, repository_root=tmp_path, stages=('evaluate',),
-        gpu_lock_path=canonical_lock)
+        gpu_lock_path=canonical_lock,
+        shared_lock_root=tmp_path / 'shared')
 
     assert first.run_next().exit_code == 0
     assert nested_results[0].exit_code == 75
@@ -499,7 +631,8 @@ def test_device_one_is_used_for_admission_and_runner_environment(
         tmp_path / 'work_dirs/optimization', candidate, runner,
         repository_root=tmp_path, stages=('latency',), device_index=1,
         gpu_lock_path=(
-            tmp_path / 'shared/work_dirs/optimization/gpu.lock')).run_next()
+            tmp_path / 'shared/work_dirs/optimization/gpu.lock'),
+        shared_lock_root=tmp_path / 'shared').run_next()
 
     subprocess_runner = SubprocessStageRunner(
         tmp_path / 'work_dirs/optimization',
@@ -529,7 +662,8 @@ def test_every_non_profile_cuda_stage_uses_the_shared_lease(
         tmp_path / 'work_dirs/optimization', candidate, runner,
         repository_root=tmp_path, stages=(stage,),
         gpu_lock_path=(
-            tmp_path / 'shared/work_dirs/optimization/gpu.lock')).run_next()
+            tmp_path / 'shared/work_dirs/optimization/gpu.lock'),
+        shared_lock_root=tmp_path / 'shared').run_next()
 
     assert result.exit_code == 0
     assert [record[2] for record in entered] == [f'fixture:{stage}']
@@ -768,6 +902,92 @@ def test_controller_lock_cannot_escape_campaign_root(tmp_path):
             controller_lock_path=tmp_path / 'outside/controller.lock')
 
 
+def test_controller_rejects_suffix_matching_lock_outside_trusted_anchor(
+        tmp_path):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    trusted = tmp_path / 'trusted-checkout'
+    external = tmp_path / 'external/work_dirs/optimization/gpu.lock'
+
+    with pytest.raises(ValueError, match='canonical'):
+        OptimizationController(
+            tmp_path / 'work_dirs/optimization', candidate,
+            lambda *args: None, repository_root=tmp_path,
+            stages=('compare',), gpu_lock_path=external,
+            shared_lock_root=trusted)
+
+
+def test_run_cli_rejects_noncanonical_lock_override_before_controller(
+        tmp_path, monkeypatch, capsys):
+    from tools.optimization import run_campaign
+
+    candidate = _candidate(tmp_path)
+    monkeypatch.setattr(
+        run_campaign, 'load_candidate_manifest', lambda path: (candidate,))
+    monkeypatch.setattr(
+        run_campaign, '_canonical_checkout_root',
+        lambda: tmp_path / 'canonical', raising=False)
+
+    class MustNotConstruct:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError('controller must not be constructed')
+
+    monkeypatch.setattr(run_campaign, 'OptimizationController', MustNotConstruct)
+    monkeypatch.setattr(sys, 'argv', [
+        'run_campaign.py', '--run', '--gpu-lock-path',
+        str(tmp_path / 'external/work_dirs/optimization/gpu.lock'),
+    ])
+
+    assert run_campaign.main() == 78
+    assert 'canonical GPU lock' in capsys.readouterr().err
+
+
+def test_run_cli_normalizes_invalid_campaign_path_to_78_without_traceback(
+        tmp_path, monkeypatch, capsys):
+    from tools.optimization import run_campaign
+
+    candidate = _candidate(tmp_path)
+    monkeypatch.setattr(
+        run_campaign, 'load_candidate_manifest', lambda path: (candidate,))
+    monkeypatch.setattr(
+        run_campaign, '_canonical_checkout_root',
+        lambda: tmp_path / 'canonical', raising=False)
+    monkeypatch.setattr(sys, 'argv', [
+        'run_campaign.py', '--run', '--campaign-root',
+        str(tmp_path / 'external/work_dirs/optimization'),
+    ])
+
+    assert run_campaign.main() == 78
+    captured = capsys.readouterr()
+    assert 'optimization campaign root' in captured.err
+    assert 'Traceback' not in captured.err
+
+
+def test_run_cli_normalizes_runner_path_value_error_to_78(
+        tmp_path, monkeypatch, capsys):
+    from tools.optimization import run_campaign
+
+    candidate = _candidate(tmp_path)
+    monkeypatch.setattr(
+        run_campaign, 'load_candidate_manifest', lambda path: (candidate,))
+    monkeypatch.setattr(
+        run_campaign, '_canonical_checkout_root',
+        lambda: tmp_path / 'canonical', raising=False)
+
+    class InvalidRunner:
+        def __init__(self, *args, **kwargs):
+            raise ValueError('runner output path escapes repository')
+
+    monkeypatch.setattr(run_campaign, 'SubprocessStageRunner', InvalidRunner)
+    monkeypatch.setattr(sys, 'argv', ['run_campaign.py', '--run'])
+
+    assert run_campaign.main() == 78
+    captured = capsys.readouterr()
+    assert 'runner output path escapes repository' in captured.err
+    assert 'Traceback' not in captured.err
+
+
 def test_retry_budget_persists_across_controller_process_restarts(
         tmp_path, monkeypatch):
     from mambapose_opt.controller import OptimizationController, StageOutcome
@@ -776,18 +996,20 @@ def test_retry_budget_persists_across_controller_process_restarts(
     candidate = _candidate(tmp_path)
     _mock_lease(monkeypatch, [])
     campaign = tmp_path / 'work_dirs/optimization'
+    clock = [datetime(2026, 8, 27, tzinfo=timezone.utc)]
 
     def transient(candidate, stage, stage_dir, attempt):
         return StageOutcome(
             'fixture:evaluate', 'evaluate', 'fixture', 75,
             f'transient-{attempt}')
 
-    results = [
-        OptimizationController(
+    results = []
+    for _ in range(3):
+        results.append(OptimizationController(
             campaign, candidate, transient, repository_root=tmp_path,
-            stages=('evaluate',), max_attempts=3).run_next()
-        for _ in range(3)
-    ]
+            stages=('evaluate',), max_attempts=3,
+            now=lambda: clock[0]).run_next())
+        clock[0] += timedelta(minutes=10)
 
     assert [result.exit_code for result in results] == [75, 75, 78]
     run = StateStore(campaign).read()['runs']['fixture:evaluate']

@@ -11,14 +11,23 @@ def test_campaign_unit_has_durable_restart_and_group_shutdown():
 
     assert 'Restart=on-failure' in unit
     assert 'RestartPreventExitStatus=78' in unit
-    assert 'StartLimitBurst=4' in unit
+    assert 'StartLimitIntervalSec=0' in unit
+    assert 'StartLimitBurst=' not in unit
     assert 'RestartSec=30s' in unit
-    assert 'RestartSteps=2' in unit
-    assert 'RestartMaxDelaySec=2min' in unit
+    assert 'RestartSteps=' not in unit
+    assert 'RestartMaxDelaySec=' not in unit
     assert 'KillMode=control-group' in unit
     assert 'PYTHONNOUSERSITE=1' in unit
     assert 'CUDA_VISIBLE_DEVICES=0' in unit
     assert 'tools/optimization/run_campaign.py --run' in unit
+
+
+def test_controller_owned_stage_retries_cannot_consume_a_global_unit_burst():
+    unit = (SYSTEMD / 'mambapose-optimization.service').read_text()
+
+    assert 'StartLimitIntervalSec=0' in unit
+    assert 'StartLimitBurst=' not in unit
+    assert 'RestartSec=30s' in unit
 
 
 def test_observer_timer_has_no_controller_authority():

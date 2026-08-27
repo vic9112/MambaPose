@@ -52,6 +52,34 @@ def test_observer_reports_stale_heartbeat_without_controlling_processes(
     assert status['process_alive'] is True
 
 
+def test_observer_reports_retry_wait_despite_fresh_exited_child_heartbeat(
+        tmp_path, monkeypatch):
+    from mambapose_opt import observe as observer
+    from mambapose_opt.observe import observe
+    from mambapose_repro.state import StateStore
+
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=2)
+    StateStore(tmp_path).transition(
+        'fixture:train', 'retry_wait', attempt=1,
+        retry_delay_seconds=120,
+        retry_not_before=deadline.isoformat(),
+    )
+    (tmp_path / 'heartbeat.json').write_text(json.dumps({
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'pid': 999_999_999,
+        'stage_id': 'fixture:train',
+        'phase': 'exited',
+    }))
+    monkeypatch.setattr(observer, 'query_compute_processes', lambda _: ())
+
+    status = observe(tmp_path, heartbeat_max_age=180)
+
+    assert status['health'] == 'waiting'
+    assert status['retry_not_before'] == deadline.isoformat()
+    assert 0 < status['retry_remaining_seconds'] <= 120
+    assert status['process_alive'] is False
+
+
 def test_observer_marks_external_gpu_contention(tmp_path, monkeypatch):
     from mambapose_opt import observe as observer
     from mambapose_opt.gpu_guard import GpuProcess
