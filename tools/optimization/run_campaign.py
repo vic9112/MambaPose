@@ -70,6 +70,7 @@ class SubprocessStageRunner:
         environment.update({
             'PYTHONNOUSERSITE': '1',
             'CUDA_VISIBLE_DEVICES': str(self.device_index),
+            'MAMBAPOSE_PHYSICAL_DEVICE_INDEX': str(self.device_index),
             'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1',
         })
         return environment
@@ -110,6 +111,11 @@ class SubprocessStageRunner:
             'latency': 'measure_latency.py',
             'compare': 'compare_candidates.py',
         }[stage]
+        if stage in {'evaluate', 'latency'}:
+            common = [
+                candidate.id, '--manifest', str(self.manifest_path),
+                '--output', self._relative(artifact),
+            ]
         return [python, str(REPO_ROOT / 'tools/optimization' / tool), *common]
 
     def __call__(

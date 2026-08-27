@@ -52,11 +52,22 @@ def _outcome(stage, artifact, *, exit_code=0, valid=True, fingerprint='ok'):
 
 def _write_generic_artifact(path, stage, candidate_id='fixture'):
     path.parent.mkdir(parents=True, exist_ok=True)
+    result = {}
+    if stage == 'evaluate':
+        result = {
+            'route': 'accuracy-first', 'calibration_split': None,
+            'modes': {
+                'flip': {'metrics': {}, 'provenance': {},
+                         'determinism': {}, 'protocol': {}},
+                'no_flip': {'metrics': {}, 'provenance': {},
+                            'determinism': {}, 'protocol': {}},
+            },
+        }
     path.write_text(json.dumps({
         'schema_version': 1,
         'candidate_id': candidate_id,
         'stage': stage,
-        'result': {},
+        'result': result,
     }))
 
 
@@ -86,6 +97,67 @@ def _profile_artifact_value(candidate):
 
 def _write_profile_artifact(path, candidate):
     path.write_text(json.dumps(_profile_artifact_value(candidate)))
+
+
+def test_controller_refuses_single_mode_evaluation_as_complete(tmp_path):
+    from mambapose_opt.controller import (
+        ArtifactValidationError, OptimizationController)
+
+    candidate = _candidate(tmp_path)
+    campaign = tmp_path / 'work_dirs/optimization'
+    controller = OptimizationController(
+        campaign, candidate, lambda *args: None,
+        repository_root=tmp_path)
+    path = campaign / 'candidates/fixture/evaluate/evaluate.json'
+    _write_generic_artifact(path, 'evaluate')
+    payload = json.loads(path.read_text())
+    del payload['result']['modes']['no_flip']
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ArtifactValidationError, match='both.*modes'):
+        controller._artifact_schema('evaluate', path)
+
+
+@pytest.mark.parametrize('stage, tool', [
+    ('evaluate', 'evaluate_candidate.py'),
+    ('latency', 'measure_latency.py'),
+])
+def test_stage_runner_forwards_authoritative_manifest_exactly(
+        tmp_path, monkeypatch, stage, tool):
+    import tools.optimization.run_campaign as campaign_tool
+
+    candidate = _candidate(tmp_path)
+    manifest = tmp_path / 'alternate/candidates.json'
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({
+        'schema_version': 1,
+        'candidates': [{
+            'id': 'fixture', 'route': 'accuracy-first', 'kind': 'float',
+            'config': 'configs/alternate.py',
+            'checkpoint': 'checkpoints/alternate.pth',
+            'checkpoint_sha256': 'f' * 64, 'seed': 3, 'features': {},
+        }],
+    }))
+    artifact = tmp_path / f'work_dirs/optimization/{stage}/{stage}.json'
+    monkeypatch.setattr(campaign_tool, 'REPO_ROOT', tmp_path)
+    runner = campaign_tool.SubprocessStageRunner(
+        tmp_path / 'work_dirs/optimization', manifest, device_index=3)
+
+    command = runner._command(candidate, stage, artifact)
+
+    assert command == [
+        str(tmp_path / '.venv/bin/python'),
+        str(tmp_path / f'tools/optimization/{tool}'),
+        'fixture', '--manifest', str(manifest),
+        '--output', f'work_dirs/optimization/{stage}/{stage}.json',
+    ]
+    selected = (
+        __import__(
+            f'tools.optimization.{tool.removesuffix(".py")}',
+            fromlist=['_candidate'])
+        ._candidate(manifest, 'fixture'))
+    assert selected.config.as_posix() == 'configs/alternate.py'
+    assert selected.checkpoint.as_posix() == 'checkpoints/alternate.pth'
 
 
 def _mock_lease(monkeypatch, entered):

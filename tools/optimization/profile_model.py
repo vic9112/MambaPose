@@ -21,6 +21,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from mambapose_opt.inventory import collect_module_inventory, count_parameters
+from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 
 
@@ -71,26 +72,7 @@ def _parse_shape(value: str) -> tuple[int, ...]:
 
 
 def _output_path(value: str) -> Path:
-    path = Path(value)
-    if (
-            path.is_absolute()
-            or any(part in {'.', '..'} for part in path.parts)
-            or path.parts[:2] != OPTIMIZATION_ARTIFACTS.parts):
-        raise argparse.ArgumentTypeError(
-            'output must be a repository-relative path under '
-            'work_dirs/optimization')
-    try:
-        repository_root = REPOSITORY_ROOT.resolve(strict=False)
-        artifact_root = (REPOSITORY_ROOT / OPTIMIZATION_ARTIFACTS).resolve(
-            strict=False)
-        effective_path = (REPOSITORY_ROOT / path).resolve(strict=False)
-        artifact_root.relative_to(repository_root)
-        effective_path.relative_to(artifact_root)
-    except (OSError, RuntimeError, ValueError) as error:
-        raise argparse.ArgumentTypeError(
-            'output must be a repository-relative path under '
-            'work_dirs/optimization') from error
-    return effective_path
+    return optimization_output_path(value, repository_root=REPOSITORY_ROOT)
 
 
 def _candidate(manifest: Path, identifier: str) -> CandidateSpec:

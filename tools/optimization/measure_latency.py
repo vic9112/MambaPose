@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -24,8 +25,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from mmengine.config import Config
 
-from mambapose_opt.evaluation import stage_envelope
-from mambapose_opt.latency import build_latency_result, measure_latency_samples
+from mambapose_opt.evaluation import stage_envelope, validate_coco_val_protocol
+from mambapose_opt.artifacts import optimization_output_path
+from mambapose_opt.gpu_guard import controller_process_tree
+from mambapose_opt.latency import (
+    build_latency_result, measure_latency_samples, validate_gpu_lease)
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 
 
@@ -38,17 +42,7 @@ def _sha256(path: Path) -> str:
 
 
 def _output_path(value: str) -> Path:
-    path = Path(value)
-    if path.is_absolute() or any(part in {'.', '..'} for part in path.parts):
-        raise argparse.ArgumentTypeError(
-            'output must be repository-relative under work_dirs/optimization')
-    resolved = (REPO_ROOT / path).resolve()
-    try:
-        resolved.relative_to(ARTIFACT_ROOT.resolve())
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            'output must be repository-relative under work_dirs/optimization') from error
-    return resolved
+    return optimization_output_path(value, repository_root=REPO_ROOT)
 
 
 def _candidate(path: Path, identifier: str) -> CandidateSpec:
@@ -86,13 +80,33 @@ def _canonical_gpu_lock() -> Path:
     return common_path.parent / 'work_dirs/optimization/gpu.lock'
 
 
-def _gpu_lease(candidate_id: str) -> dict[str, Any]:
+def _active_gpu_lease(candidate_id: str, device_index: int) -> dict[str, Any]:
+    lock_path = _canonical_gpu_lock()
     try:
-        value = json.loads(_canonical_gpu_lock().read_text(encoding='utf-8'))
+        stream = lock_path.open('r+', encoding='utf-8')
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            stream.seek(0)
+            value = json.load(stream)
+        else:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            raise ValueError('canonical GPU lease is not actively held')
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f'cannot read active GPU lease: {error}') from error
-    if value.get('stage_id') != f'{candidate_id}:latency':
+    finally:
+        if 'stream' in locals():
+            stream.close()
+    value = validate_gpu_lease(value)
+    if value['stage_id'] != f'{candidate_id}:latency':
         raise ValueError('active GPU lease does not match latency stage')
+    boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    if value['boot_id'] != boot_id:
+        raise ValueError('active GPU lease belongs to a different boot')
+    if value['device_index'] != device_index:
+        raise ValueError('active GPU lease device does not match latency device')
+    if os.getpid() not in controller_process_tree({value['pid']}):
+        raise ValueError('latency process is not a live controller descendant')
     return value
 
 
@@ -106,17 +120,42 @@ def _git_commit() -> str:
         ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True).strip()
 
 
-def measure_candidate(
-        candidate: CandidateSpec, *, warmup: int, repeats: int) -> dict:
+def _latency_admission(
+        candidate: CandidateSpec, *, device_index: int) -> dict[str, Any]:
+    commit = _git_commit()
     checkpoint = REPO_ROOT / candidate.checkpoint
     checkpoint_hash = _sha256(checkpoint)
     if checkpoint_hash != candidate.checkpoint_sha256:
         raise ValueError(f'checkpoint sha256 mismatch for {candidate.id}')
     config_path = REPO_ROOT / candidate.config
+    inventory_path = REPO_ROOT / 'data/inventory.json'
+    config_hash = _sha256(config_path)
+    inventory_hash = _sha256(inventory_path)
+    lease = _active_gpu_lease(candidate.id, device_index)
+    return {
+        'checkpoint_sha256': checkpoint_hash,
+        'config_sha256': config_hash,
+        'data_inventory_sha256': inventory_hash,
+        'git_commit': commit,
+        'gpu_lease': lease,
+    }
+
+
+def measure_candidate(
+        candidate: CandidateSpec, *, warmup: int, repeats: int,
+        device_index: int | None = None) -> dict:
+    if device_index is None:
+        try:
+            device_index = int(os.environ['MAMBAPOSE_PHYSICAL_DEVICE_INDEX'])
+        except (KeyError, ValueError) as error:
+            raise ValueError('physical GPU device index is required') from error
+    admission = _latency_admission(candidate, device_index=device_index)
+    checkpoint = REPO_ROOT / candidate.checkpoint
+    config_path = REPO_ROOT / candidate.config
     config = Config.fromfile(config_path)
+    data_protocol = validate_coco_val_protocol(
+        config, repository_root=REPO_ROOT)
     config.randomness = dict(seed=candidate.seed, deterministic=True)
-    config_sha256 = hashlib.sha256(
-        config.pretty_text.encode('utf-8')).hexdigest()
     from mmpose.apis import inference_topdown, init_model
     import torch
 
@@ -142,16 +181,20 @@ def measure_candidate(
     result = build_latency_result(
         flip=samples['flip'], no_flip=samples['no_flip'],
         warmup=warmup, repeats=repeats,
-        gpu_lease=_gpu_lease(candidate.id))
+        gpu_lease=admission['gpu_lease'])
     result.update({
         'route': candidate.route,
         'provenance': {
-            'checkpoint_sha256': checkpoint_hash,
-            'config_sha256': config_sha256,
-            'data_inventory_sha256': _sha256(
-                REPO_ROOT / 'data/inventory.json'),
-            'git_commit': _git_commit(),
+            key: admission[key] for key in (
+                'checkpoint_sha256', 'config_sha256',
+                'data_inventory_sha256', 'git_commit')
         },
+    })
+    result['protocol']['data'] = data_protocol
+    result['protocol'].update({
+        'source_config': candidate.config.as_posix(),
+        'checkpoint': candidate.checkpoint.as_posix(),
+        'data_inventory': 'data/inventory.json',
     })
     return stage_envelope(candidate.id, 'latency', result)
 

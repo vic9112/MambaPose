@@ -23,7 +23,9 @@ from mmengine.config import Config
 from mambapose_opt.determinism import (
     build_determinism_record, deterministic_dataloader_config,
     repeated_order_hash)
-from mambapose_opt.evaluation import load_coco_metrics, stage_envelope
+from mambapose_opt.evaluation import (
+    load_coco_metrics, stage_envelope, validate_coco_val_protocol)
+from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 
 
@@ -36,17 +38,7 @@ def _sha256(path: Path) -> str:
 
 
 def _output_path(value: str) -> Path:
-    path = Path(value)
-    if path.is_absolute() or any(part in {'.', '..'} for part in path.parts):
-        raise argparse.ArgumentTypeError(
-            'output must be repository-relative under work_dirs/optimization')
-    resolved = (REPO_ROOT / path).resolve()
-    try:
-        resolved.relative_to(ARTIFACT_ROOT.resolve())
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            'output must be repository-relative under work_dirs/optimization') from error
-    return resolved
+    return optimization_output_path(value, repository_root=REPO_ROOT)
 
 
 def _candidate(path: Path, identifier: str) -> CandidateSpec:
@@ -107,15 +99,12 @@ def _deterministic_config(candidate: CandidateSpec, flip_test: bool) -> Config:
     return config
 
 
-def evaluate(
-        candidate: CandidateSpec, output: Path, *, flip_test: bool) -> dict:
+def _evaluate_mode(
+        candidate: CandidateSpec, output: Path, *, flip_test: bool,
+        checkpoint_sha256: str, git_commit: str) -> dict:
     checkpoint = REPO_ROOT / candidate.checkpoint
-    checkpoint_sha256 = _sha256(checkpoint)
-    if checkpoint_sha256 != candidate.checkpoint_sha256:
-        raise ValueError(
-            f'checkpoint sha256 mismatch for {candidate.id}: '
-            f'{checkpoint_sha256}')
     config = _deterministic_config(candidate, flip_test)
+    protocol = validate_coco_val_protocol(config, repository_root=REPO_ROOT)
     mode = 'flip' if flip_test else 'no-flip'
     resolved = output.parent / f'resolved-{mode}.py'
     raw_metrics = output.parent / f'raw-{mode}-mmpose-metrics.json'
@@ -125,7 +114,7 @@ def evaluate(
         'checkpoint_sha256': checkpoint_sha256,
         'config_sha256': _sha256(resolved),
         'data_inventory_sha256': _sha256(REPO_ROOT / 'data/inventory.json'),
-        'git_commit': _git_commit(),
+        'git_commit': git_commit,
     }
     order_hash = repeated_order_hash(
         config.test_dataloader, seed=candidate.seed, epoch=0)
@@ -154,19 +143,40 @@ def evaluate(
         checkpoint_sha256=provenance['checkpoint_sha256'],
         git_commit=provenance['git_commit'],
     )
-    return stage_envelope(candidate.id, 'evaluate', {
-        'route': candidate.route,
-        'flip_test': flip_test,
+    return {
         'metrics': metrics.to_dict(),
         'provenance': provenance,
         'determinism': determinism,
-        'calibration_split': None,
         'protocol': {
-            'dataset': 'coco',
-            'split': 'val2017',
+            **protocol,
             'batch_size': int(config.test_dataloader.batch_size),
-            'complete_split': True,
+            'source_config': candidate.config.as_posix(),
+            'checkpoint': candidate.checkpoint.as_posix(),
+            'data_inventory': 'data/inventory.json',
         },
+    }
+
+
+def evaluate(
+        candidate: CandidateSpec, output: Path, *,
+        modes: tuple[str, ...] = ('flip', 'no_flip')) -> dict:
+    checkpoint = REPO_ROOT / candidate.checkpoint
+    checkpoint_sha256 = _sha256(checkpoint)
+    if checkpoint_sha256 != candidate.checkpoint_sha256:
+        raise ValueError(
+            f'checkpoint sha256 mismatch for {candidate.id}: '
+            f'{checkpoint_sha256}')
+    git_commit = _git_commit()
+    rows = {
+        mode: _evaluate_mode(
+            candidate, output, flip_test=mode == 'flip',
+            checkpoint_sha256=checkpoint_sha256, git_commit=git_commit)
+        for mode in modes
+    }
+    return stage_envelope(candidate.id, 'evaluate', {
+        'route': candidate.route,
+        'calibration_split': None,
+        'modes': rows,
     })
 
 
@@ -179,11 +189,12 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--flip', dest='flip_test', action='store_true')
     mode.add_argument('--no-flip', dest='flip_test', action='store_false')
-    parser.set_defaults(flip_test=True)
+    parser.set_defaults(flip_test=None)
     args = parser.parse_args()
     candidate = _candidate(args.manifest, args.candidate_id)
-    _atomic_json(
-        args.output, evaluate(candidate, args.output, flip_test=args.flip_test))
+    modes = ('flip', 'no_flip') if args.flip_test is None else (
+        ('flip',) if args.flip_test else ('no_flip',))
+    _atomic_json(args.output, evaluate(candidate, args.output, modes=modes))
     return 0
 
 

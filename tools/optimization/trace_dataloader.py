@@ -23,6 +23,11 @@ from mambapose_opt.determinism import (
     build_determinism_record, deterministic_dataloader_config,
     repeated_order_hash)
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
+from mambapose_opt.artifacts import optimization_output_path
+
+
+def _output_path(value: str) -> Path:
+    return optimization_output_path(value, repository_root=REPO_ROOT)
 
 
 def _sha256(path: Path) -> str:
@@ -55,20 +60,28 @@ def _atomic_json(path: Path, value: object) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('candidate_id')
-    parser.add_argument('--manifest', type=Path,
-                        default=REPO_ROOT / 'optimization/candidates.json')
-    parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--epochs', type=int, default=1)
-    args = parser.parse_args()
-    if args.epochs <= 0:
-        parser.error('--epochs must be positive')
+def _git_commit() -> str:
+    status = subprocess.run(
+        ['git', 'status', '--porcelain', '--untracked-files=no'],
+        cwd=REPO_ROOT, check=True, capture_output=True, text=True)
+    if status.stdout.strip():
+        raise RuntimeError('data-order trace requires a clean tracked worktree')
+    return subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True).strip()
 
-    candidate = _candidate(args.manifest, args.candidate_id)
+
+def trace_candidate(
+        candidate: CandidateSpec, output: Path, *, epochs: int) -> dict:
+    """Validate frozen inputs before constructing any dataset and trace it."""
+    commit = _git_commit()
     config_path = REPO_ROOT / candidate.config
     checkpoint_path = REPO_ROOT / candidate.checkpoint
+    checkpoint_sha256 = _sha256(checkpoint_path)
+    if checkpoint_sha256 != candidate.checkpoint_sha256:
+        raise ValueError(f'checkpoint sha256 mismatch for {candidate.id}')
+    data_inventory = REPO_ROOT / 'data/inventory.json'
+    config_sha256 = _sha256(config_path)
+    data_inventory_sha256 = _sha256(data_inventory)
     config = Config.fromfile(config_path)
     loader = deterministic_dataloader_config(
         config.train_dataloader, seed=candidate.seed, worker_count=2)
@@ -78,27 +91,41 @@ def main() -> int:
     config.train_dataloader = loader
     order_hashes = {
         epoch: repeated_order_hash(loader, seed=candidate.seed, epoch=epoch)
-        for epoch in range(args.epochs)
+        for epoch in range(epochs)
     }
-    commit = subprocess.check_output(
-        ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True).strip()
     record = build_determinism_record(
         seed=candidate.seed,
         worker_count=int(loader.num_workers),
         persistent_workers=bool(loader.persistent_workers),
         order_hashes=order_hashes,
-        config_sha256=hashlib.sha256(
-            config.pretty_text.encode('utf-8')).hexdigest(),
-        data_inventory_sha256=_sha256(REPO_ROOT / 'data/inventory.json'),
-        checkpoint_sha256=_sha256(checkpoint_path),
+        config_sha256=config_sha256,
+        data_inventory_sha256=data_inventory_sha256,
+        checkpoint_sha256=checkpoint_sha256,
         git_commit=commit,
     )
-    _atomic_json(args.output, {
+    envelope = {
         'schema_version': 1,
         'candidate_id': candidate.id,
         'trace': record,
         'repeat_preflight': True,
-    })
+    }
+    _atomic_json(output, envelope)
+    return envelope
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('candidate_id')
+    parser.add_argument('--manifest', type=Path,
+                        default=REPO_ROOT / 'optimization/candidates.json')
+    parser.add_argument('--output', type=_output_path, required=True)
+    parser.add_argument('--epochs', type=int, default=1)
+    args = parser.parse_args()
+    if args.epochs <= 0:
+        parser.error('--epochs must be positive')
+
+    candidate = _candidate(args.manifest, args.candidate_id)
+    trace_candidate(candidate, args.output, epochs=args.epochs)
     return 0
 
 

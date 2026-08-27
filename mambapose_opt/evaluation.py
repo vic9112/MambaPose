@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import re
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
+
+from mambapose_opt.latency import LatencyError, validate_gpu_lease
 
 
 _SHA256 = re.compile(r'^[0-9a-f]{64}$')
@@ -29,6 +32,110 @@ _PROVENANCE_FIELDS = {
 
 class MetricError(ValueError):
     """Raised when metrics or their provenance cannot support a gate."""
+
+
+_COCO_ANNOTATION = 'data/coco/annotations/person_keypoints_val2017.json'
+_COCO_DETECTIONS = (
+    'data/coco/person_detection_results/'
+    'COCO_val2017_detections_AP_H_56_person.json')
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_coco_val_protocol(
+        config: Mapping[str, Any], *, repository_root: Path,
+        expected_image_count: int = 5000) -> dict[str, Any]:
+    """Fail closed unless config and local assets prove official COCO val2017."""
+    try:
+        loader = config['test_dataloader']
+        dataset = loader['dataset']
+        sampler = loader['sampler']
+        evaluator = config['test_evaluator']
+    except (KeyError, TypeError) as error:
+        raise MetricError('COCO val protocol configuration is incomplete') from error
+    if dataset.get('type') != 'CocoDataset':
+        raise MetricError('evaluation dataset must be CocoDataset')
+    if dataset.get('data_mode') != 'topdown' or dataset.get('test_mode') is not True:
+        raise MetricError('CocoDataset must be top-down and in test_mode')
+    if (
+            sampler.get('type') != 'DefaultSampler'
+            or sampler.get('shuffle') is not False
+            or sampler.get('round_up') is not False
+            or loader.get('drop_last') is not False):
+        raise MetricError('COCO val sampler must be complete and nonshuffling')
+    data_root = Path(str(dataset.get('data_root', '')))
+    annotation_relative = (data_root / str(dataset.get('ann_file', ''))).as_posix()
+    if annotation_relative != _COCO_ANNOTATION:
+        raise MetricError('evaluation annotation must be COCO val2017 keypoints')
+    if dataset.get('bbox_file') != _COCO_DETECTIONS:
+        raise MetricError('evaluation must use official COCO val detection boxes')
+    if (
+            evaluator.get('type') != 'CocoMetric'
+            or evaluator.get('ann_file') != _COCO_ANNOTATION):
+        raise MetricError('evaluation must use CocoMetric on COCO val2017')
+    image_prefix = dataset.get('data_prefix')
+    if not isinstance(image_prefix, Mapping) or image_prefix.get('img') != 'val2017/':
+        raise MetricError('CocoDataset image prefix must be val2017')
+
+    root = Path(repository_root).resolve()
+    annotation_path = root / _COCO_ANNOTATION
+    detection_path = root / _COCO_DETECTIONS
+    inventory_path = root / 'data/inventory.json'
+    try:
+        annotation = json.loads(annotation_path.read_text(encoding='utf-8'))
+        detections = json.loads(detection_path.read_text(encoding='utf-8'))
+        inventory = json.loads(inventory_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise MetricError(f'cannot verify COCO val assets: {error}') from error
+    images = annotation.get('images') if isinstance(annotation, Mapping) else None
+    annotations = annotation.get('annotations') if isinstance(annotation, Mapping) else None
+    if (
+            not isinstance(images, list) or len(images) != expected_image_count
+            or not isinstance(annotations, list)):
+        raise MetricError(
+            f'COCO val annotation must contain exactly {expected_image_count} images')
+    ids: set[int] = set()
+    image_dir = root / data_root / 'val2017'
+    for row in images:
+        if (
+                not isinstance(row, Mapping)
+                or isinstance(row.get('id'), bool)
+                or not isinstance(row.get('id'), int)
+                or row['id'] in ids
+                or not isinstance(row.get('file_name'), str)
+                or not (image_dir / row['file_name']).is_file()):
+            raise MetricError('COCO val image inventory is incomplete or invalid')
+        ids.add(row['id'])
+    if (
+            not isinstance(detections, list) or not detections
+            or any(
+                not isinstance(row, Mapping) or row.get('image_id') not in ids
+                for row in detections)):
+        raise MetricError('COCO val detections are empty or reference unknown images')
+    assets = inventory.get('assets') if isinstance(inventory, Mapping) else None
+    entries = [row for row in assets or [] if (
+        isinstance(row, Mapping) and row.get('id') == 'coco-val-detections')]
+    if len(entries) != 1 or entries[0].get('path') != _COCO_DETECTIONS:
+        raise MetricError('data inventory lacks the official COCO val detections')
+    detection_sha256 = _file_sha256(detection_path)
+    if entries[0].get('sha256') != detection_sha256:
+        raise MetricError('data inventory detection hash does not match actual asset')
+    return {
+        'dataset': 'coco', 'split': 'val2017', 'complete_split': True,
+        'annotation_sha256': _file_sha256(annotation_path),
+        'detection_sha256': detection_sha256,
+        'inventory_detection_sha256': entries[0]['sha256'],
+        'annotation_image_count': len(images),
+        'annotation_record_count': len(annotations),
+        'detection_record_count': len(detections),
+        'verified_image_count': len(images),
+    }
 
 
 def _finite_number(value: object) -> bool:
@@ -167,13 +274,16 @@ def _validate_determinism(
             or len(workers) != worker_count):
         raise MetricError('determinism worker records do not match worker_count')
     worker_fields = {
-        'worker_id', 'python_seed', 'numpy_seed', 'torch_seed'}
+        'worker_id', 'torch_seed_source', 'python_seed_derivation',
+        'numpy_seed_derivation'}
     if any(
             not isinstance(worker, Mapping) or set(worker) != worker_fields
-            or any(
-                isinstance(worker[field], bool)
-                or not isinstance(worker[field], int)
-                for field in worker_fields)
+            or isinstance(worker['worker_id'], bool)
+            or not isinstance(worker['worker_id'], int)
+            or worker['worker_id'] < 0
+            or worker['torch_seed_source'] != 'torch.initial_seed()'
+            or worker['python_seed_derivation'] != 'torch_seed % 2**32'
+            or worker['numpy_seed_derivation'] != 'torch_seed % 2**32'
             for worker in workers):
         raise MetricError('determinism worker seed record is invalid')
     if value['persistent_workers'] is not False:
@@ -189,6 +299,49 @@ def _validate_determinism(
     nested = validate_provenance(value['provenance'])
     if nested != dict(provenance):
         raise MetricError('determinism provenance disagrees with result provenance')
+    return _freeze(value)
+
+
+def _validate_recorded_coco_protocol(value: object) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise MetricError('evaluation protocol must be an object')
+    if (
+            value.get('dataset') != 'coco'
+            or value.get('split') != 'val2017'
+            or value.get('complete_split') is not True
+            or isinstance(value.get('batch_size'), bool)
+            or not isinstance(value.get('batch_size'), int)
+            or value['batch_size'] <= 0):
+        raise MetricError('evaluation protocol is not complete COCO val2017')
+    for name in (
+            'annotation_sha256', 'detection_sha256',
+            'inventory_detection_sha256'):
+        if not isinstance(value.get(name), str) or not _SHA256.fullmatch(
+                value[name]):
+            raise MetricError(f'evaluation protocol {name} is invalid')
+    if value['detection_sha256'] != value['inventory_detection_sha256']:
+        raise MetricError('evaluation detection hash disagrees with inventory')
+    counts = (
+        value.get('annotation_image_count'),
+        value.get('annotation_record_count'),
+        value.get('detection_record_count'),
+        value.get('verified_image_count'))
+    if (
+            any(isinstance(item, bool) or not isinstance(item, int)
+                or item < 0 for item in counts)
+            or value['annotation_image_count'] != 5000
+            or value['verified_image_count'] != 5000
+            or value['detection_record_count'] == 0):
+        raise MetricError('evaluation protocol COCO asset counts are invalid')
+    for name in ('source_config', 'checkpoint', 'data_inventory'):
+        item = value.get(name)
+        if (
+                not isinstance(item, str) or not item
+                or Path(item).is_absolute()
+                or any(part in {'.', '..'} for part in Path(item).parts)):
+            raise MetricError(f'evaluation protocol {name} path is invalid')
+    if value['data_inventory'] != 'data/inventory.json':
+        raise MetricError('evaluation protocol data inventory path is invalid')
     return _freeze(value)
 
 
@@ -211,9 +364,14 @@ class CandidateResult:
     evaluation_artifact: Path
 
     @classmethod
-    def from_artifacts(cls, root: Path | str) -> 'CandidateResult':
+    def from_artifacts(
+            cls, root: Path | str, *, mode: str = 'flip') -> 'CandidateResult':
         root = Path(root)
-        path = root if root.is_file() else root / 'evaluate/evaluate.json'
+        if root.is_file() or not root.is_dir():
+            raise MetricError('candidate artifact root must be a directory')
+        if mode not in {'flip', 'no_flip'}:
+            raise MetricError('evaluation mode must be flip or no_flip')
+        path = root / 'evaluate/evaluate.json'
         try:
             envelope = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError) as error:
@@ -229,56 +387,87 @@ class CandidateResult:
         if not isinstance(candidate_id, str) or not candidate_id:
             raise MetricError('evaluation candidate_id must be non-empty')
         result = envelope['result']
-        result_fields = {
-            'route', 'flip_test', 'metrics', 'provenance', 'determinism',
-            'protocol', 'calibration_split',
-        }
+        result_fields = {'route', 'calibration_split', 'modes'}
         if not isinstance(result, Mapping) or set(result) != result_fields:
             raise MetricError('evaluation result has invalid fields')
         route = result['route']
         if not isinstance(route, str) or not route:
             raise MetricError('evaluation route must be non-empty')
-        if not isinstance(result['flip_test'], bool):
-            raise MetricError('evaluation flip_test must be boolean')
         calibration_split = result['calibration_split']
         if calibration_split not in {None, 'train2017'}:
             raise MetricError(
                 'calibration_split must be absent or train2017, never val2017')
-        provenance = validate_provenance(result['provenance'])
-        determinism = _validate_determinism(result['determinism'], provenance)
-        protocol = result['protocol']
-        if not isinstance(protocol, Mapping):
-            raise MetricError('evaluation protocol must be an object')
-        if (
-                protocol.get('dataset') != 'coco'
-                or protocol.get('split') != 'val2017'
-                or protocol.get('complete_split') is not True
-                or isinstance(protocol.get('batch_size'), bool)
-                or not isinstance(protocol.get('batch_size'), int)
-                or protocol['batch_size'] <= 0):
-            raise MetricError('evaluation protocol is not complete COCO val2017')
+        modes = result['modes']
+        if not isinstance(modes, Mapping) or set(modes) != {'flip', 'no_flip'}:
+            raise MetricError('evaluation must contain both flip and no_flip modes')
+        normalized_modes: dict[str, tuple[CocoMetrics, dict[str, str],
+                                          Mapping[str, Any], Mapping[str, Any]]] = {}
+        mode_fields = {'metrics', 'provenance', 'determinism', 'protocol'}
+        for name, row in modes.items():
+            if not isinstance(row, Mapping) or set(row) != mode_fields:
+                raise MetricError(f'evaluation {name} mode has invalid fields')
+            row_provenance = validate_provenance(row['provenance'])
+            row_determinism = _validate_determinism(
+                row['determinism'], row_provenance)
+            row_protocol = _validate_recorded_coco_protocol(row['protocol'])
+            normalized_modes[name] = (
+                CocoMetrics.from_dict(row['metrics']), row_provenance,
+                row_determinism, row_protocol)
+        for field in ('checkpoint_sha256', 'data_inventory_sha256', 'git_commit'):
+            if normalized_modes['flip'][1][field] != normalized_modes['no_flip'][1][field]:
+                raise MetricError(f'evaluation mode provenance disagrees on {field}')
+        for field in (
+                'annotation_sha256', 'detection_sha256',
+                'inventory_detection_sha256', 'annotation_image_count',
+                'annotation_record_count', 'detection_record_count',
+                'verified_image_count', 'source_config', 'checkpoint',
+                'data_inventory'):
+            if normalized_modes['flip'][3][field] != normalized_modes['no_flip'][3][field]:
+                raise MetricError(f'evaluation mode protocol disagrees on {field}')
+        metrics, provenance, determinism, protocol = normalized_modes[mode]
         profile: Mapping[str, Any] | None = None
         latency: Mapping[str, Any] | None = None
         gpu_lease: Mapping[str, Any] | None = None
         artifact_paths: dict[str, Path] = {'evaluation': path.resolve()}
-        if root.is_dir():
-            profile_path = root / 'profile/profile.json'
-            latency_path = root / 'latency/latency.json'
-            profile = _load_profile(
-                profile_path, candidate_id=candidate_id,
-                provenance=provenance)
-            latency, gpu_lease = _load_latency(
-                latency_path, candidate_id=candidate_id, route=route,
-                provenance=provenance)
-            artifact_paths.update({
-                'profile': profile_path.resolve(),
-                'latency': latency_path.resolve(),
-            })
+        profile_path = root / 'profile/profile.json'
+        latency_path = root / 'latency/latency.json'
+        profile = _load_profile(
+            profile_path, candidate_id=candidate_id,
+            provenance=provenance)
+        latency, gpu_lease = _load_latency(
+            latency_path, candidate_id=candidate_id, route=route,
+            provenance=provenance)
+        if (
+                profile['config'] != protocol['source_config']
+                or profile['checkpoint'] != protocol['checkpoint']):
+            raise MetricError('profile paths disagree with evaluation provenance')
+        latency_protocol = latency['protocol']
+        for field in ('source_config', 'checkpoint', 'data_inventory'):
+            if latency_protocol.get(field) != protocol[field]:
+                raise MetricError(
+                    f'latency {field} disagrees with evaluation provenance')
+        for field in (
+                'annotation_sha256', 'detection_sha256',
+                'inventory_detection_sha256', 'annotation_image_count',
+                'annotation_record_count', 'detection_record_count',
+                'verified_image_count'):
+            if latency_protocol['data'][field] != protocol[field]:
+                raise MetricError(
+                    f'latency data {field} disagrees with evaluation provenance')
+        artifact_paths.update({
+            'profile': profile_path.resolve(),
+            'latency': latency_path.resolve(),
+        })
+        try:
+            for artifact in artifact_paths.values():
+                artifact.relative_to(root.resolve())
+        except ValueError as error:
+            raise MetricError('candidate artifact path escapes its directory') from error
         return cls(
             candidate_id=candidate_id,
             route=route,
-            metrics=CocoMetrics.from_dict(result['metrics']),
-            flip_test=result['flip_test'],
+            metrics=metrics,
+            flip_test=mode == 'flip',
             provenance=MappingProxyType(provenance),
             determinism=determinism,
             protocol=_freeze(protocol),
@@ -312,19 +501,60 @@ def _load_profile(
             or value['checkpoint_sha256'] != provenance['checkpoint_sha256']):
         raise MetricError('profile artifact provenance mismatch')
     parameters = value['parameters']
+    def valid_count(item: object) -> bool:
+        return (
+            isinstance(item, int) and not isinstance(item, bool) and item >= 0)
+
+    def valid_count_map(item: object) -> bool:
+        return (
+            isinstance(item, Mapping) and bool(item)
+            and all(isinstance(key, str) and bool(key) and valid_count(count)
+                    for key, count in item.items()))
+
+    def valid_shape(item: object) -> bool:
+        if isinstance(item, list):
+            if not item:
+                return False
+            if all(valid_count(dimension) and dimension > 0 for dimension in item):
+                return True
+            return all(valid_shape(child) for child in item)
+        if isinstance(item, Mapping):
+            return bool(item) and all(
+                isinstance(key, str) and valid_shape(child)
+                for key, child in item.items())
+        return isinstance(item, str) and bool(item)
+
     if (
             not isinstance(parameters, Mapping)
             or set(parameters) != {
                 'total', 'trainable', 'bytes_by_dtype', 'by_prefix'}
-            or isinstance(parameters['total'], bool)
-            or not isinstance(parameters['total'], int)
-            or parameters['total'] < 0
-            or isinstance(parameters['trainable'], bool)
-            or not isinstance(parameters['trainable'], int)
+            or not valid_count(parameters['total'])
+            or not valid_count(parameters['trainable'])
             or not 0 <= parameters['trainable'] <= parameters['total']):
         raise MetricError('profile parameter summary is invalid')
+    if (
+            not valid_count_map(parameters['bytes_by_dtype'])
+            or not valid_count_map(parameters['by_prefix'])
+            or not valid_shape(value['input_shapes'])
+            or not valid_shape(value['output_shapes'])):
+        raise MetricError('profile shape or parameter inventory is invalid')
     if not isinstance(value['modules'], list) or not value['modules']:
         raise MetricError('profile module inventory is invalid')
+    if not all(
+            isinstance(record, Mapping)
+            and set(record) == {'name', 'kind', 'parameters', 'hazard'}
+            and isinstance(record['name'], str)
+            and isinstance(record['kind'], str) and bool(record['kind'])
+            and isinstance(record['parameters'], int)
+            and not isinstance(record['parameters'], bool)
+            and record['parameters'] >= 0
+            and (record['hazard'] is None or isinstance(record['hazard'], str))
+            for record in value['modules']):
+        raise MetricError('profile module inventory is invalid')
+    if not isinstance(value['config'], str) or not value['config']:
+        raise MetricError('profile config identity is invalid')
+    if not isinstance(value['checkpoint'], str) or not value['checkpoint']:
+        raise MetricError('profile checkpoint identity is invalid')
     return _freeze(value)
 
 
@@ -359,8 +589,12 @@ def _load_latency(
             for field in shared_fields):
         raise MetricError('latency artifact provenance or route mismatch')
     protocol = result['protocol']
+    protocol_fields = {
+        'batch_size', 'warmup', 'iterations', 'timer', 'synchronize',
+        'scope', 'source_config', 'checkpoint', 'data_inventory', 'data'}
     if (
             not isinstance(protocol, Mapping)
+            or set(protocol) != protocol_fields
             or protocol.get('batch_size') != 1
             or protocol.get('timer') != 'torch.cuda.Event'
             or protocol.get('synchronize') is not True
@@ -372,6 +606,16 @@ def _load_latency(
             or not isinstance(protocol.get('iterations'), int)
             or protocol['iterations'] <= 0):
         raise MetricError('latency protocol is invalid')
+    latency_data = protocol['data']
+    if not isinstance(latency_data, Mapping):
+        raise MetricError('latency data protocol is invalid')
+    _validate_recorded_coco_protocol({
+        **latency_data,
+        'batch_size': protocol['batch_size'],
+        'source_config': protocol['source_config'],
+        'checkpoint': protocol['checkpoint'],
+        'data_inventory': protocol['data_inventory'],
+    })
     modes = result['modes']
     summary_fields = {'median_ms', 'p90_ms', 'p95_ms', 'sample_count'}
     if not isinstance(modes, Mapping) or set(modes) != {'flip', 'no_flip'}:
@@ -380,6 +624,8 @@ def _load_latency(
         if (
                 not isinstance(summary, Mapping)
                 or set(summary) != summary_fields
+                or isinstance(summary['sample_count'], bool)
+                or not isinstance(summary['sample_count'], int)
                 or summary['sample_count'] != protocol['iterations']
                 or any(
                     not _finite_number(summary[field])
@@ -387,16 +633,11 @@ def _load_latency(
                     for field in ('median_ms', 'p90_ms', 'p95_ms'))
                 or not summary['median_ms'] <= summary['p90_ms'] <= summary['p95_ms']):
             raise MetricError(f'latency {name} summary is invalid')
-    lease = result['gpu_lease']
-    lease_fields = {
-        'stage_id', 'pid', 'boot_id', 'timestamp', 'device_index',
-        'allowed_pids',
-    }
-    if (
-            not isinstance(lease, Mapping) or set(lease) != lease_fields
-            or lease['stage_id'] != f'{candidate_id}:latency'
-            or isinstance(lease['pid'], bool) or not isinstance(lease['pid'], int)
-            or lease['pid'] <= 0):
+    try:
+        lease = validate_gpu_lease(result['gpu_lease'])
+    except LatencyError as error:
+        raise MetricError(f'latency GPU lease provenance is invalid: {error}') from error
+    if lease['stage_id'] != f'{candidate_id}:latency':
         raise MetricError('latency GPU lease provenance is invalid')
     return _freeze(result), _freeze(lease)
 

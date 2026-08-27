@@ -96,16 +96,23 @@ def infer_tracked_poses(
             raise YoloAdapterError('pose coordinates must be finite')
         if (
                 (coordinates[:, 0] < 0).any()
-                or (coordinates[:, 0] > width).any()
+                or (coordinates[:, 0] >= width).any()
                 or (coordinates[:, 1] < 0).any()
-                or (coordinates[:, 1] > height).any()):
+                or (coordinates[:, 1] >= height).any()):
             raise YoloAdapterError('pose coordinates must map inside the frame')
         try:
             scores = np.asarray(result.pred_instances.keypoint_scores)
         except (AttributeError, TypeError, ValueError) as error:
             raise YoloAdapterError('pose result lacks keypoint scores') from error
-        if not np.isfinite(scores).all():
-            raise YoloAdapterError('pose keypoint scores must be finite')
+        scores = np.squeeze(scores)
+        if scores.ndim == 0:
+            scores = scores.reshape(1)
+        if (
+                scores.ndim != 1 or scores.size == 0
+                or scores.size != keypoints.shape[0]
+                or not np.isfinite(scores).all()):
+            raise YoloAdapterError(
+                'pose keypoint scores must be finite with one per keypoint')
         tracked.append(TrackedPose(
             track_id=box.track_id,
             detector_score=float(box.score),

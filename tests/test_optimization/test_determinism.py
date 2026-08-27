@@ -1,4 +1,6 @@
 import json
+import hashlib
+from pathlib import Path
 import random
 import subprocess
 import sys
@@ -9,15 +11,20 @@ import torch
 from mmengine.config import Config
 
 
-def test_seed_worker_repeats_python_numpy_and_torch_streams():
+def test_seed_worker_uses_full_torch_initial_seed_and_32bit_library_seeds(
+        monkeypatch):
     from mambapose_opt.determinism import seed_worker
 
-    seed_worker(3, base_seed=41)
-    first = (random.random(), np.random.random(), torch.rand(1).item())
-    seed_worker(3, base_seed=41)
-    second = (random.random(), np.random.random(), torch.rand(1).item())
+    calls = []
+    full_seed = 2**32 + 41
+    monkeypatch.setattr(torch, 'initial_seed', lambda: full_seed)
+    monkeypatch.setattr(random, 'seed', lambda value: calls.append(('python', value)))
+    monkeypatch.setattr(np.random, 'seed', lambda value: calls.append(('numpy', value)))
+    monkeypatch.setattr(torch, 'manual_seed', lambda value: calls.append(('torch', value)))
 
-    assert first == second
+    seed_worker(3)
+
+    assert calls == [('python', 41), ('numpy', 41), ('torch', full_seed)]
 
 
 def test_order_hash_is_repeatable_epoch_sensitive_and_rejects_rewrite():
@@ -51,10 +58,12 @@ def test_determinism_record_contains_exact_worker_and_provenance_contract():
     assert record['numpy_seed'] == 7
     assert record['torch_seed'] == 7
     assert record['workers'] == [
-        {'worker_id': 0, 'python_seed': 7, 'numpy_seed': 7,
-         'torch_seed': 7},
-        {'worker_id': 1, 'python_seed': 8, 'numpy_seed': 8,
-         'torch_seed': 8},
+        {'worker_id': 0, 'torch_seed_source': 'torch.initial_seed()',
+         'python_seed_derivation': 'torch_seed % 2**32',
+         'numpy_seed_derivation': 'torch_seed % 2**32'},
+        {'worker_id': 1, 'torch_seed_source': 'torch.initial_seed()',
+         'python_seed_derivation': 'torch_seed % 2**32',
+         'numpy_seed_derivation': 'torch_seed % 2**32'},
     ]
     assert record['worker_count'] == 2
     assert record['persistent_workers'] is False
@@ -95,8 +104,7 @@ def test_optimization_configs_enable_fixed_determinism():
             loader = cfg[loader_name]
             assert loader.num_workers == 2
             assert loader.persistent_workers is False
-            assert loader.worker_init_fn == dict(
-                type='mambapose_seed_worker', base_seed=0)
+            assert loader.worker_init_fn == dict(type='mambapose_seed_worker')
     assert no_pif.model.head.tokenpose_cfg.pif_mode == 'disabled'
 
 
@@ -111,8 +119,7 @@ def test_source_loader_is_copied_into_fixed_nonpersistent_worker_policy():
     assert source.persistent_workers is True
     assert normalized.persistent_workers is False
     assert normalized.num_workers == 2
-    assert normalized.worker_init_fn == dict(
-        type='mambapose_seed_worker', base_seed=0)
+    assert normalized.worker_init_fn == dict(type='mambapose_seed_worker')
 
 
 def test_trace_dataloader_help_is_directly_executable_without_user_site():
@@ -122,3 +129,36 @@ def test_trace_dataloader_help_is_directly_executable_without_user_site():
         capture_output=True, text=True, check=False)
     assert completed.returncode == 0, completed.stderr
     assert 'candidate_id' in completed.stdout
+
+
+@pytest.mark.parametrize('failure', ['checkpoint', 'dirty'])
+def test_trace_refuses_bad_checkpoint_or_dirty_source_before_dataset_and_output(
+        tmp_path, monkeypatch, failure):
+    import tools.optimization.trace_dataloader as tool
+    from mambapose_opt.schema import CandidateSpec
+
+    (tmp_path / 'config.py').write_text('train_dataloader = dict()')
+    checkpoint = tmp_path / 'model.pth'
+    checkpoint.write_bytes(b'actual')
+    expected = hashlib.sha256(b'actual').hexdigest()
+    if failure == 'checkpoint':
+        expected = 'a' * 64
+    candidate = CandidateSpec.from_dict({
+        'id': 'fixture', 'route': 'accuracy-first', 'kind': 'float',
+        'config': 'config.py', 'checkpoint': 'model.pth',
+        'checkpoint_sha256': expected, 'seed': 0, 'features': {},
+    })
+    output = tmp_path / 'work_dirs/optimization/trace.json'
+    monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(
+        tool, '_git_commit',
+        lambda: (_ for _ in ()).throw(RuntimeError('dirty source'))
+        if failure == 'dirty' else 'd' * 40)
+    monkeypatch.setattr(
+        tool.Config, 'fromfile',
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError('dataset/config loading happened too early')))
+
+    with pytest.raises((ValueError, RuntimeError)):
+        tool.trace_candidate(candidate, output, epochs=1)
+    assert not output.exists()

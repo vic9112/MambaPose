@@ -392,6 +392,21 @@ class OptimizationController:
         if not isinstance(value.get('result'), dict):
             raise ArtifactValidationError(
                 f'{stage} artifact result must be an object')
+        if stage == 'evaluate':
+            result = value['result']
+            if set(result) != {'route', 'calibration_split', 'modes'}:
+                raise ArtifactValidationError(
+                    'evaluate result must use the dual-mode schema')
+            modes = result.get('modes')
+            if not isinstance(modes, dict) or set(modes) != {'flip', 'no_flip'}:
+                raise ArtifactValidationError(
+                    'evaluate artifact must contain both evaluation modes')
+            fields = {'metrics', 'provenance', 'determinism', 'protocol'}
+            if any(
+                    not isinstance(row, dict) or set(row) != fields
+                    for row in modes.values()):
+                raise ArtifactValidationError(
+                    'evaluate mode rows do not match the formal schema')
         return 'optimization-stage-envelope-v1'
 
     def _validate_artifacts(
