@@ -334,6 +334,8 @@ class OptimizationController:
                 base_required | {'device', 'parent', 'runtime'})
             if self.candidate.route == 'ssm-quant-pwl':
                 required.add('source')
+            if self.candidate.kind == 'binary-qk':
+                required.add('binary_qk_operation')
             if set(value) != required:
                 raise ArtifactValidationError(
                     'profile artifact fields do not match its schema version')
@@ -458,6 +460,15 @@ class OptimizationController:
                         for record in modules)):
                 raise ArtifactValidationError(
                     'profile artifact modules list is invalid')
+            if self.candidate.kind == 'binary-qk':
+                try:
+                    from .binary_operation import (
+                        validate_binary_operation_manifest)
+                    validate_binary_operation_manifest(
+                        value.get('binary_qk_operation'))
+                except ValueError as error:
+                    raise ArtifactValidationError(
+                        f'binary profile operation is invalid: {error}') from error
             return f'optimization-profile-v{version}'
 
         required = {'schema_version', 'candidate_id', 'stage', 'result'}
@@ -610,6 +621,15 @@ class OptimizationController:
                 validate_live_coco_observation(
                     validated_evaluation['modes']['flip']['protocol'],
                     config=config, repository_root=self.repository_root)
+                if self.candidate.kind == 'binary-qk':
+                    from .binary_operation import validate_binary_stage_binding
+                    validate_binary_stage_binding(
+                        profile_path=(
+                            path.parent.parent / 'profile/profile.json'),
+                        stage_path=path,
+                        repository_root=self.repository_root,
+                        candidate_id=self.candidate.id,
+                        stage='evaluate')
             except (MetricError, OSError, ValueError) as error:
                 raise ArtifactValidationError(
                     f'evaluate artifact is invalid: {error}') from error
@@ -665,6 +685,15 @@ class OptimizationController:
                     config=Config.fromfile(
                         runtime_config_path),
                     repository_root=self.repository_root)
+                if self.candidate.kind == 'binary-qk':
+                    from .binary_operation import validate_binary_stage_binding
+                    validate_binary_stage_binding(
+                        profile_path=(
+                            path.parent.parent / 'profile/profile.json'),
+                        stage_path=path,
+                        repository_root=self.repository_root,
+                        candidate_id=self.candidate.id,
+                        stage='latency')
             except (MetricError, OSError, ValueError) as error:
                 raise ArtifactValidationError(
                     f'latency artifact is invalid: {error}') from error

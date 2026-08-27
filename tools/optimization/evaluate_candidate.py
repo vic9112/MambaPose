@@ -185,12 +185,18 @@ def evaluate(
             and (_sha256(config_path) != runtime['config_sha256']
                  or _sha256(checkpoint) != runtime['checkpoint_sha256'])):
         raise ValueError('evaluation runtime inputs changed during execution')
-    return stage_envelope(candidate.id, 'evaluate', {
+    result = {
         'route': candidate.route,
         'calibration_split': None,
         'modes': rows,
         'source': source,
-    })
+    }
+    if candidate.kind == 'binary-qk':
+        from mambapose_opt.binary_operation import (
+            binary_profile_binding_for_stage)
+        result['binary_qk_profile'] = binary_profile_binding_for_stage(
+            output, repository_root=REPO_ROOT)
+    return stage_envelope(candidate.id, 'evaluate', result)
 
 
 def main() -> int:

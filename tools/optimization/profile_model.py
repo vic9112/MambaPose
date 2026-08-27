@@ -198,6 +198,10 @@ def profile(
             manifest_path=manifest_path,
             policy_path=REPOSITORY_ROOT / candidate.config,
             git_commit=commit)
+    if candidate.kind == 'binary-qk':
+        from mambapose_opt.binary_operation import (
+            build_binary_operation_manifest)
+        result['binary_qk_operation'] = build_binary_operation_manifest(model)
     return result
 
 

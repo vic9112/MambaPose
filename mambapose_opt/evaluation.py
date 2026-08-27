@@ -1099,12 +1099,23 @@ def validate_evaluation_envelope(
         raise MetricError('evaluation candidate identity mismatch')
     result = value['result']
     expected_result_fields = {'route', 'calibration_split', 'modes', 'source'}
+    allowed_result_fields = (
+        expected_result_fields,
+        expected_result_fields - {'source'},
+        expected_result_fields | {'binary_qk_profile'},
+    )
     if (
             not isinstance(result, Mapping)
-            or set(result) not in (
-                expected_result_fields,
-                expected_result_fields - {'source'})):
+            or set(result) not in allowed_result_fields):
         raise MetricError('evaluation result has invalid fields')
+    binary_profile = result.get('binary_qk_profile')
+    if binary_profile is not None:
+        try:
+            from .binary_operation import validate_binary_profile_binding
+            validate_binary_profile_binding(binary_profile)
+        except ValueError as error:
+            raise MetricError(
+                f'evaluation binary profile binding is invalid: {error}') from error
     source = result.get('source')
     if require_source_binding and source is None:
         raise MetricError('evaluation source manifest binding is required')
@@ -1206,6 +1217,8 @@ def validate_evaluation_envelope(
         'calibration_split': calibration_split,
         'modes': MappingProxyType(normalized_modes),
         'source': _freeze(source) if source is not None else None,
+        'binary_qk_profile': (
+            _freeze(binary_profile) if binary_profile is not None else None),
     })
 
 
@@ -1223,6 +1236,7 @@ class CandidateResult:
     calibration_split: str | None
     profile: Mapping[str, Any] | None
     latency: Mapping[str, Any] | None
+    binary_operation: Mapping[str, Any] | None
     gpu_lease: Mapping[str, Any] | None
     artifact_paths: Mapping[str, Path]
     evaluation_artifact: Path
@@ -1333,6 +1347,24 @@ class CandidateResult:
             latency_path, candidate_id=candidate_id, route=route,
             provenance=provenance, source=source,
             expected_runtime=expected_runtime, authority=authority)
+        binary_operation: Mapping[str, Any] | None = None
+        if candidate.kind == 'binary-qk':
+            try:
+                from .binary_operation import validate_binary_artifact_bundle
+                binary_operation = _freeze(validate_binary_artifact_bundle(
+                    profile_path=profile_path, evaluation_path=path,
+                    latency_path=latency_path,
+                    repository_root=repository_root,
+                    candidate_id=candidate_id))
+            except ValueError as error:
+                raise MetricError(
+                    f'binary CandidateResult binding is invalid: {error}') from error
+        elif (
+                profile.get('binary_qk_operation') is not None
+                or validated.get('binary_qk_profile') is not None
+                or latency.get('binary_qk_profile') is not None):
+            raise MetricError(
+                'non-binary CandidateResult contains Binary Q/K evidence')
         if (
                 profile['schema_version'] == 2
                 and profile['device']['physical_index'] !=
@@ -1381,6 +1413,7 @@ class CandidateResult:
             calibration_split=calibration_split,
             profile=profile,
             latency=latency,
+            binary_operation=binary_operation,
             gpu_lease=gpu_lease,
             artifact_paths=MappingProxyType(artifact_paths),
             evaluation_artifact=path.resolve(),
@@ -1405,11 +1438,16 @@ def _load_profile(
     runtime_fields = legacy_fields | {'device', 'parent', 'runtime'}
     if expected_source is not None:
         runtime_fields.add('source')
+    binary_legacy_fields = legacy_fields | {'binary_qk_operation'}
+    binary_runtime_fields = runtime_fields | {'binary_qk_operation'}
     if (
             not isinstance(value, Mapping)
-            or set(value) not in (legacy_fields, runtime_fields)):
+            or set(value) not in (
+                legacy_fields, runtime_fields,
+                binary_legacy_fields, binary_runtime_fields)):
         raise MetricError('profile artifact has invalid fields')
-    expected_schema = 2 if set(value) == runtime_fields else 1
+    expected_schema = (
+        2 if set(value) in (runtime_fields, binary_runtime_fields) else 1)
     if (
             value['schema_version'] != expected_schema
             or value['candidate'] != candidate_id):
@@ -1499,6 +1537,13 @@ def _load_profile(
         raise MetricError('profile config identity is invalid')
     if not isinstance(value['checkpoint'], str) or not value['checkpoint']:
         raise MetricError('profile checkpoint identity is invalid')
+    if value.get('binary_qk_operation') is not None:
+        try:
+            from .binary_operation import validate_binary_operation_manifest
+            validate_binary_operation_manifest(value['binary_qk_operation'])
+        except ValueError as error:
+            raise MetricError(
+                f'profile binary operation is invalid: {error}') from error
     return _freeze(value)
 
 
@@ -1555,15 +1600,24 @@ def validate_latency_envelope(
     if expected_candidate_id is not None and candidate_id != expected_candidate_id:
         raise MetricError('latency candidate identity mismatch')
     result = envelope['result']
+    result_fields = {
+        'route', 'provenance', 'protocol', 'modes', 'gpu_lease', 'source'}
     if (
             not isinstance(result, Mapping)
-            or set(result) not in ({
-                'route', 'provenance', 'protocol', 'modes', 'gpu_lease',
-                'source'}, {
-                'route', 'provenance', 'protocol', 'modes', 'gpu_lease'})
+            or set(result) not in (
+                result_fields,
+                result_fields - {'source'},
+                result_fields | {'binary_qk_profile'})
             or not isinstance(result['route'], str)
             or not result['route']):
         raise MetricError('latency artifact provenance or route mismatch')
+    if result.get('binary_qk_profile') is not None:
+        try:
+            from .binary_operation import validate_binary_profile_binding
+            validate_binary_profile_binding(result['binary_qk_profile'])
+        except ValueError as error:
+            raise MetricError(
+                f'latency binary profile binding is invalid: {error}') from error
     source = result.get('source')
     if require_source_binding and source is None:
         raise MetricError('latency source manifest binding is required')

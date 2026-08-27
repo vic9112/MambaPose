@@ -12,7 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Sequence
+from typing import Any, Callable, Sequence
 
 sys.dont_write_bytecode = True
 
@@ -214,7 +214,11 @@ def _status(root: Path) -> int:
 def _select(
         candidates: Sequence[CandidateSpec],
         identifiers: Sequence[str], *,
-        admit_conditional: bool = False) -> tuple[CandidateSpec, ...]:
+        admit_conditional: bool = False,
+        repository_root: Path = REPO_ROOT,
+        manifest_path: Path = MANIFEST_PATH,
+        candidate_result_loader: Callable[..., Any] | None = None,
+        ) -> tuple[CandidateSpec, ...]:
     if not identifiers:
         return tuple(
             candidate for candidate in candidates
@@ -232,6 +236,24 @@ def _select(
         raise CandidateManifestError(
             f'conditional candidates require --admit-conditional: '
             f'{list(conditional)}')
+    invalid_pwl_dependency = []
+    for item in selected:
+        if item.kind != 'binary-qk':
+            continue
+        try:
+            from mambapose_opt.binary_readiness import (
+                validate_binary_qk_admission)
+            validate_binary_qk_admission(
+                item, repository_root=repository_root,
+                manifest_path=manifest_path,
+                candidate_result_loader=candidate_result_loader)
+        except (OSError, RuntimeError, ValueError) as error:
+            invalid_pwl_dependency.append(item.id)
+            invalid_detail = str(error)
+    if invalid_pwl_dependency:
+        raise CandidateManifestError(
+            'binary Q/K candidates require a public-valid Stage-B PWL '
+            f'dependency: {invalid_pwl_dependency}: {invalid_detail}')
     return selected
 
 
@@ -311,7 +333,8 @@ def main() -> int:
     try:
         candidates = _select(
             load_candidate_manifest(args.manifest), args.candidate,
-            admit_conditional=args.admit_conditional)
+            admit_conditional=args.admit_conditional,
+            manifest_path=args.manifest)
     except CandidateManifestError as error:
         print(str(error), file=sys.stderr)
         return PERMANENT_EXIT

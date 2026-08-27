@@ -207,6 +207,14 @@ def measure_candidate(
         repository_root=REPO_ROOT, candidate=candidate,
         manifest_path=manifest,
         git_commit=admission['git_commit'])
+    binary_profile = None
+    if candidate.kind == 'binary-qk':
+        if output is None:
+            raise ValueError('binary latency requires its canonical output path')
+        from mambapose_opt.binary_operation import (
+            binary_profile_binding_for_stage)
+        binary_profile = binary_profile_binding_for_stage(
+            output, repository_root=REPO_ROOT)
     config = Config.fromfile(config_path)
     data_protocol = validate_coco_val_protocol(
         config, repository_root=REPO_ROOT)
@@ -224,6 +232,14 @@ def measure_candidate(
     numeric = config.get('numeric_optimization')
     if numeric is not None:
         NumericRuntimeHook.apply_to_model(model, numeric)
+    if binary_profile is not None:
+        from mambapose_opt.binary_operation import (
+            build_binary_operation_manifest, canonical_json_sha256)
+        live_operation = build_binary_operation_manifest(model)
+        if canonical_json_sha256(live_operation) != (
+                binary_profile['operation_sha256']):
+            raise ValueError(
+                'binary latency live graph differs from profiled operation')
     frame = np.zeros((256, 192, 3), dtype=np.uint8)
     box = np.array([[0., 0., 192., 256.]], dtype=np.float32)
     samples: dict[str, tuple[float, ...]] = {}
@@ -249,6 +265,8 @@ def measure_candidate(
         },
         'source': source,
     })
+    if binary_profile is not None:
+        result['binary_qk_profile'] = binary_profile
     result['protocol']['data'] = data_protocol
     result['protocol'].update({
         'source_config': config_path.relative_to(REPO_ROOT).as_posix(),
