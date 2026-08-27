@@ -16,6 +16,18 @@ import sys
 import tempfile
 from typing import Any, Callable
 
+
+_REQUIRED_ENVIRONMENT = {
+    'PYTHONDONTWRITEBYTECODE': '1',
+    'CUBLAS_WORKSPACE_CONFIG': ':4096:8',
+}
+if __name__ == '__main__' and any(
+        os.environ.get(name) != value
+        for name, value in _REQUIRED_ENVIRONMENT.items()):
+    environment = os.environ.copy()
+    environment.update(_REQUIRED_ENVIRONMENT)
+    os.execve(sys.executable, [sys.executable, *sys.argv], environment)
+
 sys.dont_write_bytecode = True
 
 import numpy as np
@@ -44,6 +56,19 @@ from mambapose_opt.numeric_runtime import resolve_numeric_runtime
 
 LEASE_MAX_AGE = timedelta(seconds=LEASE_MAX_AGE_SECONDS)
 LEASE_MAX_FUTURE_SKEW = timedelta(seconds=LEASE_MAX_FUTURE_SKEW_SECONDS)
+
+
+def _require_deterministic_environment() -> None:
+    if (
+            os.environ.get('PYTHONDONTWRITEBYTECODE') != '1'
+            or not sys.dont_write_bytecode):
+        raise RuntimeError(
+            'latency requires PYTHONDONTWRITEBYTECODE=1 before source/GPU '
+            'admission')
+    if os.environ.get('CUBLAS_WORKSPACE_CONFIG') != ':4096:8':
+        raise RuntimeError(
+            'latency requires CUBLAS_WORKSPACE_CONFIG=:4096:8 before '
+            'source/GPU admission')
 
 
 def _sha256(path: Path) -> str:
@@ -161,6 +186,7 @@ def measure_candidate(
         device_index: int | None = None,
         manifest_path: Path | None = None,
         output: Path | None = None) -> dict:
+    _require_deterministic_environment()
     if device_index is None:
         try:
             device_index = int(os.environ['MAMBAPOSE_PHYSICAL_DEVICE_INDEX'])

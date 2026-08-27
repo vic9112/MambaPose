@@ -980,6 +980,9 @@ def test_device_one_is_used_for_admission_and_runner_environment(
     from mambapose_opt.controller import OptimizationController
     from tools.optimization.run_campaign import SubprocessStageRunner
 
+    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '0')
+    monkeypatch.setenv('CUBLAS_WORKSPACE_CONFIG', ':16:8')
+    monkeypatch.setenv('MAMBAPOSE_TEST_SENTINEL', 'preserved')
     candidate = _candidate(tmp_path)
     entered = []
     _mock_lease(monkeypatch, entered)
@@ -1003,7 +1006,11 @@ def test_device_one_is_used_for_admission_and_runner_environment(
     )
     assert result.exit_code == 0
     assert entered[0][1] == 1
-    assert subprocess_runner.environment()['CUDA_VISIBLE_DEVICES'] == '1'
+    environment = subprocess_runner.environment()
+    assert environment['CUDA_VISIBLE_DEVICES'] == '1'
+    assert environment['PYTHONDONTWRITEBYTECODE'] == '1'
+    assert environment['CUBLAS_WORKSPACE_CONFIG'] == ':4096:8'
+    assert environment['MAMBAPOSE_TEST_SENTINEL'] == 'preserved'
 
 
 def test_controller_rejects_latency_nonce_not_from_its_acquisition(

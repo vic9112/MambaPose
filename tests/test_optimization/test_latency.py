@@ -16,6 +16,118 @@ class FakeTimer:
         return next(self.samples)
 
 
+@pytest.mark.parametrize('name,value', [
+    ('PYTHONDONTWRITEBYTECODE', None),
+    ('PYTHONDONTWRITEBYTECODE', '0'),
+    ('CUBLAS_WORKSPACE_CONFIG', None),
+    ('CUBLAS_WORKSPACE_CONFIG', ':16:8'),
+])
+def test_latency_cli_reexecutes_before_project_imports_with_exact_environment(
+        monkeypatch, name, value):
+    import builtins
+    import os
+    import runpy
+    import sys
+
+    script = Path('tools/optimization/measure_latency.py').resolve()
+    original_argv = [
+        str(script), 'w8-weight-only-s-v1', '--output',
+        'work_dirs/optimization/fixture/latency.json']
+    monkeypatch.setattr(sys, 'argv', original_argv)
+    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '1')
+    monkeypatch.setenv('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    monkeypatch.setenv('MAMBAPOSE_TEST_SENTINEL', 'preserved')
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    imported = []
+    captured = {}
+    real_import = builtins.__import__
+
+    def guarded_import(module_name, *args, **kwargs):
+        if module_name.split('.')[0] in {
+                'numpy', 'mmengine', 'mambapose_opt', 'mmpose', 'torch'}:
+            imported.append(module_name)
+            raise AssertionError(
+                f'project import happened before re-exec: {module_name}')
+        return real_import(module_name, *args, **kwargs)
+
+    class ReexecCaptured(RuntimeError):
+        pass
+
+    def captured_exec(executable, argv, environment):
+        captured.update({
+            'executable': executable,
+            'argv': argv,
+            'environment': environment,
+        })
+        raise ReexecCaptured
+
+    monkeypatch.setattr(builtins, '__import__', guarded_import)
+    monkeypatch.setattr(os, 'execve', captured_exec)
+
+    with pytest.raises(ReexecCaptured):
+        runpy.run_path(str(script), run_name='__main__')
+
+    assert imported == []
+    assert captured['executable'] == sys.executable
+    assert captured['argv'] == [sys.executable, *original_argv]
+    assert captured['environment']['PYTHONDONTWRITEBYTECODE'] == '1'
+    assert captured['environment']['CUBLAS_WORKSPACE_CONFIG'] == ':4096:8'
+    assert captured['environment']['MAMBAPOSE_TEST_SENTINEL'] == 'preserved'
+
+
+@pytest.mark.parametrize('name,value', [
+    ('PYTHONDONTWRITEBYTECODE', None),
+    ('PYTHONDONTWRITEBYTECODE', '0'),
+    ('CUBLAS_WORKSPACE_CONFIG', None),
+    ('CUBLAS_WORKSPACE_CONFIG', ':16:8'),
+])
+def test_measure_candidate_rejects_invalid_deterministic_environment_first(
+        monkeypatch, name, value):
+    import sys
+    import tools.optimization.measure_latency as tool
+
+    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '1')
+    monkeypatch.setenv('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    monkeypatch.setattr(sys, 'dont_write_bytecode', True)
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        tool, 'resolve_numeric_runtime',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                'numeric source/GPU admission ran before environment gate')))
+
+    with pytest.raises(RuntimeError, match=name):
+        tool.measure_candidate(
+            None, warmup=50, repeats=200, device_index=0,
+            manifest_path=Path('optimization/candidates.json'))
+
+
+def test_measure_candidate_rejects_runtime_bytecode_guard_bypass_first(
+        monkeypatch):
+    import sys
+    import tools.optimization.measure_latency as tool
+
+    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '1')
+    monkeypatch.setenv('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    monkeypatch.setattr(sys, 'dont_write_bytecode', False)
+    monkeypatch.setattr(
+        tool, 'resolve_numeric_runtime',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                'numeric source/GPU admission ran before environment gate')))
+
+    with pytest.raises(RuntimeError, match='PYTHONDONTWRITEBYTECODE'):
+        tool.measure_candidate(
+            None, warmup=50, repeats=200, device_index=0,
+            manifest_path=Path('optimization/candidates.json'))
+
+
 def test_latency_summary_reports_median_and_interpolated_tails():
     from mambapose_opt.latency import LatencySummary
 
@@ -105,9 +217,13 @@ def test_latency_admission_rejects_unlocked_lease_before_model_or_cuda(
         tmp_path, monkeypatch):
     import hashlib
     import json
+    import sys
     import tools.optimization.measure_latency as tool
     from mambapose_opt.schema import CandidateSpec
 
+    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '1')
+    monkeypatch.setenv('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    monkeypatch.setattr(sys, 'dont_write_bytecode', True)
     __import__('subprocess').run(['git', 'init', '-q'], cwd=tmp_path, check=True)
 
     (tmp_path / 'config.py').write_text('model = dict()')

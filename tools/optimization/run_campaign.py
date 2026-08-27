@@ -73,6 +73,7 @@ class SubprocessStageRunner:
         environment.update({
             'PYTHONNOUSERSITE': '1',
             'PYTHONDONTWRITEBYTECODE': '1',
+            'CUBLAS_WORKSPACE_CONFIG': ':4096:8',
             'CUDA_VISIBLE_DEVICES': str(self.device_index),
             'MAMBAPOSE_PHYSICAL_DEVICE_INDEX': str(self.device_index),
             'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1',
