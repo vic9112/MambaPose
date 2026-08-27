@@ -120,6 +120,7 @@ def _evaluate_mode(
     environment = os.environ.copy()
     environment.update({
         'PYTHONNOUSERSITE': '1',
+        'PYTHONDONTWRITEBYTECODE': '1',
         'CUBLAS_WORKSPACE_CONFIG': ':4096:8',
         'MAMBAPOSE_OPTIMIZATION_SEED': str(candidate.seed),
     })
