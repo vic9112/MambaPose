@@ -135,7 +135,7 @@ class SubprocessStageRunner:
             'latency': 'measure_latency.py',
             'compare': 'compare_candidates.py',
         }[stage]
-        if stage in {'evaluate', 'latency'}:
+        if stage in {'train', 'evaluate', 'latency'}:
             common = [
                 candidate.id, '--manifest', str(self.manifest_path),
                 '--output', self._relative(artifact),

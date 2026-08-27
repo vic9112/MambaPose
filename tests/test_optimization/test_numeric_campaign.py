@@ -1,6 +1,7 @@
 import hashlib
 import json
 import subprocess
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 
@@ -120,13 +121,34 @@ def _write_evaluation_authority(repository):
 
 def _formal_evaluation(
         *, candidate, source, source_config, checkpoint, checkpoint_sha,
-        config_sha, inventory_sha, ap):
-    provenance = {
-        'checkpoint_sha256': checkpoint_sha,
-        'config_sha256': config_sha,
-        'data_inventory_sha256': inventory_sha,
-        'git_commit': source['git_commit'],
-    }
+        mode_config_shas, inventory_sha, ap):
+    def row(config_sha):
+        provenance = {
+            'checkpoint_sha256': checkpoint_sha,
+            'config_sha256': config_sha,
+            'data_inventory_sha256': inventory_sha,
+            'git_commit': source['git_commit'],
+        }
+        determinism = {
+            'python_seed': candidate.seed, 'numpy_seed': candidate.seed,
+            'torch_seed': candidate.seed, 'worker_count': 2,
+            'workers': [{
+                'worker_id': worker_id,
+                'torch_seed_source': 'torch.initial_seed()',
+                'python_seed_derivation': 'torch_seed % 2**32',
+                'numpy_seed_derivation': 'torch_seed % 2**32',
+            } for worker_id in range(2)],
+            'persistent_workers': False, 'order_hashes': {'0': 'e' * 64},
+            'provenance': provenance,
+        }
+        return {
+            'metrics': {
+                'unit': 'percentage_points', 'AP': ap, 'AP50': 89.7,
+                'AP75': 80.5, 'APM': 69.4, 'APL': 79.2, 'AR': 78.2},
+            'provenance': provenance, 'determinism': determinism,
+            'protocol': protocol,
+        }
+
     protocol = {
         'dataset': 'coco', 'split': 'val2017', 'complete_split': True,
         'batch_size': 1,
@@ -167,19 +189,6 @@ def _formal_evaluation(
             'detection_observed_sha256': '2' * 64,
         },
     }
-    determinism = {
-        'python_seed': candidate.seed, 'numpy_seed': candidate.seed,
-        'torch_seed': candidate.seed, 'worker_count': 0, 'workers': [],
-        'persistent_workers': False, 'order_hashes': {'0': 'e' * 64},
-        'provenance': provenance,
-    }
-    row = {
-        'metrics': {
-            'unit': 'percentage_points', 'AP': ap, 'AP50': 89.7,
-            'AP75': 80.5, 'APM': 69.4, 'APL': 79.2, 'AR': 78.2},
-        'provenance': provenance, 'determinism': determinism,
-        'protocol': protocol,
-    }
     return {
         'schema_version': 1, 'candidate_id': candidate.id,
         'stage': 'evaluate',
@@ -189,10 +198,28 @@ def _formal_evaluation(
                 'train2017'
                 if candidate.features.get('numeric_kind') == 'w8a8'
                 else None),
-            'modes': {'flip': row, 'no_flip': deepcopy(row)},
+            'modes': {
+                'flip': row(mode_config_shas['flip']),
+                'no_flip': row(mode_config_shas['no_flip']),
+            },
             'source': source,
         },
     }
+
+
+def _producer_mode_config_shas(candidate, config_path):
+    from tools.optimization.evaluate_candidate import (
+        _deterministic_config, _dump_config)
+
+    hashes = {}
+    with tempfile.TemporaryDirectory() as directory:
+        for mode in ('flip', 'no_flip'):
+            resolved = Path(directory) / f'resolved-{mode}.py'
+            _dump_config(
+                _deterministic_config(
+                    candidate, mode == 'flip', config_path), resolved)
+            hashes[mode] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    return hashes
 
 
 def test_route3_stage_plans_follow_numeric_admission_order():
@@ -724,10 +751,19 @@ def _w8a8_recovery_fixture(tmp_path, monkeypatch):
     teacher_sha = file_sha256(teacher_checkpoint)
     baseline_config = tmp_path / 'configs/reproduction/coco_s_v1.py'
     teacher_config = tmp_path / 'configs/reproduction/coco_b.py'
-    baseline_config.write_text('model = dict(type="S-V1")\n')
+    evaluation_config = (
+        'model = dict(type="S-V1", test_cfg=dict(flip_test=True))\n'
+        'train_dataloader = dict(batch_size=1, num_workers=0, '
+        'persistent_workers=False)\n'
+        'val_dataloader = dict(batch_size=1, num_workers=0, '
+        'persistent_workers=False)\n'
+        'test_dataloader = dict(batch_size=1, num_workers=0, '
+        'persistent_workers=False)\n')
+    baseline_config.write_text(evaluation_config)
     teacher_config.write_text('model = dict(type="B")\n')
     policy = tmp_path / 'configs/numeric/w8a8.py'
     policy.write_text(
+        evaluation_config +
         'custom_imports = dict(\n'
         "    imports=['mambapose_opt.numeric_conversion'],\n"
         '    allow_failed_imports=False)\n'
@@ -877,19 +913,23 @@ def _w8a8_recovery_fixture(tmp_path, monkeypatch):
         calibration_path.parent.parent / 'evaluate/evaluate.json')
     baseline_evaluation_path.parent.mkdir(parents=True)
     screen_evaluation_path.parent.mkdir()
+    baseline_mode_config_shas = _producer_mode_config_shas(
+        baseline, baseline_config)
+    screen_mode_config_shas = _producer_mode_config_shas(
+        screen, runtime_config)
     baseline_evaluation_path.write_text(json.dumps(_formal_evaluation(
         candidate=baseline, source=baseline_source,
         source_config=baseline.config.as_posix(),
         checkpoint=baseline.checkpoint.as_posix(),
         checkpoint_sha=baseline.checkpoint_sha256,
-        config_sha=file_sha256(baseline_config),
+        mode_config_shas=baseline_mode_config_shas,
         inventory_sha=inventory_sha, ap=72.8)))
     screen_evaluation_path.write_text(json.dumps(_formal_evaluation(
         candidate=screen, source=screen_source,
         source_config=runtime_config.relative_to(tmp_path).as_posix(),
         checkpoint=screen.checkpoint.as_posix(),
         checkpoint_sha=screen.checkpoint_sha256,
-        config_sha=file_sha256(runtime_config),
+        mode_config_shas=screen_mode_config_shas,
         inventory_sha=inventory_sha, ap=72.49)))
 
     recovery_stage = (
@@ -993,6 +1033,9 @@ def _w8a8_recovery_fixture(tmp_path, monkeypatch):
         'baseline': baseline, 'teacher': teacher, 'screen': screen,
         'recovery': recovery, 'screen_manifest': screen_manifest,
         'screen_commit': screen_commit,
+        'baseline_mode_config_shas': baseline_mode_config_shas,
+        'screen_mode_config_shas': screen_mode_config_shas,
+        'screen_runtime_config': runtime_config,
         'recovery_manifest': recovery_manifest,
         'calibration_path': calibration_path,
         'calibration_reference': calibration_reference,
@@ -1004,6 +1047,94 @@ def _w8a8_recovery_fixture(tmp_path, monkeypatch):
         'metadata_path': metadata_path, 'train': train,
         'train_path': train_path,
     }
+
+
+def test_recovery_train_runner_forwards_follow_on_manifest_to_child_lookup(
+        tmp_path, monkeypatch):
+    from tools.optimization import run_campaign, train_candidate
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    recovery = fixture['recovery']
+    manifest = fixture['recovery_manifest']
+    artifact = fixture['recovery_stage'] / 'train.json'
+    monkeypatch.setattr(run_campaign, 'REPO_ROOT', tmp_path)
+    runner = run_campaign.SubprocessStageRunner(
+        tmp_path / 'work_dirs/optimization', manifest)
+
+    command = runner._command(recovery, 'train', artifact)
+
+    assert command == [
+        str(tmp_path / '.venv/bin/python'),
+        str(tmp_path / 'tools/optimization/train_candidate.py'),
+        recovery.id, '--manifest', str(manifest),
+        '--output', artifact.relative_to(tmp_path).as_posix(),
+    ]
+    assert train_candidate._candidate(manifest, recovery.id) == recovery
+    with pytest.raises(ValueError, match='resolve exactly once'):
+        train_candidate._candidate(fixture['screen_manifest'], recovery.id)
+
+
+def test_recovery_admission_authenticates_evaluator_mode_config_hashes(
+        tmp_path, monkeypatch):
+    from mambapose_opt.numeric_runtime import validate_recovery_admission
+    from mambapose_opt.numeric_source import file_sha256
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    runtime_sha = file_sha256(fixture['screen_runtime_config'])
+    mode_shas = fixture['screen_mode_config_shas']
+    assert mode_shas['flip'] != runtime_sha
+    assert mode_shas['no_flip'] != runtime_sha
+    assert mode_shas['flip'] != mode_shas['no_flip']
+
+    admitted = validate_recovery_admission(
+        fixture['admission_path'], candidate=fixture['recovery'],
+        repository_root=tmp_path,
+        manifest_path=fixture['recovery_manifest'])
+
+    assert admitted['preliminary_ap_drop'] == pytest.approx(0.31)
+
+
+def test_recovery_admission_rejects_runtime_input_hash_as_mode_provenance(
+        tmp_path, monkeypatch):
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, validate_recovery_admission)
+    from mambapose_opt.numeric_source import file_sha256
+    from mambapose_opt.schema import load_candidate_manifest
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    evaluations = {
+        'recovery_baseline_evaluation_sha256': (
+            fixture['baseline_evaluation_path'],
+            file_sha256(tmp_path / fixture['baseline'].config)),
+        'recovery_candidate_evaluation_sha256': (
+            fixture['screen_evaluation_path'],
+            file_sha256(fixture['screen_runtime_config'])),
+    }
+    for evaluation_path, runtime_sha in evaluations.values():
+        evaluation = json.loads(evaluation_path.read_text())
+        for row in evaluation['result']['modes'].values():
+            row['provenance']['config_sha256'] = runtime_sha
+            row['determinism']['provenance']['config_sha256'] = runtime_sha
+        evaluation_path.write_text(json.dumps(evaluation))
+    recovery_manifest = json.loads(fixture['recovery_manifest'].read_text())
+    for feature, (evaluation_path, _runtime_sha) in evaluations.items():
+        recovery_manifest['candidates'][0]['features'][feature] = file_sha256(
+            evaluation_path)
+    fixture['recovery_manifest'].write_text(json.dumps(recovery_manifest))
+    admission = json.loads(fixture['admission_path'].read_text())
+    admission['baseline_evaluation']['sha256'] = file_sha256(
+        fixture['baseline_evaluation_path'])
+    admission['candidate_evaluation']['sha256'] = file_sha256(
+        fixture['screen_evaluation_path'])
+    fixture['admission_path'].write_text(json.dumps(admission))
+    _commit_fixture(tmp_path, 'authorize wrong runtime-input mode hashes')
+    recovery = load_candidate_manifest(fixture['recovery_manifest'])[0]
+
+    with pytest.raises(NumericRuntimeError, match='config hash'):
+        validate_recovery_admission(
+            fixture['admission_path'], candidate=recovery,
+            repository_root=tmp_path,
+            manifest_path=fixture['recovery_manifest'])
 
 
 def test_w8a8_recovery_uses_screen_manifest_calibration_and_trained_checkpoint(

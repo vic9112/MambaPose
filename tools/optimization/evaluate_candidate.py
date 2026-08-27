@@ -23,10 +23,10 @@ if str(REPO_ROOT) not in sys.path:
 from mmengine.config import Config
 
 from mambapose_opt.determinism import (
-    build_determinism_record, deterministic_dataloader_config,
-    repeated_order_hash)
+    build_determinism_record, repeated_order_hash)
 from mambapose_opt.evaluation import (
-    build_source_binding, load_coco_metrics, stage_envelope,
+    build_deterministic_evaluation_config, build_source_binding,
+    load_coco_metrics, stage_envelope,
     validate_coco_val_protocol)
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
@@ -86,21 +86,7 @@ def _git_commit() -> str:
     return clean_git_commit(REPO_ROOT)
 
 
-def _deterministic_config(
-        candidate: CandidateSpec, flip_test: bool, config_path: Path) -> Config:
-    config = Config.fromfile(config_path)
-    config.randomness = dict(seed=candidate.seed, deterministic=True)
-    configured_imports = list(
-        config.get('custom_imports', {}).get('imports', ()))
-    if 'mambapose_opt.determinism' not in configured_imports:
-        configured_imports.append('mambapose_opt.determinism')
-    config.custom_imports = dict(
-        imports=configured_imports, allow_failed_imports=False)
-    for name in ('train_dataloader', 'val_dataloader', 'test_dataloader'):
-        config[name] = deterministic_dataloader_config(
-            config[name], seed=candidate.seed, worker_count=2)
-    config.model.test_cfg.flip_test = flip_test
-    return config
+_deterministic_config = build_deterministic_evaluation_config
 
 
 def _evaluate_mode(

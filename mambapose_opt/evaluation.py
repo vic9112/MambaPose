@@ -189,6 +189,42 @@ def build_source_binding(
     }
 
 
+def build_deterministic_evaluation_config(
+        candidate: CandidateSpec, flip_test: bool, config_path: Path):
+    """Reconstruct the exact config serialized by the evaluation producer."""
+    if flip_test is not True and flip_test is not False:
+        raise MetricError('flip_test must be a boolean')
+    from mmengine.config import Config
+
+    from mambapose_opt.determinism import deterministic_dataloader_config
+
+    config = Config.fromfile(config_path)
+    config.randomness = dict(seed=candidate.seed, deterministic=True)
+    configured_imports = list(
+        config.get('custom_imports', {}).get('imports', ()))
+    if 'mambapose_opt.determinism' not in configured_imports:
+        configured_imports.append('mambapose_opt.determinism')
+    config.custom_imports = dict(
+        imports=configured_imports, allow_failed_imports=False)
+    for name in ('train_dataloader', 'val_dataloader', 'test_dataloader'):
+        config[name] = deterministic_dataloader_config(
+            config[name], seed=candidate.seed, worker_count=2)
+    config.model.test_cfg.flip_test = flip_test
+    return config
+
+
+def evaluation_mode_config_sha256(
+        candidate: CandidateSpec, *, flip_test: bool,
+        config_path: Path) -> str:
+    """Hash the canonical mode-specific Python config dump."""
+    config = build_deterministic_evaluation_config(
+        candidate, flip_test, config_path)
+    serialized = config.dump()
+    if not isinstance(serialized, str):
+        raise MetricError('deterministic evaluation config is not serializable')
+    return _bytes_sha256(serialized.encode('utf-8'))
+
+
 def _official_authority_expectations(value: object) -> dict[str, Any]:
     top_fields = {
         'schema_version', 'dataset', 'split', 'inventory', 'annotation',

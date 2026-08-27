@@ -189,7 +189,8 @@ def _evaluation_ap(
     try:
         value = json.loads(path.read_text(encoding='utf-8'))
         from .evaluation import (
-            resolve_artifact_source, validate_evaluation_envelope)
+            evaluation_mode_config_sha256, resolve_artifact_source,
+            validate_evaluation_envelope)
         source, selected, authority = resolve_artifact_source(
             value, repository_root=repository_root,
             expected_manifest_path=manifest_path)
@@ -212,11 +213,17 @@ def _evaluation_ap(
             expected_git_commit=source['git_commit'],
             expected_source_binding=source, expected_authority=authority,
             require_source_binding=True)
+        expected_mode_hashes = {
+            mode: evaluation_mode_config_sha256(
+                candidate, flip_test=mode == 'flip',
+                config_path=runtime['config_path'])
+            for mode in ('flip', 'no_flip')
+        }
         if any(
                 validated['modes'][mode]['provenance']['config_sha256'] !=
-                runtime['config_sha256'] for mode in ('flip', 'no_flip')):
+                expected_mode_hashes[mode] for mode in ('flip', 'no_flip')):
             raise NumericRuntimeError(
-                'recovery evaluation runtime config hash is invalid')
+                'recovery evaluation mode config hash is invalid')
     except NumericRuntimeError:
         raise
     except (KeyError, OSError, TypeError, ValueError) as error:
