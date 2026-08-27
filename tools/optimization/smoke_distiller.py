@@ -9,9 +9,14 @@ from pathlib import Path
 import sys
 
 
-if os.environ.get('PYTHONDONTWRITEBYTECODE') != '1':
+_REQUIRED_ENVIRONMENT = {
+    'PYTHONDONTWRITEBYTECODE': '1',
+    'CUBLAS_WORKSPACE_CONFIG': ':4096:8',
+}
+if any(os.environ.get(name) != value
+       for name, value in _REQUIRED_ENVIRONMENT.items()):
     environment = os.environ.copy()
-    environment['PYTHONDONTWRITEBYTECODE'] = '1'
+    environment.update(_REQUIRED_ENVIRONMENT)
     os.execve(sys.executable, [sys.executable, *sys.argv], environment)
 sys.dont_write_bytecode = True
 

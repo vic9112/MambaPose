@@ -1389,6 +1389,9 @@ def run_distill_smoke(
     if os.environ.get('PYTHONDONTWRITEBYTECODE') != '1' \
             or not sys.dont_write_bytecode:
         raise RuntimeError('smoke requires PYTHONDONTWRITEBYTECODE=1')
+    if os.environ.get('CUBLAS_WORKSPACE_CONFIG') != ':4096:8':
+        raise RuntimeError(
+            'smoke requires CUBLAS_WORKSPACE_CONFIG=:4096:8 before CUDA')
     if isinstance(device_index, bool) or not isinstance(device_index, int) \
             or device_index < 0:
         raise ValueError('device_index must be a non-negative integer')

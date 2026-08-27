@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 import zipfile
@@ -594,6 +595,8 @@ def test_existing_output_refuses_partial_artifacts_before_preflight(
         tmp_path, monkeypatch):
     import mambapose_opt.distill_smoke as smoke
 
+    monkeypatch.setenv('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+
     output = tmp_path / 'work_dirs/optimization/accuracy-first/existing'
     output.mkdir(parents=True)
     (output / 'partial.pth').write_bytes(b'partial')
@@ -617,6 +620,8 @@ def test_existing_output_refuses_partial_artifacts_before_preflight(
 def test_invalid_preflight_never_enters_gpu_or_creates_partial_output(
         tmp_path, monkeypatch):
     import mambapose_opt.distill_smoke as smoke
+
+    monkeypatch.setenv('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 
     def reject(*args, **kwargs):
         raise RuntimeError('dirty executable source')
@@ -649,6 +654,8 @@ def test_invalid_preflight_never_enters_gpu_or_creates_partial_output(
 def test_real_preflight_rejects_before_data_validation_or_gpu(
         tmp_path, monkeypatch, failure):
     import mambapose_opt.distill_smoke as smoke
+
+    monkeypatch.setenv('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 
     root = tmp_path / 'repo'
     root.mkdir()
@@ -743,3 +750,50 @@ def test_smoke_cli_rejects_output_outside_optimization_before_execution():
 
     assert result.returncode == 2
     assert 'work_dirs/optimization' in result.stderr
+
+
+def test_smoke_cli_reexecutes_with_deterministic_cublas_environment(
+        monkeypatch):
+    root = Path(__file__).resolve().parents[2]
+    script = root / 'tools/optimization/smoke_distiller.py'
+    captured = {}
+
+    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '1')
+    monkeypatch.delenv('CUBLAS_WORKSPACE_CONFIG', raising=False)
+
+    def capture(executable, argv, environment):
+        captured.update({
+            'executable': executable,
+            'argv': argv,
+            'environment': environment,
+        })
+        raise RuntimeError('captured deterministic re-exec')
+
+    monkeypatch.setattr(os, 'execve', capture)
+    with pytest.raises(RuntimeError, match='captured deterministic re-exec'):
+        runpy.run_path(str(script), run_name='smoke_cli_environment_probe')
+
+    assert captured['executable'] == sys.executable
+    assert captured['environment']['PYTHONDONTWRITEBYTECODE'] == '1'
+    assert captured['environment']['CUBLAS_WORKSPACE_CONFIG'] == ':4096:8'
+
+
+def test_run_smoke_rejects_missing_cublas_contract_before_preflight(
+        tmp_path, monkeypatch):
+    import mambapose_opt.distill_smoke as smoke
+
+    monkeypatch.delenv('CUBLAS_WORKSPACE_CONFIG', raising=False)
+    monkeypatch.setattr(
+        smoke, 'build_smoke_preflight',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError('preflight ran without deterministic cuBLAS')))
+
+    with pytest.raises(RuntimeError, match='CUBLAS_WORKSPACE_CONFIG'):
+        smoke.run_distill_smoke(
+            repository_root=tmp_path,
+            config_path=Path(
+                'configs/optimization/accuracy_first/'
+                'distill_s_v1_from_b.py'),
+            output_relative=Path(
+                'work_dirs/optimization/accuracy-first/cublas-contract'),
+            device_index=0)
