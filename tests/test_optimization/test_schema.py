@@ -71,6 +71,23 @@ def test_candidate_manifest_rejects_duplicate_ids(tmp_path):
         load_candidate_manifest(path)
 
 
+@pytest.mark.parametrize('identifier', [
+    '../../escaped',
+    'contains/slash',
+    '.hidden',
+    'white space',
+])
+def test_candidate_manifest_rejects_path_unsafe_identifier(
+        tmp_path, identifier):
+    from mambapose_opt.schema import CandidateManifestError, load_candidate_manifest
+
+    path = tmp_path / 'candidates.json'
+    _write_manifest(path, [_candidate(id=identifier)])
+
+    with pytest.raises(CandidateManifestError, match='candidate id'):
+        load_candidate_manifest(path)
+
+
 def test_candidate_manifest_loads_frozen_scalar_records(tmp_path):
     from mambapose_opt.schema import load_candidate_manifest
 

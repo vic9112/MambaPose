@@ -7,7 +7,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .gpu_guard import ExternalGpuContention, query_compute_processes
+from .gpu_guard import (
+    ExternalGpuContention,
+    controller_process_tree,
+    query_compute_processes,
+)
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -29,12 +33,15 @@ def _parse_time(value: Any) -> datetime | None:
         return None
 
 
-def observe(root: Path, heartbeat_max_age: float) -> dict[str, Any]:
+def observe(
+        root: Path, heartbeat_max_age: float,
+        *, gpu_lock_path: Path | None = None) -> dict[str, Any]:
     """Derive campaign and GPU health without writing or controlling work."""
     root = Path(root)
     state = _load(root / 'state.json')
     heartbeat = _load(root / 'heartbeat.json')
-    lease = _load(root / 'gpu.lock')
+    lease = _load(Path(gpu_lock_path) if gpu_lock_path else root / 'gpu.lock')
+    plan = _load(root / 'campaign-plan.json')
     now = datetime.now(timezone.utc)
     heartbeat_time = _parse_time(heartbeat.get('timestamp'))
     heartbeat_age = (
@@ -45,10 +52,24 @@ def observe(root: Path, heartbeat_max_age: float) -> dict[str, Any]:
         isinstance(pid, int) and pid > 0 and Path(f'/proc/{pid}').exists())
     stage = state.get('stage', 'not_started')
 
-    if stage in {'blocked', 'exhausted'}:
+    run_ids = plan.get('run_ids')
+    expected = (
+        tuple(run_ids)
+        if isinstance(run_ids, list)
+        and all(isinstance(run_id, str) for run_id in run_ids)
+        else ())
+    runs = state.get('runs') if isinstance(state.get('runs'), dict) else {}
+    completed_runs = sum(
+        runs.get(run_id, {}).get('status') == 'complete'
+        for run_id in expected)
+    campaign_complete = bool(expected) and completed_runs == len(expected)
+
+    if campaign_complete:
+        health = 'complete'
+    elif stage in {'blocked', 'exhausted'}:
         health = 'failed'
     elif stage == 'complete':
-        health = 'complete'
+        health = 'incomplete'
     elif stage in {'running', 'retry_wait'}:
         if heartbeat_age is None:
             health = 'starting' if stage == 'running' else 'waiting'
@@ -65,6 +86,7 @@ def observe(root: Path, heartbeat_max_age: float) -> dict[str, Any]:
         if isinstance(pid, int) and pid > 0
     }
     try:
+        allowed = set(controller_process_tree(allowed)) if allowed else set()
         owners = query_compute_processes(int(device_index))
         external = sorted(owner.pid for owner in owners if owner.pid not in allowed)
         gpu_status = 'available'
@@ -84,6 +106,8 @@ def observe(root: Path, heartbeat_max_age: float) -> dict[str, Any]:
         'process_alive': process_alive,
         'pid': pid,
         'stage_id': heartbeat.get('stage_id'),
+        'completed_runs': completed_runs,
+        'expected_runs': len(expected),
         'gpu_status': gpu_status,
         'gpu_processes': [
             {

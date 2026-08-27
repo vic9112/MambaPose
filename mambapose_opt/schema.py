@@ -23,6 +23,7 @@ _KINDS = frozenset({
     'float', 'structural', 'fake-quant', 'pwl', 'binary-qk', 'integrated',
 })
 _SHA256 = re.compile(r'^[0-9a-f]{64}$')
+_IDENTIFIER = re.compile(r'^[a-z0-9][a-z0-9._-]{0,127}$')
 
 
 class CandidateManifestError(ValueError):
@@ -52,8 +53,11 @@ class CandidateSpec:
             raise CandidateManifestError(f'candidate is missing fields: {sorted(missing)}')
 
         identifier = value['id']
-        if not isinstance(identifier, str) or not identifier:
-            raise CandidateManifestError('candidate id must be a non-empty string')
+        if (
+                not isinstance(identifier, str)
+                or not _IDENTIFIER.fullmatch(identifier)):
+            raise CandidateManifestError(
+                'candidate id must be a path-safe lowercase identifier')
 
         route = value['route']
         if not isinstance(route, str) or route not in _ROUTES:

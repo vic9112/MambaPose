@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mambapose_opt.observe import observe
+from tools.optimization.run_campaign import _canonical_gpu_lock
 
 
 def main() -> int:
@@ -22,9 +23,17 @@ def main() -> int:
         '--campaign-root', type=Path,
         default=REPO_ROOT / 'work_dirs/optimization')
     parser.add_argument('--heartbeat-max-age', type=float, default=180.0)
+    parser.add_argument('--gpu-lock-path', type=Path)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
-    status = observe(args.campaign_root, args.heartbeat_max_age)
+    try:
+        gpu_lock_path = args.gpu_lock_path or _canonical_gpu_lock()
+    except Exception as error:
+        print(f'cannot derive canonical GPU lock: {error}', file=sys.stderr)
+        return 1
+    status = observe(
+        args.campaign_root, args.heartbeat_max_age,
+        gpu_lock_path=gpu_lock_path)
     print(json.dumps(status, indent=2, sort_keys=True))
     return (
         1 if args.check and status['health'] in {'failed', 'stalled'}

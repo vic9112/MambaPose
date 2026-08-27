@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 
 def _sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -46,6 +48,35 @@ def _outcome(stage, artifact, *, exit_code=0, valid=True, fingerprint='ok'):
     )
 
 
+def _write_generic_artifact(path, stage, candidate_id='fixture'):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        'schema_version': 1,
+        'candidate_id': candidate_id,
+        'stage': stage,
+        'result': {},
+    }))
+
+
+def _write_profile_artifact(path, candidate):
+    path.write_text(json.dumps({
+        'schema_version': 1,
+        'git_commit': 'a' * 40,
+        'candidate': candidate.id,
+        'config': candidate.config.as_posix(),
+        'checkpoint': candidate.checkpoint.as_posix(),
+        'checkpoint_sha256': candidate.checkpoint_sha256,
+        'input_shapes': [1, 3, 256, 192],
+        'output_shapes': [1, 17, 64, 48],
+        'parameters': {
+            'total': 1, 'trainable': 1,
+            'bytes_by_dtype': {'torch.float32': 4},
+            'by_prefix': {'model': 1},
+        },
+        'modules': [],
+    }))
+
+
 def _mock_lease(monkeypatch, entered):
     from mambapose_opt import controller
     from mambapose_opt.gpu_guard import GpuLease
@@ -70,8 +101,7 @@ def test_stage_completes_only_after_artifacts_validate(tmp_path, monkeypatch):
 
     def runner(candidate, stage, stage_dir, attempt):
         artifact = stage_dir / 'metrics.json'
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact.write_text('{"AP": 72.8}\n')
+        _write_generic_artifact(artifact, stage)
         return _outcome(stage, artifact, valid=False)
 
     campaign = tmp_path / 'work_dirs/optimization'
@@ -111,8 +141,20 @@ def test_contention_returns_75_and_retry_lineage_is_append_only(
     assert first.exit_code == second.exit_code == 75
     run = StateStore(campaign).read()['runs']['fixture:train']
     assert run['status'] == 'retry_wait'
-    assert [item['attempt'] for item in run['retry_lineage']] == [1, 2]
-    assert all(item['exit_code'] == 75 for item in run['retry_lineage'])
+    assert [
+        (item['attempt'], item['status'])
+        for item in run['retry_lineage']
+    ] == [
+        (1, 'started'), (1, 'retry_wait'),
+        (2, 'started'), (2, 'retry_wait'),
+    ]
+    terminal = [
+        item for item in run['retry_lineage']
+        if item['status'] == 'retry_wait'
+    ]
+    assert all(item['exit_code'] == 75 for item in terminal)
+    assert [item['retry_delay_seconds'] for item in terminal] == [30, 120]
+    assert run['retry_delay_seconds'] == 120
     events = [
         json.loads(line)
         for line in (campaign / 'events.jsonl').read_text().splitlines()
@@ -154,8 +196,10 @@ def test_all_cuda_stages_share_one_lease_and_compare_is_cpu_only(
 
     def runner(candidate, stage, stage_dir, attempt):
         artifact = stage_dir / f'{stage}.json'
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact.write_text('{}\n')
+        if stage == 'profile':
+            _write_profile_artifact(artifact, candidate)
+        else:
+            _write_generic_artifact(artifact, stage)
         return _outcome(stage, artifact)
 
     instance = OptimizationController(
@@ -173,7 +217,7 @@ def test_checkpoint_retention_keeps_best_and_two_valid_resume_points(tmp_path):
 
     paths = []
     for name in ('best_AP_epoch_4.pth', 'epoch_1.pth', 'epoch_2.pth',
-                 'epoch_3.pth', 'epoch_4.pth'):
+                 'epoch_3.pth', 'epoch_4.pth', 'deployment.pth'):
         path = tmp_path / name
         path.write_bytes(name.encode())
         paths.append(path)
@@ -186,7 +230,67 @@ def test_checkpoint_retention_keeps_best_and_two_valid_resume_points(tmp_path):
     assert {path.name for path in kept} == {
         'best_AP_epoch_4.pth', 'epoch_4.pth', 'epoch_2.pth'}
     assert {path.name for path in tmp_path.glob('*.pth')} == {
-        'best_AP_epoch_4.pth', 'epoch_4.pth', 'epoch_2.pth'}
+        'best_AP_epoch_4.pth', 'epoch_4.pth', 'epoch_2.pth',
+        'deployment.pth'}
+
+
+def test_retention_requires_sufficient_valid_set_before_deleting(tmp_path):
+    from mambapose_opt.controller import (
+        CheckpointRetentionError,
+        retain_checkpoints,
+    )
+
+    for name in ('best_AP_epoch_2.pth', 'epoch_1.pth', 'broken.pth'):
+        (tmp_path / name).write_bytes(name.encode())
+    before = {path.name: path.read_bytes() for path in tmp_path.glob('*.pth')}
+
+    with pytest.raises(CheckpointRetentionError, match='two valid resume'):
+        retain_checkpoints(tmp_path, validator=lambda path: True)
+
+    assert {
+        path.name: path.read_bytes() for path in tmp_path.glob('*.pth')
+    } == before
+
+
+def test_retention_validator_exception_does_not_delete_anything(tmp_path):
+    from mambapose_opt.controller import CheckpointRetentionError, retain_checkpoints
+
+    for name in ('best_AP_epoch_3.pth', 'epoch_1.pth', 'epoch_2.pth'):
+        (tmp_path / name).write_bytes(name.encode())
+
+    with pytest.raises(CheckpointRetentionError, match='validation failed'):
+        retain_checkpoints(
+            tmp_path,
+            validator=lambda path: (_ for _ in ()).throw(ValueError('bad')),
+        )
+
+    assert len(tuple(tmp_path.glob('*.pth'))) == 3
+
+
+def test_default_checkpoint_contract_accepts_real_best_and_resume_shapes(
+        tmp_path):
+    import torch
+
+    from mambapose_opt.controller import OptimizationController
+
+    best = tmp_path / 'best_AP_epoch_3.pth'
+    resume_a = tmp_path / 'epoch_2.pth'
+    resume_b = tmp_path / 'epoch_3.pth'
+    torch.save({
+        'state_dict': {'weight': torch.ones(1)},
+        'meta': {'epoch': 3},
+    }, best)
+    for epoch, path in ((2, resume_a), (3, resume_b)):
+        torch.save({
+            'state_dict': {'weight': torch.ones(1)},
+            'meta': {'epoch': epoch},
+            'optimizer': {'state': {}},
+            'param_schedulers': [{}],
+        }, path)
+
+    assert OptimizationController._checkpoint_is_valid(best) is True
+    assert OptimizationController._checkpoint_is_valid(resume_a) is True
+    assert OptimizationController._checkpoint_is_valid(resume_b) is True
 
 
 def test_completed_train_stage_applies_checkpoint_retention(
@@ -203,7 +307,7 @@ def test_completed_train_stage_applies_checkpoint_retention(
                 'epoch_3.pth', 'epoch_4.pth'):
             (stage_dir / name).write_bytes(name.encode())
         artifact = stage_dir / 'train.json'
-        artifact.write_text('{}\n')
+        _write_generic_artifact(artifact, stage)
         return _outcome(stage, artifact)
 
     instance = OptimizationController(
@@ -218,3 +322,502 @@ def test_completed_train_stage_applies_checkpoint_retention(
     assert result.exit_code == 0
     assert {path.name for path in checkpoint_dir.glob('*.pth')} == {
         'best_AP_epoch_4.pth', 'epoch_4.pth', 'epoch_2.pth'}
+
+
+def test_train_with_insufficient_checkpoints_is_blocked_without_deletion(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_repro.state import StateStore
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        (stage_dir / 'best_AP_epoch_1.pth').write_bytes(b'best')
+        (stage_dir / 'epoch_1.pth').write_bytes(b'resume')
+        artifact = stage_dir / 'train.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    campaign = tmp_path / 'work_dirs/optimization'
+    result = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('train',), checkpoint_validator=lambda path: True).run_next()
+    stage_dir = campaign / 'accuracy-first/fixture/0/train'
+
+    assert result.exit_code == 78
+    assert StateStore(campaign).read()['runs']['fixture:train']['status'] == 'blocked'
+    assert {path.name for path in stage_dir.glob('*.pth')} == {
+        'best_AP_epoch_1.pth', 'epoch_1.pth'}
+
+
+def test_not_json_artifact_is_blocked_with_exit_78(tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'evaluate.json'
+        artifact.write_text('not-json')
+        return _outcome(stage, artifact)
+
+    result = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path, stages=('evaluate',)).run_next()
+
+    assert result.exit_code == 78
+    assert result.artifacts_valid is False
+
+
+def test_generic_artifact_identity_and_stage_are_mandatory(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'evaluate.json'
+        _write_generic_artifact(
+            artifact, 'latency', candidate_id='different-candidate')
+        return _outcome(stage, artifact)
+
+    result = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path, stages=('evaluate',)).run_next()
+
+    assert result.exit_code == 78
+
+
+def test_existing_profile_schema_is_accepted(tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'profile.json'
+        _write_profile_artifact(artifact, candidate)
+        return _outcome(stage, artifact)
+
+    result = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path, stages=('profile',)).run_next()
+
+    assert result.exit_code == 0
+
+
+def test_complete_stage_evidence_is_persisted_and_revalidated(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_repro.state import StateStore
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+    calls = []
+
+    def runner(candidate, stage, stage_dir, attempt):
+        calls.append(attempt)
+        artifact = stage_dir / 'evaluate.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    campaign = tmp_path / 'work_dirs/optimization'
+    first = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('evaluate',)).run_next()
+    run = StateStore(campaign).read()['runs']['fixture:evaluate']
+
+    assert first.exit_code == 0
+    assert run['artifact_evidence'] == [{
+        'path': 'accuracy-first/fixture/0/evaluate/evaluate.json',
+        'sha256': _sha256(
+            campaign / 'accuracy-first/fixture/0/evaluate/evaluate.json'),
+        'schema': 'optimization-stage-envelope-v1',
+    }]
+
+    artifact = campaign / run['artifact_evidence'][0]['path']
+    artifact.write_text('tampered')
+    second = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('evaluate',)).run_next()
+
+    assert second.stage == 'evaluate'
+    assert calls == [1, 2]
+
+
+def test_isolated_campaign_roots_collide_on_canonical_gpu_lock(
+        tmp_path, monkeypatch):
+    from mambapose_opt import gpu_guard
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    monkeypatch.setattr(gpu_guard, 'query_compute_processes', lambda _: ())
+    canonical_lock = tmp_path / 'shared/work_dirs/optimization/gpu.lock'
+    nested_results = []
+
+    def second_runner(*args):
+        raise AssertionError('contended runner must not start')
+
+    second = OptimizationController(
+        tmp_path / 'route-b/work_dirs/optimization', candidate,
+        second_runner, repository_root=tmp_path, stages=('evaluate',),
+        gpu_lock_path=canonical_lock)
+
+    def first_runner(candidate, stage, stage_dir, attempt):
+        nested_results.append(second.run_next())
+        artifact = stage_dir / 'evaluate.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    first = OptimizationController(
+        tmp_path / 'route-a/work_dirs/optimization', candidate,
+        first_runner, repository_root=tmp_path, stages=('evaluate',),
+        gpu_lock_path=canonical_lock)
+
+    assert first.run_next().exit_code == 0
+    assert nested_results[0].exit_code == 75
+    assert canonical_lock.is_file()
+
+
+def test_device_one_is_used_for_admission_and_runner_environment(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+    from tools.optimization.run_campaign import SubprocessStageRunner
+
+    candidate = _candidate(tmp_path)
+    entered = []
+    _mock_lease(monkeypatch, entered)
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'latency.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    result = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path, stages=('latency',), device_index=1,
+        gpu_lock_path=(
+            tmp_path / 'shared/work_dirs/optimization/gpu.lock')).run_next()
+
+    subprocess_runner = SubprocessStageRunner(
+        tmp_path / 'work_dirs/optimization',
+        tmp_path / 'optimization/candidates.json',
+        device_index=1,
+    )
+    assert result.exit_code == 0
+    assert entered[0][1] == 1
+    assert subprocess_runner.environment()['CUDA_VISIBLE_DEVICES'] == '1'
+
+
+@pytest.mark.parametrize('stage', ['calibrate', 'evaluate', 'latency'])
+def test_every_non_profile_cuda_stage_uses_the_shared_lease(
+        tmp_path, monkeypatch, stage):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    entered = []
+    _mock_lease(monkeypatch, entered)
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / f'{stage}.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    result = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path, stages=(stage,),
+        gpu_lock_path=(
+            tmp_path / 'shared/work_dirs/optimization/gpu.lock')).run_next()
+
+    assert result.exit_code == 0
+    assert [record[2] for record in entered] == [f'fixture:{stage}']
+
+
+def test_compare_is_serialized_by_controller_wide_single_writer_lock(
+        tmp_path):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    campaign = tmp_path / 'work_dirs/optimization'
+    nested = []
+
+    def must_not_run(*args):
+        raise AssertionError('concurrent compare runner must not start')
+
+    second = OptimizationController(
+        campaign, candidate, must_not_run, repository_root=tmp_path,
+        stages=('compare',))
+
+    def first_runner(candidate, stage, stage_dir, attempt):
+        nested.append(second.run_next())
+        artifact = stage_dir / 'compare.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    first = OptimizationController(
+        campaign, candidate, first_runner, repository_root=tmp_path,
+        stages=('compare',))
+
+    assert first.run_next().exit_code == 0
+    assert nested[0].exit_code == 75
+
+
+def test_crashed_attempt_remains_in_lineage_when_next_process_resumes(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_repro.state import StateStore
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+    campaign = tmp_path / 'work_dirs/optimization'
+
+    def crash(*args):
+        raise KeyboardInterrupt('simulated process loss')
+
+    with pytest.raises(KeyboardInterrupt, match='simulated process loss'):
+        OptimizationController(
+            campaign, candidate, crash, repository_root=tmp_path,
+            stages=('evaluate',)).run_next()
+
+    def resume(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'evaluate.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    result = OptimizationController(
+        campaign, candidate, resume, repository_root=tmp_path,
+        stages=('evaluate',)).run_next()
+    lineage = StateStore(campaign).read()[
+        'runs']['fixture:evaluate']['retry_lineage']
+
+    assert result.exit_code == 0
+    assert [(item['attempt'], item['status']) for item in lineage] == [
+        (1, 'started'),
+        (2, 'started'),
+        (2, 'complete'),
+    ]
+
+
+def test_controller_writes_immutable_expected_run_plan(tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+    campaign = tmp_path / 'work_dirs/optimization'
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'evaluate.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    result = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('evaluate',),
+        expected_run_ids=('fixture:evaluate', 'other:evaluate')).run_next()
+
+    assert result.exit_code == 0
+    assert json.loads((campaign / 'campaign-plan.json').read_text()) == {
+        'schema_version': 1,
+        'run_ids': ['fixture:evaluate', 'other:evaluate'],
+    }
+
+    incompatible = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('evaluate',),
+        expected_run_ids=('fixture:evaluate',)).run_next()
+    assert incompatible.exit_code == 78
+    assert 'campaign plan mismatch' in incompatible.message
+
+
+def test_artifact_hash_permission_error_is_normalized_to_blocked_78(
+        tmp_path, monkeypatch):
+    from mambapose_opt import controller
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_repro.state import StateStore
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+    real_sha256 = controller._sha256
+
+    def denied(path):
+        if Path(path).name == 'evaluate.json':
+            raise PermissionError('artifact denied')
+        return real_sha256(path)
+
+    monkeypatch.setattr(controller, '_sha256', denied)
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'evaluate.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    campaign = tmp_path / 'work_dirs/optimization'
+    result = OptimizationController(
+        campaign, candidate, runner, repository_root=tmp_path,
+        stages=('evaluate',)).run_next()
+
+    assert result.exit_code == 78
+    run = StateStore(campaign).read()['runs']['fixture:evaluate']
+    assert run['status'] == 'blocked'
+
+
+def test_additional_validator_value_error_is_normalized_to_blocked_78(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'evaluate.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    def invalid(*args):
+        raise ValueError('validator failed')
+
+    result = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path, stages=('evaluate',),
+        artifact_validator=invalid).run_next()
+
+    assert result.exit_code == 78
+    assert 'validator failed' in result.message
+
+
+def test_additional_validator_runtime_error_is_normalized_to_blocked_78(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'evaluate.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    def invalid(*args):
+        raise RuntimeError('integrity validator crashed')
+
+    result = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path, stages=('evaluate',),
+        artifact_validator=invalid).run_next()
+
+    assert result.exit_code == 78
+    assert 'integrity validator crashed' in result.message
+
+
+def test_checkpoint_validator_value_error_is_normalized_to_blocked_78(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        for name in ('best_AP_epoch_2.pth', 'epoch_1.pth', 'epoch_2.pth'):
+            (stage_dir / name).write_bytes(b'checkpoint')
+        artifact = stage_dir / 'train.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    result = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path, stages=('train',),
+        checkpoint_validator=lambda path: (_ for _ in ()).throw(
+            ValueError('checkpoint validator failed'))).run_next()
+
+    assert result.exit_code == 78
+    assert 'checkpoint validator failed' in result.message
+
+
+@pytest.mark.parametrize(
+    ('campaign_root', 'lock_path'),
+    [
+        ('outside', 'work_dirs/optimization/gpu.lock'),
+        ('work_dirs/optimization', 'arbitrary/gpu.lock'),
+    ],
+)
+def test_controller_rejects_out_of_contract_output_roots(
+        tmp_path, campaign_root, lock_path):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+
+    with pytest.raises(ValueError, match='optimization'):
+        OptimizationController(
+            tmp_path / campaign_root, candidate, lambda *args: None,
+            repository_root=tmp_path, stages=('compare',),
+            gpu_lock_path=tmp_path / lock_path)
+
+
+def test_controller_lock_cannot_escape_campaign_root(tmp_path):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+
+    with pytest.raises(ValueError, match='controller lock'):
+        OptimizationController(
+            tmp_path / 'work_dirs/optimization', candidate,
+            lambda *args: None, repository_root=tmp_path,
+            stages=('compare',),
+            controller_lock_path=tmp_path / 'outside/controller.lock')
+
+
+def test_retry_budget_persists_across_controller_process_restarts(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController, StageOutcome
+    from mambapose_repro.state import StateStore
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+    campaign = tmp_path / 'work_dirs/optimization'
+
+    def transient(candidate, stage, stage_dir, attempt):
+        return StageOutcome(
+            'fixture:evaluate', 'evaluate', 'fixture', 75,
+            f'transient-{attempt}')
+
+    results = [
+        OptimizationController(
+            campaign, candidate, transient, repository_root=tmp_path,
+            stages=('evaluate',), max_attempts=3).run_next()
+        for _ in range(3)
+    ]
+
+    assert [result.exit_code for result in results] == [75, 75, 78]
+    run = StateStore(campaign).read()['runs']['fixture:evaluate']
+    assert run['status'] == 'exhausted'
+    assert run['attempt'] == 3
+
+
+def test_reboot_style_running_state_at_budget_is_exhausted_without_runner(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_repro.state import StateStore
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+    campaign = tmp_path / 'work_dirs/optimization'
+    store = StateStore(campaign)
+    store.transition(
+        'fixture:evaluate', 'running', attempt=3,
+        retry_lineage=[{
+            'attempt': 3,
+            'status': 'started',
+            'timestamp': 'before-reboot',
+        }])
+    calls = []
+
+    result = OptimizationController(
+        campaign, candidate, lambda *args: calls.append(args),
+        repository_root=tmp_path, stages=('evaluate',),
+        max_attempts=3).run_next()
+
+    assert result.exit_code == 78
+    assert calls == []
+    assert store.read()['runs']['fixture:evaluate']['status'] == 'exhausted'
