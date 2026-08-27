@@ -1421,7 +1421,8 @@ def _w8a8_recovery_fixture(tmp_path, monkeypatch):
     return {
         'baseline': baseline, 'teacher': teacher, 'screen': screen,
         'recovery': recovery, 'screen_manifest': screen_manifest,
-        'screen_commit': screen_commit,
+        'screen_commit': screen_commit, 'recovery_commit': recovery_commit,
+        'inventory_sha': inventory_sha,
         'baseline_mode_config_shas': baseline_mode_config_shas,
         'screen_mode_config_shas': screen_mode_config_shas,
         'screen_runtime_config': runtime_config,
@@ -1436,6 +1437,249 @@ def _w8a8_recovery_fixture(tmp_path, monkeypatch):
         'metadata_path': metadata_path, 'train': train,
         'train_path': train_path,
     }
+
+
+def _write_route3_candidate_result_artifacts(
+        repository, *, candidate, manifest, git_commit, inventory_sha,
+        evaluation_path=None, device_index=3, mode_config_shas=None):
+    from mambapose_opt.evaluation import build_source_binding
+    from mambapose_opt.numeric_runtime import resolve_numeric_runtime
+    from mambapose_opt.numeric_source import build_numeric_source_binding
+
+    root = (
+        repository / 'work_dirs/optimization' / candidate.route /
+        candidate.id / str(candidate.seed))
+    profile_path = root / 'profile/profile.json'
+    latency_path = root / 'latency/latency.json'
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    latency_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime = resolve_numeric_runtime(
+        candidate, repository_root=repository, manifest_path=manifest,
+        downstream_output=profile_path)
+    runtime_config = runtime['config_path'].relative_to(repository).as_posix()
+    runtime_binding = {
+        'config': {
+            'path': runtime_config, 'sha256': runtime['config_sha256']},
+        'checkpoint': {
+            'path': runtime['checkpoint_name'],
+            'sha256': runtime['checkpoint_sha256']},
+    }
+    source = build_source_binding(
+        repository_root=repository, candidate=candidate,
+        manifest_path=manifest, git_commit=git_commit)
+    numeric_source = build_numeric_source_binding(
+        repository_root=repository, candidate=candidate,
+        manifest_path=manifest,
+        policy_path=repository / candidate.config,
+        git_commit=git_commit)
+    evaluation_path = evaluation_path or root / 'evaluate/evaluate.json'
+    if not evaluation_path.is_file():
+        evaluation_path.parent.mkdir(parents=True, exist_ok=True)
+        evaluation_path.write_text(json.dumps(_formal_evaluation(
+            candidate=candidate, source=source,
+            source_config=runtime_config,
+            checkpoint=runtime['checkpoint_name'],
+            checkpoint_sha=runtime['checkpoint_sha256'],
+            mode_config_shas=(
+                mode_config_shas or _producer_mode_config_shas(
+                    candidate, runtime['config_path'])),
+            inventory_sha=inventory_sha, ap=72.49)))
+    assert evaluation_path == root / 'evaluate/evaluate.json'
+    evaluation = json.loads(evaluation_path.read_text())
+    protocol = evaluation['result']['modes']['flip']['protocol']
+    provenance = evaluation['result']['modes']['flip']['provenance']
+    profile_path.write_text(json.dumps({
+        'schema_version': 2,
+        'git_commit': source['git_commit'],
+        'candidate': candidate.id,
+        'config': runtime_config,
+        'checkpoint': runtime['checkpoint_name'],
+        'checkpoint_sha256': runtime['checkpoint_sha256'],
+        'device': {
+            'logical': 'cuda:0', 'physical_index': device_index,
+            'kind': 'cuda'},
+        'parent': {
+            'config': candidate.config.as_posix(),
+            'checkpoint': candidate.checkpoint.as_posix(),
+            'checkpoint_sha256': candidate.checkpoint_sha256},
+        'runtime': runtime_binding,
+        'source': numeric_source,
+        'input_shapes': [1, 3, 256, 192],
+        'output_shapes': [1, 17, 64, 48],
+        'parameters': {
+            'total': 10, 'trainable': 9,
+            'bytes_by_dtype': {'torch.float32': 40},
+            'by_prefix': {'backbone': 7, 'head': 3}},
+        'modules': [{
+            'name': '', 'kind': 'Model', 'parameters': 10,
+            'hazard': None}],
+    }))
+    latency_data = deepcopy(protocol)
+    for field in ('batch_size', 'source_config', 'checkpoint',
+                  'data_inventory'):
+        latency_data.pop(field)
+    summary = {
+        'median_ms': 1.0, 'p90_ms': 1.2, 'p95_ms': 1.3,
+        'sample_count': 200}
+    latency_path.write_text(json.dumps({
+        'schema_version': 1, 'candidate_id': candidate.id,
+        'stage': 'latency',
+        'result': {
+            'route': candidate.route,
+            'source': source,
+            'provenance': {
+                'checkpoint_sha256': runtime['checkpoint_sha256'],
+                'config_sha256': runtime['config_sha256'],
+                'data_inventory_sha256': provenance[
+                    'data_inventory_sha256'],
+                'git_commit': source['git_commit']},
+            'protocol': {
+                'batch_size': 1, 'warmup': 50, 'iterations': 200,
+                'timer': 'torch.cuda.Event', 'synchronize': True,
+                'scope': 'full_topdown_model',
+                'lease_max_age_seconds': 300,
+                'lease_max_future_skew_seconds': 30,
+                'source_config': runtime_config,
+                'checkpoint': runtime['checkpoint_name'],
+                'data_inventory': protocol['data_inventory'],
+                'data': latency_data},
+            'modes': {'flip': summary, 'no_flip': summary},
+            'gpu_lease': {
+                'stage_id': f'{candidate.id}:latency', 'pid': 123,
+                'boot_id': '11111111-1111-1111-1111-111111111111',
+                'timestamp': '2026-08-27T00:00:00+00:00',
+                'device_index': device_index, 'allowed_pids': [123],
+                'lease_id': '7' * 64},
+        },
+    }))
+    return {
+        'root': root, 'profile_path': profile_path,
+        'latency_path': latency_path, 'runtime': runtime_binding,
+        'source': source, 'numeric_source': numeric_source,
+    }
+
+
+def _w8_candidate_result_fixture(tmp_path, monkeypatch):
+    from mambapose_opt.schema import load_candidate_manifest
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    inventory_sha = _write_evaluation_authority(fixture['main'])
+    commit = _commit_fixture(fixture['main'], 'formal evaluation authority')
+    subprocess.run(
+        ['git', 'reset', '--hard', '-q', commit], cwd=fixture['linked'],
+        check=True)
+    candidate = load_candidate_manifest(fixture['manifest'])[0]
+    monkeypatch.setattr(
+        'mambapose_opt.evaluation._TRUSTED_REPOSITORY_ROOT',
+        fixture['linked'])
+    artifacts = _write_route3_candidate_result_artifacts(
+        fixture['linked'], candidate=candidate,
+        manifest=fixture['manifest'], git_commit=commit,
+        inventory_sha=inventory_sha,
+        mode_config_shas={'flip': '8' * 64, 'no_flip': '9' * 64})
+    return {**fixture, **artifacts, 'candidate': candidate}
+
+
+@pytest.mark.parametrize(('field', 'substitute'), [
+    ('all', {'logical': 'cpu', 'physical_index': None, 'kind': 'cpu'}),
+    ('physical_index', 4),
+    ('logical', 'cuda:1'),
+    ('kind', 'gpu'),
+])
+def test_candidate_result_rejects_profile_device_outside_latency_lease(
+        tmp_path, monkeypatch, field, substitute):
+    from mambapose_opt.evaluation import CandidateResult, MetricError
+
+    fixture = _w8_candidate_result_fixture(tmp_path, monkeypatch)
+    profile = json.loads(fixture['profile_path'].read_text())
+    if field == 'all':
+        profile['device'] = substitute
+    else:
+        profile['device'][field] = substitute
+    fixture['profile_path'].write_text(json.dumps(profile))
+
+    with pytest.raises(MetricError, match='device|CUDA'):
+        CandidateResult.from_artifacts(fixture['root'])
+
+
+def test_candidate_result_accepts_exact_w8_runtime_identity(
+        tmp_path, monkeypatch):
+    from mambapose_opt.evaluation import CandidateResult
+
+    fixture = _w8_candidate_result_fixture(tmp_path, monkeypatch)
+
+    result = CandidateResult.from_artifacts(fixture['root'])
+
+    assert result.profile['runtime'] == fixture['runtime']
+    assert result.profile['runtime']['config']['path'] == (
+        fixture['candidate'].config.as_posix())
+    assert result.profile['runtime']['checkpoint']['path'] == (
+        fixture['candidate'].checkpoint.as_posix())
+    assert result.gpu_lease['device_index'] == 3
+
+
+def test_candidate_result_accepts_generated_w8a8_and_recovery_runtimes(
+        tmp_path, monkeypatch):
+    from mambapose_opt.evaluation import CandidateResult
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        'mambapose_opt.evaluation._TRUSTED_REPOSITORY_ROOT', tmp_path)
+    cases = (
+        (fixture['screen'], fixture['screen_manifest'],
+         fixture['screen_commit'], fixture['screen_evaluation_path'],
+         fixture['screen_runtime_config'],
+         tmp_path / fixture['screen'].checkpoint),
+        (fixture['recovery'], fixture['recovery_manifest'],
+         fixture['recovery_commit'], None, fixture['resolved_train'],
+         fixture['recovery_checkpoint']),
+    )
+    for (candidate, manifest, commit, evaluation_path, expected_config,
+         expected_checkpoint) in cases:
+        artifacts = _write_route3_candidate_result_artifacts(
+            tmp_path, candidate=candidate, manifest=manifest,
+            git_commit=commit, inventory_sha=fixture['inventory_sha'],
+            evaluation_path=evaluation_path)
+
+        result = CandidateResult.from_artifacts(artifacts['root'])
+
+        assert result.profile['runtime'] == artifacts['runtime']
+        assert result.profile['runtime']['config']['path'] == (
+            expected_config.relative_to(tmp_path).as_posix())
+        assert result.profile['runtime']['checkpoint']['path'] == (
+            expected_checkpoint.relative_to(tmp_path).as_posix())
+
+
+@pytest.mark.parametrize('substitution', ['runtime', 'parent', 'source'])
+def test_candidate_result_rejects_route3_authority_substitution(
+        tmp_path, monkeypatch, substitution):
+    from mambapose_opt.evaluation import CandidateResult, MetricError
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        'mambapose_opt.evaluation._TRUSTED_REPOSITORY_ROOT', tmp_path)
+    artifacts = _write_route3_candidate_result_artifacts(
+        tmp_path, candidate=fixture['screen'],
+        manifest=fixture['screen_manifest'],
+        git_commit=fixture['screen_commit'],
+        inventory_sha=fixture['inventory_sha'],
+        evaluation_path=fixture['screen_evaluation_path'])
+    CandidateResult.from_artifacts(artifacts['root'])
+    if substitution == 'runtime':
+        latency = json.loads(artifacts['latency_path'].read_text())
+        latency['result']['provenance']['config_sha256'] = (
+            artifacts['source']['config_sha256'])
+        artifacts['latency_path'].write_text(json.dumps(latency))
+    else:
+        profile = json.loads(artifacts['profile_path'].read_text())
+        if substitution == 'parent':
+            profile['parent']['checkpoint_sha256'] = 'f' * 64
+        else:
+            profile['source']['policy_sha256'] = 'f' * 64
+        artifacts['profile_path'].write_text(json.dumps(profile))
+
+    with pytest.raises(MetricError, match='runtime|parent|source|provenance'):
+        CandidateResult.from_artifacts(artifacts['root'])
 
 
 def test_recovery_train_runner_forwards_follow_on_manifest_to_child_lookup(

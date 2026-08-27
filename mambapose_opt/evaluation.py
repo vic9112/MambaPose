@@ -1245,7 +1245,16 @@ class CandidateResult:
         source, candidate, authority = resolve_artifact_source(
             envelope, repository_root=repository_root)
         profile_path = root / 'profile/profile.json'
-        expected_profile_runtime: Mapping[str, Any] | None = None
+        expected_runtime: Mapping[str, Any] = MappingProxyType({
+            'config': MappingProxyType({
+                'path': candidate.config.as_posix(),
+                'sha256': source['config_sha256'],
+            }),
+            'checkpoint': MappingProxyType({
+                'path': candidate.checkpoint.as_posix(),
+                'sha256': candidate.checkpoint_sha256,
+            }),
+        })
         expected_profile_parent: Mapping[str, str] | None = None
         expected_profile_source: Mapping[str, Any] | None = None
         if candidate.route == 'ssm-quant-pwl':
@@ -1265,7 +1274,7 @@ class CandidateResult:
                     candidate, repository_root=repository_root,
                     manifest_path=repository_root / source['manifest_path'],
                     downstream_output=profile_path)
-                expected_profile_runtime = MappingProxyType({
+                expected_runtime = MappingProxyType({
                     'config': MappingProxyType({
                         'path': numeric_runtime['config_path'].relative_to(
                             repository_root).as_posix(),
@@ -1288,10 +1297,11 @@ class CandidateResult:
             envelope,
             expected_candidate_id=candidate.id,
             expected_route=candidate.route,
-            expected_checkpoint_sha256=candidate.checkpoint_sha256,
+            expected_checkpoint_sha256=expected_runtime[
+                'checkpoint']['sha256'],
             expected_authority_sha256=source['authority_sha256'],
-            expected_source_config=candidate.config.as_posix(),
-            expected_checkpoint=candidate.checkpoint.as_posix(),
+            expected_source_config=expected_runtime['config']['path'],
+            expected_checkpoint=expected_runtime['checkpoint']['path'],
             expected_seed=candidate.seed,
             expected_git_commit=source['git_commit'],
             expected_source_binding=source,
@@ -1314,13 +1324,21 @@ class CandidateResult:
         profile = _load_profile(
             profile_path, candidate_id=candidate_id,
             provenance=provenance,
-            expected_runtime=expected_profile_runtime,
+            expected_runtime=(
+                expected_runtime
+                if candidate.route == 'ssm-quant-pwl' else None),
             expected_parent=expected_profile_parent,
             expected_source=expected_profile_source)
         latency, gpu_lease = _load_latency(
             latency_path, candidate_id=candidate_id, route=route,
-            provenance=provenance, source=source, candidate=candidate,
-            authority=authority)
+            provenance=provenance, source=source,
+            expected_runtime=expected_runtime, authority=authority)
+        if (
+                profile['schema_version'] == 2
+                and profile['device']['physical_index'] !=
+                gpu_lease['device_index']):
+            raise MetricError(
+                'profile CUDA device disagrees with latency GPU lease')
         if (
                 profile['config'] != protocol['source_config']
                 or profile['checkpoint'] != protocol['checkpoint']):
@@ -1487,7 +1505,7 @@ def _load_profile(
 def _load_latency(
         path: Path, *, candidate_id: str, route: str,
         provenance: Mapping[str, str], source: Mapping[str, str],
-        candidate: CandidateSpec, authority: Mapping[str, Any],
+        expected_runtime: Mapping[str, Any], authority: Mapping[str, Any],
         ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     try:
         envelope = json.loads(path.read_text(encoding='utf-8'))
@@ -1495,13 +1513,14 @@ def _load_latency(
         raise MetricError(f'cannot load latency artifact: {error}') from error
     validated = validate_latency_envelope(
         envelope, expected_candidate_id=candidate_id, expected_route=route,
-        expected_checkpoint_sha256=provenance['checkpoint_sha256'],
+        expected_checkpoint_sha256=expected_runtime[
+            'checkpoint']['sha256'],
         expected_data_inventory_sha256=provenance['data_inventory_sha256'],
         expected_authority_sha256=source['authority_sha256'],
-        expected_source_config=candidate.config.as_posix(),
-        expected_checkpoint=candidate.checkpoint.as_posix(),
+        expected_source_config=expected_runtime['config']['path'],
+        expected_checkpoint=expected_runtime['checkpoint']['path'],
         expected_git_commit=provenance['git_commit'],
-        expected_config_sha256=source['config_sha256'],
+        expected_config_sha256=expected_runtime['config']['sha256'],
         expected_source_binding=source,
         expected_authority=authority,
         require_source_binding=True)
