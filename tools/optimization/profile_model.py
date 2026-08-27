@@ -80,9 +80,11 @@ def _output_path(value: str) -> Path:
             'output must be a repository-relative path under '
             'work_dirs/optimization')
     try:
+        repository_root = REPOSITORY_ROOT.resolve(strict=False)
         artifact_root = (REPOSITORY_ROOT / OPTIMIZATION_ARTIFACTS).resolve(
             strict=False)
         effective_path = (REPOSITORY_ROOT / path).resolve(strict=False)
+        artifact_root.relative_to(repository_root)
         effective_path.relative_to(artifact_root)
     except (OSError, RuntimeError, ValueError) as error:
         raise argparse.ArgumentTypeError(
