@@ -674,6 +674,9 @@ def _finite_values(value: object) -> list[float]:
 def validate_activation_scale_record(
         role: str, value: Mapping[str, Any],
         source_record: Mapping[str, Any]) -> None:
+    if source_record.get('overflow_count') != 0:
+        raise CalibrationContractError(
+            f'activation scale source has histogram overflow for {role}')
     granularity = value['granularity']
     if granularity != source_record.get('granularity'):
         raise CalibrationContractError(
@@ -682,13 +685,16 @@ def validate_activation_scale_record(
     if granularity == 'tensor':
         numeric_range = source_record['range']
         maximum = max(abs(float(item)) for item in numeric_range)
-        expected = maximum / 127.0 if maximum else 1.0
-        if (not isinstance(scale, (int, float)) or isinstance(scale, bool)
+        expected = maximum / 127.0
+        if (maximum <= 0
+                or not isinstance(scale, (int, float))
+                or isinstance(scale, bool)
                 or not math.isfinite(scale) or scale <= 0
                 or not math.isclose(scale, expected, rel_tol=1e-12,
                                     abs_tol=0.0)):
             raise CalibrationContractError(
-                f'activation scale is not derived from measured range for {role}')
+                f'activation scale requires a positive measured maximum and '
+                f'must be derived from measured range for {role}')
         return
     maximum = source_record.get('max_abs')
     shape = source_record.get('observed_shape')

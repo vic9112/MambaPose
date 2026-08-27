@@ -9,6 +9,9 @@ import pytest
 import torch
 from torch import nn
 
+from tools.optimization.calibrate_numeric import (
+    _w8a8_activation_scales_from_records)
+
 
 class SS2D(nn.Module):
     def __init__(self):
@@ -50,6 +53,76 @@ class CalibrationFixture(nn.Module):
         self.attentions = nn.ModuleList([Attention() for _ in range(6)])
         self.pose_interaction = PoseInteraction()
         self.heatmap_projection = nn.Linear(4, 17)
+
+
+def _activation_record(*, numeric_range=(-4.0, 2.0), underflow=7,
+                       overflow=0, bounded=False):
+    return {
+        'granularity': 'tensor',
+        'range': list(numeric_range),
+        'underflow_count': underflow,
+        'overflow_count': overflow,
+        'percentile_bound_valid': bounded,
+    }
+
+
+def test_w8a8_max_abs_scale_accepts_histogram_underflow_without_overflow():
+    scales = _w8a8_activation_scales_from_records(
+        {'projection': 'projection.input'},
+        {'projection.input': _activation_record()})
+
+    assert scales == {
+        'projection': {
+            'source_record': 'projection.input',
+            'granularity': 'tensor',
+            'scale': 4.0 / 127.0,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ('record', 'message'), (
+        (_activation_record(numeric_range=(float('nan'), 2.0)),
+         'finite measured range'),
+        (_activation_record(numeric_range=(0.0, 0.0)),
+         'positive max-abs scale'),
+        (_activation_record(overflow=1), 'histogram overflow'),
+    ))
+def test_w8a8_max_abs_scale_rejects_unsafe_measured_ranges(record, message):
+    with pytest.raises(ValueError, match=message):
+        _w8a8_activation_scales_from_records(
+            {'projection': 'projection.input'},
+            {'projection.input': record})
+
+
+def test_w8a8_max_abs_scale_rejects_wrong_source_record():
+    with pytest.raises(ValueError, match='record is missing'):
+        _w8a8_activation_scales_from_records(
+            {'projection': 'projection.input'},
+            {'different.input': _activation_record()})
+
+
+@pytest.mark.parametrize(
+    ('record', 'scale', 'message'), (
+        (_activation_record(overflow=1), 4.0 / 127.0,
+         'histogram overflow'),
+        (_activation_record(numeric_range=(0.0, 0.0)), 1.0,
+         'positive measured maximum'),
+        (_activation_record(), 0.0, 'measured range'),
+        (_activation_record(), -1.0, 'measured range'),
+    ))
+def test_w8a8_activation_scale_artifact_rejects_unsafe_scale_contract(
+        record, scale, message):
+    from mambapose_opt.numeric_calibration import (
+        CalibrationContractError, validate_activation_scale_record)
+
+    with pytest.raises(CalibrationContractError, match=message):
+        validate_activation_scale_record(
+            'projection', {
+                'source_record': 'projection.input',
+                'granularity': 'tensor',
+                'scale': scale,
+            }, record)
 
 
 def test_calibration_inventory_fails_closed_on_missing_or_duplicate_roles():

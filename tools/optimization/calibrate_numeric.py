@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -232,6 +234,49 @@ def _sample_ids(batch: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _w8a8_activation_scales_from_records(
+        activation_observers: Mapping[str, str],
+        records: Mapping[str, Mapping[str, Any]],
+        ) -> dict[str, dict[str, Any]]:
+    """Derive W8A8 tensor scales from exact extrema, not histogram bounds."""
+    activation_scales = {}
+    for role, source_record in activation_observers.items():
+        summary = records.get(source_record)
+        if not isinstance(summary, Mapping):
+            raise ValueError(
+                f'activation observer record is missing for {role}: '
+                f'{source_record}')
+        numeric_range = summary.get('range')
+        if (not isinstance(numeric_range, list) or len(numeric_range) != 2
+                or any(not isinstance(item, (int, float))
+                       or isinstance(item, bool) or not math.isfinite(item)
+                       for item in numeric_range)):
+            raise ValueError(
+                f'activation observer has no finite measured range: {role}')
+        overflow = summary.get('overflow_count')
+        if (not isinstance(overflow, int) or isinstance(overflow, bool)
+                or overflow < 0):
+            raise ValueError(
+                f'activation observer overflow count is invalid: {role}')
+        if overflow:
+            raise ValueError(
+                f'activation observer has histogram overflow: {role}')
+        if summary.get('granularity') != 'tensor':
+            raise ValueError(
+                f'activation observer granularity is not tensor: {role}')
+        maximum = max(abs(float(item)) for item in numeric_range)
+        scale = maximum / 127.0
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError(
+                f'activation observer has no positive max-abs scale: {role}')
+        activation_scales[role] = {
+            'source_record': source_record,
+            'granularity': 'tensor',
+            'scale': scale,
+        }
+    return activation_scales
+
+
 def calibrate(
         candidate, policy: Path, *, samples: int, device: str,
         target_candidate=None, manifest_path: Path | None = None) -> dict:
@@ -283,22 +328,8 @@ def calibrate(
     target_config = Config.fromfile(policy)
     policy_value = target_config.numeric_optimization.get('quant_policy', {})
     activation_observers = policy_value.get('activation_observers', {})
-    activation_scales = {}
-    for role, source_record in activation_observers.items():
-        summary = records.get(source_record)
-        if not isinstance(summary, dict):
-            raise ValueError(
-                f'activation observer record is missing for {role}: '
-                f'{source_record}')
-        if not summary.get('percentile_bound_valid'):
-            raise ValueError(
-                f'activation observer range is outside bounded domain: {role}')
-        maximum = max(abs(item) for item in summary['range'])
-        activation_scales[role] = {
-            'source_record': source_record,
-            'granularity': 'tensor',
-            'scale': maximum / 127.0 if maximum else 1.0,
-        }
+    activation_scales = _w8a8_activation_scales_from_records(
+        activation_observers, records)
     target = target_candidate or candidate
     identity_after = _identity(candidate, policy)
     if identity_after != identity_before:
