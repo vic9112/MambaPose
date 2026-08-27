@@ -45,5 +45,19 @@ numeric_optimization = dict(
     train_envelope=dict(
         recovery='one-bounded-qat-or-distillation-run',
         requires_attributed_error=True, max_preliminary_ap_drop=0.3,
-        resume_checkpoints=2),
+        resume_checkpoints=2,
+        student_candidate='full-s-v1',
+        student_config='configs/reproduction/coco_s_v1.py',
+        student_checkpoint=(
+            'work_dirs/reproduction/runs/coco-s-v1/'
+            'best_coco_AP_epoch_300.pth'),
+        student_checkpoint_sha256=(
+            'a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2'),
+        teacher_candidate='coco-b-teacher',
+        teacher_config='configs/reproduction/coco_b.py',
+        teacher_checkpoint=(
+            'work_dirs/reproduction/runs/coco-b/'
+            'best_coco_AP_epoch_290.pth'),
+        teacher_checkpoint_sha256=(
+            '38b5e5b1bccfdf7b8b153d91837f7f1bfe371a14f12f6e417a52ebb893efb9b2')),
 )

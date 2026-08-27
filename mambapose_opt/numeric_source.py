@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import subprocess
 from typing import Any, Mapping
@@ -118,6 +120,91 @@ def resolve_numeric_file(
     return selected
 
 
+def validate_numeric_config_closure(
+        repository_root: Path, config_path: Path, *, git_commit: str,
+        ) -> tuple[dict[str, str], ...]:
+    """Reconstruct and bind every Python config inherited at one commit."""
+    root = Path(repository_root).resolve(strict=True)
+    if not isinstance(git_commit, str) or not _COMMIT.fullmatch(git_commit):
+        raise NumericSourceError('numeric config commit is invalid')
+    start = _relative(root, config_path, 'config')
+    visited: dict[str, str] = {}
+    active: set[str] = set()
+
+    def visit(relative: str) -> None:
+        path = PurePosixPath(relative)
+        if (path.is_absolute() or path.suffix != '.py'
+                or any(part in {'', '.', '..'} for part in path.parts)):
+            raise NumericSourceError('numeric config dependency path is unsafe')
+        normalized = path.as_posix()
+        if normalized in active:
+            raise NumericSourceError('numeric config dependency cycle is invalid')
+        if normalized in visited:
+            return
+        current = resolve_numeric_file(
+            root, Path(normalized), 'numeric config dependency')
+        blob = _blob(root, git_commit, normalized)
+        if current.read_bytes() != blob:
+            raise NumericSourceError(
+                f'numeric config dependency differs from clean commit: '
+                f'{normalized}')
+        try:
+            tree = ast.parse(blob, filename=normalized)
+        except (SyntaxError, ValueError) as error:
+            raise NumericSourceError(
+                f'numeric config dependency is invalid Python: {normalized}') \
+                from error
+        bases: object = ()
+        for node in tree.body:
+            if (isinstance(node, (ast.Assign, ast.AnnAssign))
+                    and ((isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name)
+                                  and target.id == '_base_'
+                                  for target in node.targets))
+                         or (isinstance(node, ast.AnnAssign)
+                             and isinstance(node.target, ast.Name)
+                             and node.target.id == '_base_'))):
+                try:
+                    bases = ast.literal_eval(node.value)
+                except (TypeError, ValueError) as error:
+                    raise NumericSourceError(
+                        f'numeric config _base_ is not literal: {normalized}') \
+                        from error
+                break
+        if isinstance(bases, str):
+            bases = (bases,)
+        if (not isinstance(bases, (list, tuple))
+                or any(not isinstance(base, str) or not base for base in bases)):
+            raise NumericSourceError(
+                f'numeric config _base_ is invalid: {normalized}')
+        active.add(normalized)
+        for base in bases:
+            base_path = PurePosixPath(base)
+            if base_path.is_absolute():
+                raise NumericSourceError(
+                    f'numeric config base is absolute: {normalized}')
+            combined = path.parent.joinpath(base_path)
+            parts: list[str] = []
+            for part in combined.parts:
+                if part in {'', '.'}:
+                    continue
+                if part == '..':
+                    if not parts:
+                        raise NumericSourceError(
+                            f'numeric config base escapes repository: '
+                            f'{normalized}')
+                    parts.pop()
+                else:
+                    parts.append(part)
+            visit(PurePosixPath(*parts).as_posix())
+        active.remove(normalized)
+        visited[normalized] = hashlib.sha256(blob).hexdigest()
+
+    visit(start)
+    return tuple(
+        {'path': path, 'sha256': visited[path]} for path in sorted(visited))
+
+
 def build_numeric_source_binding(
         *, repository_root: Path, candidate: CandidateSpec,
         manifest_path: Path, policy_path: Path,
@@ -137,6 +224,11 @@ def build_numeric_source_binding(
     blobs = {
         name: _blob(root, commit, relative[name])
         for name in ('manifest', 'config', 'policy', 'authority')}
+    validate_numeric_config_closure(
+        root, Path(relative['config']), git_commit=commit)
+    if relative['policy'] != relative['config']:
+        validate_numeric_config_closure(
+            root, Path(relative['policy']), git_commit=commit)
     for name, blob in blobs.items():
         current = root / relative[name]
         if not current.is_file() or current.read_bytes() != blob:
@@ -192,4 +284,5 @@ def validate_numeric_source_binding(
 
 __all__ = [
     'NumericSourceError', 'build_numeric_source_binding', 'file_sha256',
-    'resolve_numeric_file', 'validate_numeric_source_binding']
+    'resolve_numeric_file', 'validate_numeric_config_closure',
+    'validate_numeric_source_binding']

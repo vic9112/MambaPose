@@ -1,6 +1,7 @@
 import hashlib
 import json
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,121 @@ def _candidate(identifier, kind, features):
         'config': 'configs/candidate.py', 'checkpoint': 'checkpoint.pth',
         'checkpoint_sha256': 'a' * 64, 'seed': 0, 'features': features,
     })
+
+
+def _write_evaluation_authority(repository):
+    inventory = repository / 'data/inventory.json'
+    authority = repository / 'optimization/coco_val2017_authority.json'
+    inventory.parent.mkdir(parents=True, exist_ok=True)
+    authority.parent.mkdir(parents=True, exist_ok=True)
+    inventory.write_text(json.dumps({
+        'schema_version': 1, 'assets': [
+            {'id': 'coco-annotations', 'sha256': '3' * 64},
+            {'id': 'coco-val2017', 'sha256': '4' * 64},
+            {'id': 'coco-val-detections', 'sha256': '2' * 64},
+        ],
+    }))
+    inventory_sha = hashlib.sha256(inventory.read_bytes()).hexdigest()
+    authority.write_text(json.dumps({
+        'schema_version': 1, 'dataset': 'coco', 'split': 'val2017',
+        'inventory': {
+            'path': 'data/inventory.json', 'sha256': inventory_sha},
+        'annotation': {
+            'path': 'data/coco/annotations/person_keypoints_val2017.json',
+            'sha256': '1' * 64, 'image_count': 5000,
+            'annotation_count': 11004,
+            'inventory_asset_id': 'coco-annotations',
+            'inventory_archive_sha256': '3' * 64},
+        'images': {
+            'prefix': 'data/coco/val2017', 'image_count': 5000,
+            'corpus_digest_algorithm': 'sha256-filename-size-content-v1',
+            'corpus_sha256': '6' * 64,
+            'inventory_asset_id': 'coco-val2017',
+            'inventory_archive_sha256': '4' * 64},
+        'detections': {
+            'path': ('data/coco/person_detection_results/'
+                     'COCO_val2017_detections_AP_H_56_person.json'),
+            'sha256': '2' * 64, 'record_count': 104125,
+            'inventory_asset_id': 'coco-val-detections'},
+    }))
+    return inventory_sha
+
+
+def _formal_evaluation(
+        *, candidate, source, source_config, checkpoint, checkpoint_sha,
+        config_sha, inventory_sha, ap):
+    provenance = {
+        'checkpoint_sha256': checkpoint_sha,
+        'config_sha256': config_sha,
+        'data_inventory_sha256': inventory_sha,
+        'git_commit': source['git_commit'],
+    }
+    protocol = {
+        'dataset': 'coco', 'split': 'val2017', 'complete_split': True,
+        'batch_size': 1,
+        'authority_path': 'optimization/coco_val2017_authority.json',
+        'authority_sha256': source['authority_sha256'],
+        'authority_image_count': 5000,
+        'authority_annotation_count': 11004,
+        'authority_detection_count': 104125,
+        'inventory_authority_sha256': inventory_sha,
+        'annotation_authority_sha256': '1' * 64,
+        'detection_authority_sha256': '2' * 64,
+        'image_corpus_digest_algorithm': 'sha256-filename-size-content-v1',
+        'image_corpus_authority_sha256': '6' * 64,
+        'image_corpus_sha256': '6' * 64,
+        'inventory_annotation_archive_sha256': '3' * 64,
+        'inventory_image_archive_sha256': '4' * 64,
+        'annotation_sha256': '1' * 64,
+        'detection_sha256': '2' * 64,
+        'inventory_detection_sha256': '2' * 64,
+        'annotation_image_count': 5000,
+        'annotation_record_count': 11004,
+        'detection_record_count': 104125,
+        'verified_image_count': 5000,
+        'source_config': source_config,
+        'checkpoint': checkpoint,
+        'data_inventory': 'data/inventory.json',
+        'inventory_projection': {
+            'inventory_path': 'data/inventory.json',
+            'inventory_sha256': inventory_sha,
+            'annotation_asset_id': 'coco-annotations',
+            'annotation_declared_sha256': '3' * 64,
+            'annotation_observed_archive_sha256': '3' * 64,
+            'image_asset_id': 'coco-val2017',
+            'image_declared_sha256': '4' * 64,
+            'image_observed_archive_sha256': '4' * 64,
+            'detection_asset_id': 'coco-val-detections',
+            'detection_declared_sha256': '2' * 64,
+            'detection_observed_sha256': '2' * 64,
+        },
+    }
+    determinism = {
+        'python_seed': candidate.seed, 'numpy_seed': candidate.seed,
+        'torch_seed': candidate.seed, 'worker_count': 0, 'workers': [],
+        'persistent_workers': False, 'order_hashes': {'0': 'e' * 64},
+        'provenance': provenance,
+    }
+    row = {
+        'metrics': {
+            'unit': 'percentage_points', 'AP': ap, 'AP50': 89.7,
+            'AP75': 80.5, 'APM': 69.4, 'APL': 79.2, 'AR': 78.2},
+        'provenance': provenance, 'determinism': determinism,
+        'protocol': protocol,
+    }
+    return {
+        'schema_version': 1, 'candidate_id': candidate.id,
+        'stage': 'evaluate',
+        'result': {
+            'route': candidate.route,
+            'calibration_split': (
+                'train2017'
+                if candidate.features.get('numeric_kind') == 'w8a8'
+                else None),
+            'modes': {'flip': row, 'no_flip': deepcopy(row)},
+            'source': source,
+        },
+    }
 
 
 def test_route3_stage_plans_follow_numeric_admission_order():
@@ -165,6 +281,44 @@ def test_numeric_source_binds_clean_commit_manifest_row_policy_and_checkpoint(
         validate_numeric_source_binding(
             source, repository_root=tmp_path, candidate=candidate,
             manifest_path=tmp_path / 'optimization/candidates.json')
+
+
+def test_numeric_source_binds_the_complete_inherited_config_closure(tmp_path):
+    from mambapose_opt.numeric_source import (
+        NumericSourceError, build_numeric_source_binding,
+        validate_numeric_source_binding)
+    from mambapose_opt.schema import load_candidate_manifest
+
+    (tmp_path / 'configs').mkdir()
+    (tmp_path / 'optimization').mkdir()
+    (tmp_path / 'configs/base.py').write_text('model = dict(type="S-V1")\n')
+    (tmp_path / 'configs/candidate.py').write_text(
+        "_base_ = ['./base.py']\npolicy = True\n")
+    (tmp_path / 'checkpoint.pth').write_bytes(b'checkpoint')
+    checkpoint_sha = hashlib.sha256(b'checkpoint').hexdigest()
+    (tmp_path / 'optimization/candidates.json').write_text(json.dumps({
+        'schema_version': 1, 'candidates': [{
+            'id': 'numeric', 'route': 'ssm-quant-pwl',
+            'kind': 'fake-quant', 'config': 'configs/candidate.py',
+            'checkpoint': 'checkpoint.pth',
+            'checkpoint_sha256': checkpoint_sha, 'seed': 0,
+            'features': {'numeric_kind': 'weight-only'},
+        }],
+    }))
+    (tmp_path / 'optimization/coco_train2017_authority.json').write_text('{}\n')
+    _commit_fixture(tmp_path, 'inherited config fixture')
+    manifest = tmp_path / 'optimization/candidates.json'
+    candidate = load_candidate_manifest(manifest)[0]
+    source = build_numeric_source_binding(
+        repository_root=tmp_path, candidate=candidate,
+        manifest_path=manifest,
+        policy_path=tmp_path / 'configs/candidate.py')
+
+    (tmp_path / 'configs/base.py').write_text('model = dict(type="forged")\n')
+    with pytest.raises(NumericSourceError, match='dependency.*commit'):
+        validate_numeric_source_binding(
+            source, repository_root=tmp_path, candidate=candidate,
+            manifest_path=manifest)
 
 
 def test_numeric_source_accepts_only_common_checkout_reproduction_link(tmp_path):
@@ -356,11 +510,22 @@ def test_real_numeric_producer_round_trips_public_and_controller_validation(
         'optimization-stage-envelope-v1')
 
     if numeric_kind == 'weight-only' and stage == 'convert':
-        round_tripped['result']['conversion']['simulation_only'] = False
-        with pytest.raises(NumericRuntimeError, match='conversion report'):
-            validate_numeric_convert_artifact(
-                round_tripped, candidate=candidate, repository_root=tmp_path,
-                manifest_path=manifest, artifact_path=output)
+        invalid_claims = []
+        for field, value in (
+                ('simulation_only', False), ('simulation_only', 1),
+                ('integer_kernel_latency_claimed', True),
+                ('integer_kernel_latency_claimed', 0)):
+            invalid = deepcopy(round_tripped)
+            invalid['result']['conversion'][field] = value
+            invalid_claims.append(invalid)
+        unknown = deepcopy(round_tripped)
+        unknown['result']['conversion']['hardware_latency_measured'] = False
+        invalid_claims.append(unknown)
+        for invalid in invalid_claims:
+            with pytest.raises(NumericRuntimeError, match='conversion report'):
+                validate_numeric_convert_artifact(
+                    invalid, candidate=candidate, repository_root=tmp_path,
+                    manifest_path=manifest, artifact_path=output)
 
 
 def test_controller_rehashes_numeric_nested_bindings_and_export(
@@ -538,12 +703,10 @@ def test_train_artifact_rejects_hash_matching_empty_recovery_admission(
             manifest_path=tmp_path / 'optimization/candidates.json')
 
 
-def test_w8a8_recovery_uses_screen_manifest_calibration_and_trained_checkpoint(
-        tmp_path, monkeypatch):
-    from mambapose_opt.controller import OptimizationController
-    from mambapose_opt.numeric_runtime import (
-        resolve_numeric_runtime, validate_numeric_train_artifact,
-        validate_recovery_calibration_dependency)
+def _w8a8_recovery_fixture(tmp_path, monkeypatch):
+    from mmengine.config import Config
+
+    from mambapose_opt.evaluation import build_source_binding
     from mambapose_opt.numeric_source import (
         build_numeric_source_binding, file_sha256)
     from mambapose_opt.schema import load_candidate_manifest
@@ -553,15 +716,25 @@ def test_w8a8_recovery_uses_screen_manifest_calibration_and_trained_checkpoint(
     (tmp_path / 'optimization').mkdir()
     (tmp_path / 'work_dirs/optimization').mkdir(parents=True)
     (tmp_path / '.gitignore').write_text('work_dirs/\n')
-    checkpoint = tmp_path / 'checkpoint.pth'
-    checkpoint.write_bytes(b'parent')
-    checkpoint_sha = file_sha256(checkpoint)
-    (tmp_path / 'configs/reproduction/coco_s_v1.py').write_text(
-        'model = dict(type="baseline")\n')
+    student_checkpoint = tmp_path / 'student.pth'
+    teacher_checkpoint = tmp_path / 'teacher.pth'
+    student_checkpoint.write_bytes(b'S-V1 parent')
+    teacher_checkpoint.write_bytes(b'B teacher')
+    student_sha = file_sha256(student_checkpoint)
+    teacher_sha = file_sha256(teacher_checkpoint)
+    baseline_config = tmp_path / 'configs/reproduction/coco_s_v1.py'
+    teacher_config = tmp_path / 'configs/reproduction/coco_b.py'
+    baseline_config.write_text('model = dict(type="S-V1")\n')
+    teacher_config.write_text('model = dict(type="B")\n')
     policy = tmp_path / 'configs/numeric/w8a8.py'
     policy.write_text(
+        'custom_imports = dict(\n'
+        "    imports=['mambapose_opt.numeric_conversion'],\n"
+        '    allow_failed_imports=False)\n'
+        "custom_hooks = [dict(type='NumericRuntimeHook', priority='VERY_HIGH')]\n"
         'numeric_optimization = dict(\n'
         "    candidate_kind='w8a8',\n"
+        '    calibration=dict(source_candidate="full-s-v1"),\n'
         '    quant_policy=dict(\n'
         "        allow=('layer',), deny=(),\n"
         "        activation_observers={'layer': 'layer.input'},\n"
@@ -570,22 +743,19 @@ def test_w8a8_recovery_uses_screen_manifest_calibration_and_trained_checkpoint(
         '                  per_output_channel=True, symmetric=True)),\n'
         '    precision_invariants=dict(\n'
         "        selective_scan_state_accumulation='fp32',\n"
-        "        attention_softmax='floating', norms='floating'))\n")
-    screen_manifest = tmp_path / 'optimization/candidates.json'
-    baseline_row = {
-        'id': 'full-s-v1', 'route': 'baseline', 'kind': 'float',
-        'config': 'configs/reproduction/coco_s_v1.py',
-        'checkpoint': 'checkpoint.pth', 'checkpoint_sha256': checkpoint_sha,
-        'seed': 0, 'features': {},
-    }
-    screen_row = {
-        'id': 'w8a8-screen', 'route': 'ssm-quant-pwl',
-        'kind': 'fake-quant', 'config': 'configs/numeric/w8a8.py',
-        'checkpoint': 'checkpoint.pth', 'checkpoint_sha256': checkpoint_sha,
-        'seed': 0, 'features': {'numeric_kind': 'w8a8'},
-    }
-    screen_manifest.write_text(json.dumps({
-        'schema_version': 1, 'candidates': [baseline_row, screen_row]}))
+        "        attention_softmax='floating', norms='floating'),\n"
+        '    train_envelope=dict(\n'
+        "        recovery='one-bounded-qat-or-distillation-run',\n"
+        '        requires_attributed_error=True, max_preliminary_ap_drop=0.3,\n'
+        '        resume_checkpoints=2, student_candidate="full-s-v1",\n'
+        '        student_config="configs/reproduction/coco_s_v1.py",\n'
+        '        student_checkpoint="student.pth",\n'
+        f'        student_checkpoint_sha256="{student_sha}",\n'
+        '        teacher_candidate="coco-b-teacher",\n'
+        '        teacher_config="configs/reproduction/coco_b.py",\n'
+        '        teacher_checkpoint="teacher.pth",\n'
+        f'        teacher_checkpoint_sha256="{teacher_sha}"))\n')
+    inventory_sha = _write_evaluation_authority(tmp_path)
     sha = 'a' * 64
     (tmp_path / 'optimization/coco_train2017_authority.json').write_text(
         json.dumps({
@@ -600,21 +770,49 @@ def test_w8a8_recovery_uses_screen_manifest_calibration_and_trained_checkpoint(
             'annotation_archive_asset_id': 'coco-annotations',
             'annotation_archive_sha256': sha,
         }))
+    screen_manifest = tmp_path / 'optimization/candidates.json'
+    baseline_row = {
+        'id': 'full-s-v1', 'route': 'baseline', 'kind': 'float',
+        'config': baseline_config.relative_to(tmp_path).as_posix(),
+        'checkpoint': student_checkpoint.relative_to(tmp_path).as_posix(),
+        'checkpoint_sha256': student_sha, 'seed': 0, 'features': {},
+    }
+    teacher_row = {
+        'id': 'coco-b-teacher', 'route': 'baseline', 'kind': 'float',
+        'config': teacher_config.relative_to(tmp_path).as_posix(),
+        'checkpoint': teacher_checkpoint.relative_to(tmp_path).as_posix(),
+        'checkpoint_sha256': teacher_sha, 'seed': 0,
+        'features': {'role': 'teacher'},
+    }
+    screen_row = {
+        'id': 'w8a8-screen', 'route': 'ssm-quant-pwl',
+        'kind': 'fake-quant', 'config': policy.relative_to(tmp_path).as_posix(),
+        'checkpoint': student_checkpoint.relative_to(tmp_path).as_posix(),
+        'checkpoint_sha256': student_sha, 'seed': 0,
+        'features': {'numeric_kind': 'w8a8'},
+    }
+    screen_manifest.write_text(json.dumps({
+        'schema_version': 1,
+        'candidates': [baseline_row, teacher_row, screen_row]}))
     screen_commit = _commit_fixture(tmp_path, 'screen manifest')
-    screen = load_candidate_manifest(screen_manifest)[1]
-    screen_source = build_numeric_source_binding(
+    baseline, teacher, screen = load_candidate_manifest(screen_manifest)
+    screen_numeric_source = build_numeric_source_binding(
         repository_root=tmp_path, candidate=screen,
         manifest_path=screen_manifest, policy_path=policy,
         git_commit=screen_commit)
     identity = _calibration_identity(
-        screen_source, checkpoint_sha=checkpoint_sha)
+        screen_numeric_source, checkpoint_sha=student_sha)
+    monkeypatch.setattr(
+        'mambapose_opt.numeric_calibration.calibration_identity',
+        lambda **_kwargs: identity)
     calibration_path = (
         tmp_path / 'work_dirs/optimization/ssm-quant-pwl' /
         screen.id / str(screen.seed) / 'calibrate/calibrate.json')
     calibration_path.parent.mkdir(parents=True)
     calibration = {
         'schema_version': 1, 'candidate_id': screen.id,
-        'stage': 'calibrate', 'source': screen_source, 'identity': identity,
+        'stage': 'calibrate', 'source': screen_numeric_source,
+        'identity': identity,
         'protocol': {
             'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
             'worker_count': 0, 'sample_count': 2,
@@ -629,69 +827,143 @@ def test_w8a8_recovery_uses_screen_manifest_calibration_and_trained_checkpoint(
         },
     }
     calibration_path.write_text(json.dumps(calibration))
-    calibration_sha = file_sha256(calibration_path)
+    calibration_reference = {
+        'path': calibration_path.relative_to(tmp_path).as_posix(),
+        'sha256': file_sha256(calibration_path)}
+
+    convert_dir = calibration_path.parent.parent / 'convert'
+    convert_dir.mkdir()
+    runtime_config = convert_dir / 'resolved-runtime.py'
+    resolved_screen = Config.fromfile(policy)
+    resolved_screen.numeric_optimization.quant_policy.calibration_artifact = (
+        calibration_reference)
+    resolved_screen.dump(runtime_config)
+    ref = lambda path: {
+        'path': path.relative_to(tmp_path).as_posix(),
+        'sha256': file_sha256(path)}
+    conversion = {
+        'schema_version': 1, 'candidate_id': screen.id, 'stage': 'convert',
+        'result': {
+            'source': screen_numeric_source,
+            'runtime_bindings': {
+                'config': ref(policy), 'checkpoint': ref(student_checkpoint),
+                'policy': ref(policy),
+                'calibration': calibration_reference},
+            'conversion': {
+                'converted': ['layer'], 'skipped': [],
+                'original_weight_bytes': 4,
+                'simulated_weight_bytes': 1,
+                'simulated_coverage': 1.0,
+                'simulation_only': True,
+                'integer_kernel_latency_claimed': False},
+            'precision_invariants': dict(
+                resolved_screen.numeric_optimization.precision_invariants),
+            'latency_claim': 'none-fake-quant-is-not-an-integer-kernel',
+            'runtime_config': ref(runtime_config),
+        },
+    }
+    (convert_dir / 'convert.json').write_text(json.dumps(conversion))
+
+    baseline_source = build_source_binding(
+        repository_root=tmp_path, candidate=baseline,
+        manifest_path=screen_manifest, git_commit=screen_commit)
+    screen_source = build_source_binding(
+        repository_root=tmp_path, candidate=screen,
+        manifest_path=screen_manifest, git_commit=screen_commit)
+    baseline_evaluation_path = (
+        tmp_path / 'work_dirs/optimization/baseline/full-s-v1/0/'
+        'evaluate/evaluate.json')
+    screen_evaluation_path = (
+        calibration_path.parent.parent / 'evaluate/evaluate.json')
+    baseline_evaluation_path.parent.mkdir(parents=True)
+    screen_evaluation_path.parent.mkdir()
+    baseline_evaluation_path.write_text(json.dumps(_formal_evaluation(
+        candidate=baseline, source=baseline_source,
+        source_config=baseline.config.as_posix(),
+        checkpoint=baseline.checkpoint.as_posix(),
+        checkpoint_sha=baseline.checkpoint_sha256,
+        config_sha=file_sha256(baseline_config),
+        inventory_sha=inventory_sha, ap=72.8)))
+    screen_evaluation_path.write_text(json.dumps(_formal_evaluation(
+        candidate=screen, source=screen_source,
+        source_config=runtime_config.relative_to(tmp_path).as_posix(),
+        checkpoint=screen.checkpoint.as_posix(),
+        checkpoint_sha=screen.checkpoint_sha256,
+        config_sha=file_sha256(runtime_config),
+        inventory_sha=inventory_sha, ap=72.49)))
 
     recovery_stage = (
         tmp_path / 'work_dirs/optimization/ssm-quant-pwl' /
         'w8a8-recovery/0/train')
-    recovery_runtime = recovery_stage / 'best_numeric.pth'
+    recovery_checkpoint = recovery_stage / 'best_numeric.pth'
     recovery_manifest = tmp_path / 'optimization/recovery-candidates.json'
     recovery_row = {
         'id': 'w8a8-recovery', 'route': 'ssm-quant-pwl',
         'kind': 'fake-quant', 'config': screen_row['config'],
         'checkpoint': screen_row['checkpoint'],
-        'checkpoint_sha256': checkpoint_sha, 'seed': 0,
+        'checkpoint_sha256': student_sha, 'seed': 0,
         'features': {
             'numeric_kind': 'w8a8', 'conditional': True,
             'recovery_candidate': True,
             'recovery_screen_candidate': screen.id,
+            'recovery_screen_manifest':
+                screen_manifest.relative_to(tmp_path).as_posix(),
+            'recovery_screen_manifest_sha256': file_sha256(screen_manifest),
             'recovery_calibration_artifact':
-                calibration_path.relative_to(tmp_path).as_posix(),
-            'recovery_calibration_sha256': calibration_sha,
+                calibration_reference['path'],
+            'recovery_calibration_sha256':
+                calibration_reference['sha256'],
+            'recovery_baseline_evaluation':
+                baseline_evaluation_path.relative_to(tmp_path).as_posix(),
+            'recovery_baseline_evaluation_sha256':
+                file_sha256(baseline_evaluation_path),
+            'recovery_candidate_evaluation':
+                screen_evaluation_path.relative_to(tmp_path).as_posix(),
+            'recovery_candidate_evaluation_sha256':
+                file_sha256(screen_evaluation_path),
             'runtime_checkpoint':
-                recovery_runtime.relative_to(tmp_path).as_posix(),
+                recovery_checkpoint.relative_to(tmp_path).as_posix(),
         },
     }
     recovery_manifest.write_text(json.dumps({
         'schema_version': 1, 'candidates': [recovery_row]}))
     recovery_commit = _commit_fixture(tmp_path, 'recovery manifest')
     recovery = load_candidate_manifest(recovery_manifest)[0]
-    monkeypatch.setattr(
-        'mambapose_opt.numeric_calibration.calibration_identity',
-        lambda **_kwargs: identity)
-
-    selected, reference, validated = validate_recovery_calibration_dependency(
-        recovery, repository_root=tmp_path,
-        recovery_manifest_path=recovery_manifest,
-        recovery_stage_dir=recovery_stage)
-    assert selected == screen
-    assert reference == {
-        'path': calibration_path.relative_to(tmp_path).as_posix(),
-        'sha256': calibration_sha}
-    assert validated == calibration
-
-    recovery_stage.mkdir(parents=True)
-    admission = recovery_stage / 'recovery-admission.json'
-    admission.write_text('{"admitted":true}\n')
-    runtime_config = recovery_stage / 'resolved-train.py'
-    runtime_config.write_text('runtime = True\n')
-    recovery_runtime.write_bytes(b'trained')
-    metadata = recovery_stage / 'runtime-metadata.json'
     recovery_source = build_numeric_source_binding(
         repository_root=tmp_path, candidate=recovery,
         manifest_path=recovery_manifest, policy_path=policy,
         git_commit=recovery_commit)
-    ref = lambda path: {
-        'path': path.relative_to(tmp_path).as_posix(),
-        'sha256': file_sha256(path)}
-    metadata.write_text(json.dumps({
+
+    recovery_stage.mkdir(parents=True)
+    admission_path = recovery_stage / 'recovery-admission.json'
+    admission = {
+        'schema_version': 1, 'candidate_id': recovery.id,
+        'decision': 'admit-one-bounded-recovery',
+        'attributed_error': 'activation quantization',
+        'threshold_ap': 0.3, 'preliminary_ap_drop': 0.31,
+        'baseline_evaluation': ref(baseline_evaluation_path),
+        'candidate_evaluation': ref(screen_evaluation_path),
+    }
+    admission_path.write_text(json.dumps(admission))
+    resolved_train = recovery_stage / 'resolved-train.py'
+    recovery_config = Config.fromfile(policy)
+    recovery_config.numeric_optimization.quant_policy.calibration_artifact = (
+        calibration_reference)
+    recovery_config.work_dir = str(recovery_stage / 'mmpose')
+    recovery_config.load_from = str(tmp_path / recovery.checkpoint)
+    recovery_config.resume = False
+    recovery_config.randomness = dict(seed=recovery.seed, deterministic=True)
+    recovery_config.dump(resolved_train)
+    recovery_checkpoint.write_bytes(b'trained')
+    metadata_path = recovery_stage / 'runtime-metadata.json'
+    metadata_path.write_text(json.dumps({
         'schema_version': 1, 'candidate_id': recovery.id,
         'route': recovery.route, 'numeric_kind': 'w8a8',
-        'parent_checkpoint_sha256': checkpoint_sha,
-        'runtime_checkpoint_sha256': file_sha256(recovery_runtime),
-        'recovery_admission_sha256': file_sha256(admission),
+        'parent_checkpoint_sha256': student_sha,
+        'runtime_checkpoint_sha256': file_sha256(recovery_checkpoint),
+        'recovery_admission_sha256': file_sha256(admission_path),
         'screen_calibration_candidate_id': screen.id,
-        'screen_calibration_sha256': calibration_sha,
+        'screen_calibration_sha256': calibration_reference['sha256'],
     }))
     train = {
         'schema_version': 1, 'candidate_id': recovery.id, 'stage': 'train',
@@ -702,49 +974,236 @@ def test_w8a8_recovery_uses_screen_manifest_calibration_and_trained_checkpoint(
                 'checkpoint': recovery.checkpoint.as_posix(),
                 'checkpoint_sha256': recovery.checkpoint_sha256},
             'dependency': {
-                'recovery_admission': ref(admission),
-                'screen_calibration': reference},
+                'recovery_admission': ref(admission_path),
+                'screen_calibration': calibration_reference},
             'protocol': {
                 'seed': 0, 'operation': 'one-bounded-numeric-recovery',
                 'attributed_error': 'activation quantization',
                 'preliminary_ap_drop': 0.31},
             'runtime': {
-                'config': ref(runtime_config),
-                'checkpoint': ref(recovery_runtime),
-                'metadata': ref(metadata),
+                'config': ref(resolved_train),
+                'checkpoint': ref(recovery_checkpoint),
+                'metadata': ref(metadata_path),
                 'transform': 'bounded-numeric-recovery-v1'},
         },
     }
     train_path = recovery_stage / 'train.json'
     train_path.write_text(json.dumps(train))
-    monkeypatch.setattr(
-        'mambapose_opt.numeric_runtime.validate_recovery_admission',
-        lambda *_args, **_kwargs: {
-            'attributed_error': 'activation quantization',
-            'preliminary_ap_drop': 0.31})
+    return {
+        'baseline': baseline, 'teacher': teacher, 'screen': screen,
+        'recovery': recovery, 'screen_manifest': screen_manifest,
+        'screen_commit': screen_commit,
+        'recovery_manifest': recovery_manifest,
+        'calibration_path': calibration_path,
+        'calibration_reference': calibration_reference,
+        'baseline_evaluation_path': baseline_evaluation_path,
+        'screen_evaluation_path': screen_evaluation_path,
+        'recovery_stage': recovery_stage, 'admission_path': admission_path,
+        'resolved_train': resolved_train,
+        'recovery_checkpoint': recovery_checkpoint,
+        'metadata_path': metadata_path, 'train': train,
+        'train_path': train_path,
+    }
+
+
+def test_w8a8_recovery_uses_screen_manifest_calibration_and_trained_checkpoint(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_opt.numeric_runtime import (
+        resolve_numeric_runtime, validate_numeric_train_artifact,
+        validate_recovery_calibration_dependency)
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    recovery = fixture['recovery']
+
+    selected, reference, validated = validate_recovery_calibration_dependency(
+        recovery, repository_root=tmp_path,
+        recovery_manifest_path=fixture['recovery_manifest'],
+        recovery_stage_dir=fixture['recovery_stage'])
+    assert selected == fixture['screen']
+    assert reference == fixture['calibration_reference']
+    assert validated == json.loads(fixture['calibration_path'].read_text())
 
     validated_runtime = validate_numeric_train_artifact(
-        train, candidate=recovery, repository_root=tmp_path,
-        manifest_path=recovery_manifest)
-    assert validated_runtime['checkpoint_path'] == recovery_runtime
+        fixture['train'], candidate=recovery, repository_root=tmp_path,
+        manifest_path=fixture['recovery_manifest'])
+    assert validated_runtime['checkpoint_path'] == fixture['recovery_checkpoint']
     controller = OptimizationController(
         tmp_path / 'work_dirs/optimization', recovery, lambda *_args: None,
-        repository_root=tmp_path, manifest_path=recovery_manifest,
+        repository_root=tmp_path, manifest_path=fixture['recovery_manifest'],
         stages=('train',))
-    assert controller._artifact_schema('train', train_path) == 'numeric-train-v1'
-    downstream = recovery_stage.parent / 'profile/profile.json'
+    assert controller._artifact_schema(
+        'train', fixture['train_path']) == 'numeric-train-v1'
+    downstream = fixture['recovery_stage'].parent / 'profile/profile.json'
     downstream.parent.mkdir()
     assert resolve_numeric_runtime(
         recovery, repository_root=tmp_path,
-        manifest_path=recovery_manifest,
-        downstream_output=downstream)['checkpoint_path'] == recovery_runtime
+        manifest_path=fixture['recovery_manifest'],
+        downstream_output=downstream)['checkpoint_path'] == (
+            fixture['recovery_checkpoint'])
 
-    calibration_path.write_text('{"forged":true}\n')
+    fixture['calibration_path'].write_text('{"forged":true}\n')
     with pytest.raises(ValueError, match='calibration.*hash'):
         validate_recovery_calibration_dependency(
             recovery, repository_root=tmp_path,
-            recovery_manifest_path=recovery_manifest,
-            recovery_stage_dir=recovery_stage)
+            recovery_manifest_path=fixture['recovery_manifest'],
+            recovery_stage_dir=fixture['recovery_stage'])
+
+
+def test_w8a8_train_handoff_rejects_hash_matching_non_numeric_runtime_config(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import (
+        ArtifactValidationError, OptimizationController)
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, resolve_numeric_runtime,
+        validate_numeric_train_artifact)
+    from mambapose_opt.numeric_source import file_sha256
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    fixture['resolved_train'].write_text('runtime = True\n')
+    forged = deepcopy(fixture['train'])
+    forged['result']['runtime']['config']['sha256'] = file_sha256(
+        fixture['resolved_train'])
+    fixture['train_path'].write_text(json.dumps(forged))
+
+    with pytest.raises(NumericRuntimeError, match='config|W8A8|policy'):
+        validate_numeric_train_artifact(
+            forged, candidate=fixture['recovery'],
+            repository_root=tmp_path,
+            manifest_path=fixture['recovery_manifest'])
+    controller = OptimizationController(
+        tmp_path / 'work_dirs/optimization', fixture['recovery'],
+        lambda *_args: None, repository_root=tmp_path,
+        manifest_path=fixture['recovery_manifest'], stages=('train',))
+    with pytest.raises(ArtifactValidationError, match='config|W8A8|policy'):
+        controller._artifact_schema('train', fixture['train_path'])
+    downstream = fixture['recovery_stage'].parent / 'profile/profile.json'
+    downstream.parent.mkdir()
+    with pytest.raises(NumericRuntimeError, match='config|W8A8|policy'):
+        resolve_numeric_runtime(
+            fixture['recovery'], repository_root=tmp_path,
+            manifest_path=fixture['recovery_manifest'],
+            downstream_output=downstream)
+
+
+@pytest.mark.parametrize(
+    'mutation', ('missing-calibration', 'changed-calibration', 'missing-hook'))
+def test_w8a8_train_handoff_rejects_mutated_runtime_policy(
+        tmp_path, monkeypatch, mutation):
+    from mmengine.config import Config
+
+    from mambapose_opt.controller import (
+        ArtifactValidationError, OptimizationController)
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, validate_numeric_train_artifact)
+    from mambapose_opt.numeric_source import file_sha256
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    policy = Config.fromfile(tmp_path / fixture['recovery'].config)
+    if mutation != 'missing-calibration':
+        policy.numeric_optimization.quant_policy.calibration_artifact = dict(
+            fixture['calibration_reference'])
+    if mutation == 'changed-calibration':
+        policy.numeric_optimization.quant_policy.calibration_artifact.sha256 = (
+            'f' * 64)
+    if mutation == 'missing-hook':
+        policy.custom_hooks = []
+    policy.work_dir = str(fixture['recovery_stage'] / 'mmpose')
+    policy.load_from = str(tmp_path / fixture['recovery'].checkpoint)
+    policy.resume = False
+    policy.randomness = dict(seed=fixture['recovery'].seed, deterministic=True)
+    policy.dump(fixture['resolved_train'])
+    forged = deepcopy(fixture['train'])
+    forged['result']['runtime']['config']['sha256'] = file_sha256(
+        fixture['resolved_train'])
+    fixture['train_path'].write_text(json.dumps(forged))
+
+    with pytest.raises(NumericRuntimeError, match='config|W8A8|policy'):
+        validate_numeric_train_artifact(
+            forged, candidate=fixture['recovery'],
+            repository_root=tmp_path,
+            manifest_path=fixture['recovery_manifest'])
+    controller = OptimizationController(
+        tmp_path / 'work_dirs/optimization', fixture['recovery'],
+        lambda *_args: None, repository_root=tmp_path,
+        manifest_path=fixture['recovery_manifest'], stages=('train',))
+    with pytest.raises(ArtifactValidationError, match='config|W8A8|policy'):
+        controller._artifact_schema('train', fixture['train_path'])
+
+
+@pytest.mark.parametrize(
+    'mutation', ('hash', 'source', 'candidate', 'runtime-config'))
+def test_recovery_admission_rejects_mismatched_screen_evaluation_authority(
+        tmp_path, monkeypatch, mutation):
+    from mambapose_opt.evaluation import build_source_binding
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, validate_recovery_admission)
+    from mambapose_opt.numeric_source import file_sha256
+    from mambapose_opt.schema import load_candidate_manifest
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    evaluation_path = fixture['screen_evaluation_path']
+    if mutation == 'hash':
+        evaluation_path.write_text(evaluation_path.read_text() + '\n')
+    else:
+        value = json.loads(evaluation_path.read_text())
+        if mutation == 'source':
+            value['result']['source']['manifest_path'] = (
+                fixture['recovery_manifest'].relative_to(tmp_path).as_posix())
+        elif mutation == 'candidate':
+            teacher = fixture['teacher']
+            teacher_source = build_source_binding(
+                repository_root=tmp_path, candidate=teacher,
+                manifest_path=fixture['screen_manifest'],
+                git_commit=fixture['screen_commit'])
+            value['candidate_id'] = teacher.id
+            value['result']['route'] = teacher.route
+            value['result']['calibration_split'] = None
+            value['result']['source'] = teacher_source
+            for row in value['result']['modes'].values():
+                row['provenance']['checkpoint_sha256'] = (
+                    teacher.checkpoint_sha256)
+                row['determinism']['provenance']['checkpoint_sha256'] = (
+                    teacher.checkpoint_sha256)
+                row['protocol']['source_config'] = teacher.config.as_posix()
+                row['protocol']['checkpoint'] = teacher.checkpoint.as_posix()
+        else:
+            for row in value['result']['modes'].values():
+                row['provenance']['config_sha256'] = 'f' * 64
+                row['determinism']['provenance']['config_sha256'] = 'f' * 64
+        evaluation_path.write_text(json.dumps(value))
+        recovery_manifest = json.loads(
+            fixture['recovery_manifest'].read_text())
+        recovery_manifest['candidates'][0]['features'][
+            'recovery_candidate_evaluation_sha256'] = file_sha256(
+                evaluation_path)
+        fixture['recovery_manifest'].write_text(json.dumps(recovery_manifest))
+        admission = json.loads(fixture['admission_path'].read_text())
+        admission['candidate_evaluation']['sha256'] = file_sha256(
+            evaluation_path)
+        fixture['admission_path'].write_text(json.dumps(admission))
+        _commit_fixture(tmp_path, f'authorize {mutation} evaluation')
+        fixture['recovery'] = load_candidate_manifest(
+            fixture['recovery_manifest'])[0]
+
+    with pytest.raises(
+            NumericRuntimeError, match='hash|source|manifest|candidate|identity'):
+        validate_recovery_admission(
+            fixture['admission_path'], candidate=fixture['recovery'],
+            repository_root=tmp_path,
+            manifest_path=fixture['recovery_manifest'])
+
+
+def test_w8a8_recovery_rejects_same_manifest_authority_cycle(
+        tmp_path, monkeypatch):
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, validate_recovery_calibration_dependency)
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    with pytest.raises(NumericRuntimeError, match='follow-on|cyclic'):
+        validate_recovery_calibration_dependency(
+            fixture['recovery'], repository_root=tmp_path,
+            recovery_manifest_path=fixture['screen_manifest'],
+            recovery_stage_dir=fixture['recovery_stage'])
 
 
 def test_campaign_does_not_auto_select_opt_in_numeric_candidates():
