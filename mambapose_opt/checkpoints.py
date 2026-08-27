@@ -105,6 +105,34 @@ def authorize_manifest_candidate(
     return AuthorizedCandidate(candidate, config, checkpoint, source)
 
 
+def authorize_candidate_checkpoint_reference(
+        repository_root: Path, manifest_path: Path, candidate: CandidateSpec,
+        reference: object) -> Path:
+    """Bind one serialized logical checkpoint reference to its approved file."""
+    if not isinstance(reference, Mapping) or set(reference) != {
+            'path', 'sha256'}:
+        raise ValueError('candidate checkpoint reference is invalid')
+    expected = {
+        'path': candidate.checkpoint.as_posix(),
+        'sha256': candidate.checkpoint_sha256,
+    }
+    if dict(reference) != expected:
+        raise ValueError(
+            'candidate checkpoint reference disagrees with manifest')
+    try:
+        authorized = authorize_manifest_candidate(
+            repository_root, manifest_path, candidate.id)
+    except (
+            OSError, RuntimeError, subprocess.SubprocessError,
+            ValueError) as error:
+        raise ValueError(
+            f'candidate checkpoint is not authorized: {error}') from error
+    if authorized.candidate != candidate:
+        raise ValueError(
+            'candidate checkpoint reference differs from authorized manifest')
+    return authorized.checkpoint_path
+
+
 def authorized_tracked_file(
         repository_root: Path, relative: Path | str, *, commit: str,
         label: str) -> Path:

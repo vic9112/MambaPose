@@ -462,13 +462,21 @@ class OptimizationController:
                         'path', 'sha256'}:
                     raise ArtifactValidationError(
                         f'numeric {role} binding schema is invalid')
-                path = (self.repository_root / str(binding['path'])).resolve()
+                if role == 'checkpoint':
+                    # The public numeric validator immediately above binds this
+                    # logical record through the manifest checkpoint authority.
+                    # Re-resolving it under a linked worktree would confuse the
+                    # approved primary asset path with an arbitrary escape.
+                    continue
+                binding_path = (
+                    self.repository_root / str(binding['path'])).resolve()
                 try:
-                    path.relative_to(self.repository_root)
+                    binding_path.relative_to(self.repository_root)
                 except ValueError as error:
                     raise ArtifactValidationError(
                         f'numeric {role} binding escapes repository') from error
-                if not path.is_file() or _sha256(path) != binding['sha256']:
+                if (not binding_path.is_file()
+                        or _sha256(binding_path) != binding['sha256']):
                     raise ArtifactValidationError(
                         f'numeric {role} binding hash mismatch')
             if result.get('latency_claim') != (

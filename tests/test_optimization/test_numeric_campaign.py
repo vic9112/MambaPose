@@ -424,7 +424,16 @@ def _linked_numeric_checkpoint_fixture(tmp_path):
     (main / 'configs').mkdir()
     (main / 'optimization').mkdir()
     (main / '.gitignore').write_text('/data\nwork_dirs/\n')
-    (main / 'configs/candidate.py').write_text('policy = True\n')
+    (main / 'configs/candidate.py').write_text(
+        'numeric_optimization = dict(\n'
+        "    candidate_kind='weight-only',\n"
+        '    quant_policy=dict(\n'
+        "        allow=('layer',), deny=(),\n"
+        '        spec=dict(enabled=True, weight_bits=8, '
+        'activation_bits=None, per_output_channel=True, symmetric=True)),\n'
+        '    precision_invariants=dict(\n'
+        "        selective_scan_state_accumulation='fp32',\n"
+        "        attention_softmax='floating', norms='floating'))\n")
     (main / 'optimization/coco_train2017_authority.json').write_text(
         '{"split":"train2017"}\n')
     (main / 'optimization/coco_val2017_authority.json').write_text(
@@ -682,6 +691,101 @@ def test_numeric_convert_rejects_alternate_same_byte_tree_before_model_load(
             manifest_path=fixture['manifest'])
 
     assert entered == []
+
+
+def test_linked_numeric_convert_producer_round_trips_controller_validation(
+        tmp_path, monkeypatch):
+    from torch import nn
+
+    from mambapose_opt.controller import OptimizationController
+    from tools.optimization import convert_numeric
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    linked = fixture['linked']
+    candidate = fixture['candidate']
+    output = (
+        linked / 'work_dirs/optimization/ssm-quant-pwl/numeric/0/'
+        'convert/convert.json')
+    output.parent.mkdir(parents=True)
+    model = nn.Module()
+    model.layer = nn.Linear(2, 2)
+    monkeypatch.setattr(convert_numeric, 'REPOSITORY_ROOT', linked)
+    monkeypatch.setattr(
+        'mmpose.apis.init_model', lambda *_args, **_kwargs: model)
+
+    produced = convert_numeric.convert(
+        candidate, stage='convert', output=output,
+        manifest_path=fixture['manifest'])
+    output.write_text(json.dumps(produced, allow_nan=False))
+    controller = OptimizationController(
+        linked / 'work_dirs/optimization', candidate, lambda *_args: None,
+        repository_root=linked, manifest_path=fixture['manifest'],
+        stages=('convert',))
+
+    assert controller._artifact_schema('convert', output) == (
+        'optimization-stage-envelope-v1')
+
+
+def test_numeric_convert_validator_rejects_manifest_unapproved_checkpoint_root(
+        tmp_path):
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, validate_numeric_convert_artifact)
+    from mambapose_opt.numeric_source import build_numeric_source_binding
+    from mambapose_opt.schema import load_candidate_manifest
+
+    fixture = _linked_numeric_checkpoint_fixture(tmp_path)
+    main = fixture['main']
+    linked = fixture['linked']
+    unapproved = main / 'models/model.pth'
+    unapproved.parent.mkdir()
+    unapproved.write_bytes(fixture['checkpoint'].read_bytes())
+    manifest = main / 'optimization/candidates.json'
+    value = json.loads(manifest.read_text())
+    value['candidates'][0]['checkpoint'] = 'models/model.pth'
+    manifest.write_text(json.dumps(value))
+    commit = _commit_fixture(main, 'use unapproved numeric checkpoint root')
+    subprocess.run(
+        ['git', 'reset', '--hard', '-q', commit], cwd=linked, check=True)
+    linked_manifest = linked / 'optimization/candidates.json'
+    candidate = load_candidate_manifest(linked_manifest)[0]
+    config_sha = hashlib.sha256(
+        (linked / candidate.config).read_bytes()).hexdigest()
+    source = build_numeric_source_binding(
+        repository_root=linked, candidate=candidate,
+        manifest_path=linked_manifest,
+        policy_path=linked / candidate.config)
+    artifact_path = (
+        linked / 'work_dirs/optimization/ssm-quant-pwl/numeric/0/'
+        'convert/convert.json')
+    artifact = {
+        'schema_version': 1, 'candidate_id': candidate.id, 'stage': 'convert',
+        'result': {
+            'source': source,
+            'runtime_bindings': {
+                'config': {'path': candidate.config.as_posix(),
+                           'sha256': config_sha},
+                'checkpoint': {'path': candidate.checkpoint.as_posix(),
+                               'sha256': candidate.checkpoint_sha256},
+                'policy': {'path': candidate.config.as_posix(),
+                           'sha256': config_sha},
+            },
+            'conversion': {
+                'converted': ['layer'], 'skipped': [],
+                'original_weight_bytes': 4, 'simulated_weight_bytes': 1,
+                'simulated_coverage': 1.0, 'simulation_only': True,
+                'integer_kernel_latency_claimed': False,
+            },
+            'precision_invariants': {
+                'selective_scan_state_accumulation': 'fp32',
+                'attention_softmax': 'floating', 'norms': 'floating'},
+            'latency_claim': 'none-fake-quant-is-not-an-integer-kernel',
+        },
+    }
+
+    with pytest.raises(NumericRuntimeError, match='authorized|approved'):
+        validate_numeric_convert_artifact(
+            artifact, candidate=candidate, repository_root=linked,
+            manifest_path=linked_manifest, artifact_path=artifact_path)
 
 
 @pytest.mark.parametrize(

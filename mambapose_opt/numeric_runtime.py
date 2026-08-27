@@ -6,7 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from .checkpoints import authorize_manifest_candidate
+from .checkpoints import (
+    authorize_candidate_checkpoint_reference, authorize_manifest_candidate)
 from .numeric_source import (
     file_sha256, resolve_numeric_file, validate_numeric_config_closure,
     validate_numeric_source_binding)
@@ -63,7 +64,16 @@ def validate_numeric_convert_artifact(
         if bindings.get(role) != {'path': path, 'sha256': sha256}:
             raise NumericRuntimeError(
                 f'numeric {role} binding is not canonical')
-        _file(repository_root, bindings[role], f'numeric {role}')
+        if role == 'checkpoint':
+            try:
+                authorize_candidate_checkpoint_reference(
+                    repository_root, manifest_path, candidate, bindings[role])
+            except ValueError as error:
+                raise NumericRuntimeError(
+                    f'numeric checkpoint binding is not authorized: '
+                    f'{error}') from error
+        else:
+            _file(repository_root, bindings[role], f'numeric {role}')
     conversion = result['conversion']
     conversion_fields = {
         'converted', 'skipped', 'original_weight_bytes',
@@ -762,7 +772,16 @@ def resolve_numeric_runtime(
                     'config', 'checkpoint', 'policy', 'calibration'}):
             raise NumericRuntimeError('W8A8 runtime bindings are incomplete')
         for name, reference in bindings.items():
-            _file(repository_root, reference, f'W8A8 {name}')
+            if name == 'checkpoint':
+                try:
+                    authorize_candidate_checkpoint_reference(
+                        repository_root, manifest_path, candidate, reference)
+                except ValueError as error:
+                    raise NumericRuntimeError(
+                        f'W8A8 checkpoint binding is not authorized: '
+                        f'{error}') from error
+            else:
+                _file(repository_root, reference, f'W8A8 {name}')
         return {
             'config_path': runtime_config,
             'config_sha256': result['runtime_config']['sha256'],
