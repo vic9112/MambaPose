@@ -32,6 +32,7 @@ from mambapose_opt.numeric_source import build_numeric_source_binding
 from mambapose_opt.pwl_artifacts import (
     build_pwl_installation_manifest, validate_pwl_fit_report,
     validate_pwl_installation_manifest)
+from mambapose_opt.pwl_selection import load_pwl_selection_reference
 from mambapose_opt.schema import load_candidate_manifest
 from mmpose.models.utils.hardware_friendly import (
     convert_for_fake_quant, export_int8_state)
@@ -43,6 +44,28 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _strict_input(path: Path, *, label: str) -> Path:
+    """Keep lexical path authority so a symlink alias cannot be normalized."""
+    root = REPOSITORY_ROOT.resolve(strict=True)
+    supplied = Path(path)
+    if any(part in {'.', '..'} for part in supplied.parts):
+        raise ValueError(f'{label} path is unsafe')
+    lexical = supplied if supplied.is_absolute() else root / supplied
+    lexical = lexical.absolute()
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f'{label} path escapes repository') from error
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError(f'{label} path must not use symlink')
+    if not cursor.is_file():
+        raise ValueError(f'{label} is missing')
+    return cursor
 
 
 def _candidate(path: Path, identifier: str):
@@ -71,7 +94,8 @@ def _atomic_json(path: Path, value: dict) -> None:
 
 def convert(
         candidate, *, stage: str, output: Path, manifest_path: Path,
-        calibration_artifact: Path | None = None) -> dict:
+        calibration_artifact: Path | None = None,
+        selection_artifact: Path | None = None) -> dict:
     kind = candidate.features.get('numeric_kind')
     if candidate.route != 'ssm-quant-pwl' \
             or kind not in {'weight-only', 'w8a8', 'pwl'}:
@@ -79,6 +103,9 @@ def convert(
             'deterministic Stage A conversion admits W8/W8A8/PWL only')
     if kind == 'pwl' and calibration_artifact is None:
         raise ValueError('PWL conversion requires completed calibration fit artifact')
+    if kind == 'pwl' and selection_artifact is None:
+        raise ValueError(
+            'PWL conversion requires hash-bound four-candidate selection')
     if kind == 'pwl' and stage != 'convert':
         raise ValueError('PWL conversion has one install stage and no packed export')
     authorized = authorize_manifest_candidate(
@@ -94,12 +121,28 @@ def convert(
     checkpoint_path = authorized.checkpoint_path
     config = Config.fromfile(config_path)
     calibration = None
+    selection_reference = None
+    if kind == 'pwl':
+        selection_artifact = _strict_input(
+            selection_artifact, label='PWL selection artifact')
+        selection_reference = {
+            'path': selection_artifact.relative_to(
+                REPOSITORY_ROOT).as_posix(),
+            'sha256': _sha256(selection_artifact),
+        }
+        selection = load_pwl_selection_reference(
+            selection_reference, repository_root=REPOSITORY_ROOT,
+            manifest_path=manifest_path)
+        if (selection.get('decision') != 'selected'
+                or selection.get('selected_candidate_id') != candidate.id):
+            raise ValueError(
+                'PWL candidate is not admitted by four-candidate selection')
     if kind in {'w8a8', 'pwl'}:
         if calibration_artifact is None:
             raise ValueError(
                 f'{kind} conversion requires --calibration-artifact')
-        calibration_artifact = calibration_artifact.resolve()
-        calibration_artifact.relative_to(REPOSITORY_ROOT.resolve())
+        calibration_artifact = _strict_input(
+            calibration_artifact, label=f'{kind} calibration artifact')
         calibration = json.loads(calibration_artifact.read_text(encoding='utf-8'))
         validate_calibration_provenance(
             calibration, expected_candidate=candidate,
@@ -124,6 +167,8 @@ def convert(
     }
     if calibration_artifact is not None:
         runtime_paths['calibration'] = calibration_artifact
+    if selection_artifact is not None:
+        runtime_paths['selection'] = selection_artifact
     binding = bind_numeric_inputs(runtime_paths)
     verify_numeric_inputs(binding)
 
@@ -156,6 +201,8 @@ def convert(
         config.numeric_optimization.pwl.fit_artifact = calibration_reference
         config.numeric_optimization.pwl.installation_manifest = (
             installation_reference)
+        config.numeric_optimization.pwl.selection_artifact = (
+            selection_reference)
     else:
         report = convert_for_fake_quant(model, policy)
     verify_numeric_inputs(binding)
@@ -175,6 +222,8 @@ def convert(
                             if role == 'checkpoint'
                             else calibration_reference['path']
                             if role == 'calibration'
+                            else selection_reference['path']
+                            if role == 'selection'
                             else candidate.config.as_posix()),
                         'sha256': checksum,
                     }
@@ -186,6 +235,7 @@ def convert(
                     'sha256': _sha256(runtime_config),
                 },
                 'installation': installation_reference,
+                'selection': selection_reference,
                 'operation_manifest': installation['operation_manifest'],
                 'latency_claim': (
                     'none-pwl-pytorch-runtime-is-not-fpga-proof'),
@@ -248,6 +298,7 @@ def main() -> int:
                         default=REPOSITORY_ROOT / 'optimization/candidates.json')
     parser.add_argument('--output', required=True)
     parser.add_argument('--calibration-artifact', type=Path)
+    parser.add_argument('--selection-artifact', type=Path)
     args = parser.parse_args()
     try:
         output = optimization_output_path(
@@ -256,7 +307,8 @@ def main() -> int:
         _atomic_json(output, convert(
             candidate, stage=args.stage, output=output,
             manifest_path=args.manifest,
-            calibration_artifact=args.calibration_artifact))
+            calibration_artifact=args.calibration_artifact,
+            selection_artifact=args.selection_artifact))
         return 0
     except (OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))

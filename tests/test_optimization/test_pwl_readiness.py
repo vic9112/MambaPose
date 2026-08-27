@@ -5,6 +5,7 @@ import subprocess
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 
 def _policy(function_name='silu'):
@@ -33,7 +34,7 @@ def _fit(function_name='silu', values=None):
         observations={
             'block.act': [
                 torch.tensor(
-                    values if values is not None else [-3.0, -1.0, 0.0, 2.5],
+                    values if values is not None else [-1.0, 0.0, 1.0],
                     dtype=torch.float64)
             ]
         })
@@ -47,6 +48,65 @@ def _write_reference(root: Path, artifact: dict, relative: str):
         'path': relative,
         'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
     }
+
+
+def _selection_calibrations():
+    common_source = {
+        'git_commit': '1' * 40,
+        'manifest_path': 'optimization/candidates.json',
+        'manifest_sha256': '2' * 64,
+        'checkpoint_path': 'work_dirs/reproduction/full.pth',
+        'checkpoint_sha256': '3' * 64,
+        'authority_path': 'optimization/coco_train2017_authority.json',
+        'authority_sha256': '4' * 64,
+    }
+    common_identity = {
+        'config': 'configs/reproduction/coco_s_v1.py',
+        'config_sha256': '5' * 64,
+        'checkpoint': 'work_dirs/reproduction/full.pth',
+        'checkpoint_sha256': '3' * 64,
+        'dataset': {'authority': 'same-train2017'},
+        'git_commit': '1' * 40,
+    }
+    common_protocol = {
+        'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
+        'worker_count': 0, 'sample_count': 512,
+        'sample_order_sha256': '6' * 64,
+        'root_determinism': {'seed': 0},
+    }
+    result = {}
+    checksum_digits = {'silu': 'a', 'gelu': 'b', 'softplus': 'c', 'exp': 'd'}
+    for function in ('silu', 'gelu', 'softplus', 'exp'):
+        candidate_id = f'pwl-{function}-s-v1'
+        policy = _policy(function)
+        fit = _fit(function, values=[-1.0, 0.0, 1.0])
+        result[candidate_id] = {
+            'reference': {
+                'path': (f'work_dirs/optimization/{candidate_id}/0/'
+                         'calibrate/calibrate.json'),
+                'sha256': checksum_digits[function] * 64,
+            },
+            'policy': policy,
+            'calibration': {
+                'schema_version': 3, 'candidate_id': candidate_id,
+                'stage': 'calibrate',
+                'source': {**common_source,
+                           'candidate_id': candidate_id,
+                           'candidate_row_sha256': '7' * 64,
+                           'config_path': f'configs/{function}.py',
+                           'config_sha256': function[-1] * 64,
+                           'policy_path': f'configs/{function}.py',
+                           'policy_sha256': function[-1] * 64},
+                'identity': {**common_identity,
+                             'candidate_id': 'full-s-v1',
+                             'policy': f'configs/{function}.py',
+                             'policy_sha256': function[-1] * 64,
+                             'split': 'train2017'},
+                'protocol': dict(common_protocol),
+                'hooks': {}, 'pwl_fit': fit,
+            },
+        }
+    return result
 
 
 def test_pwl_fit_records_exact_role_ranges_errors_and_saturation():
@@ -73,11 +133,32 @@ def test_pwl_fit_records_exact_role_ranges_errors_and_saturation():
     assert role['clamp']['ratio'] == 0.5
 
 
+def test_pwl_fit_records_validator_recomputable_exact_role_tail_percentiles():
+    from mambapose_opt.pwl_artifacts import validate_pwl_fit_report
+
+    fit = _fit(values=[0.0, 0.25, 0.5, 1.0, 2.0])
+    tail = fit['role_observations'][0]['tail_statistics']
+
+    assert tail['algorithm'] == 'fixed-log2-absolute-histogram-v1'
+    assert set(tail['absolute_percentiles']) == {'0.9', '0.99', '0.999'}
+    assert len(tail['histogram']) == tail['histogram_bins'] == 256
+    assert sum(tail['histogram']) + tail['zero_count'] == tail['sample_count']
+    assert list(tail['absolute_percentiles'].values()) == sorted(
+        tail['absolute_percentiles'].values())
+    assert validate_pwl_fit_report(fit, expected_policy=_policy()) == fit
+
+    forged = json.loads(json.dumps(fit))
+    forged['role_observations'][0]['tail_statistics'][
+        'absolute_percentiles']['0.99'] *= 0.5
+    with pytest.raises(ValueError, match='tail'):
+        validate_pwl_fit_report(forged, expected_policy=_policy())
+
+
 def test_pwl_artifact_ranking_is_measured_not_function_name_order():
     from mambapose_opt.pwl_artifacts import rank_pwl_fit_artifacts
 
-    silu = _fit('silu')
-    gelu = _fit('gelu')
+    silu = _fit('silu', values=[-2.0, -1.5])
+    gelu = _fit('gelu', values=[-2.0, -1.5])
 
     assert [item['candidate_id'] for item in rank_pwl_fit_artifacts(
             [silu, gelu])] == ['pwl-gelu-s-v1', 'pwl-silu-s-v1']
@@ -99,6 +180,85 @@ def test_pwl_fit_rejects_forged_role_range_and_recomputed_error():
         validate_pwl_fit_report(forged_error)
 
 
+def test_pwl_fit_rejects_compound_forged_coefficients_and_all_metrics():
+    """Break caught: self-consistent noncanonical coefficients must not pass."""
+    from mambapose_opt.pwl_artifacts import (
+        PWLArtifactError, validate_pwl_fit_report)
+    from mmpose.models.utils.hardware_friendly.pwl import fit_pwl
+
+    values = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float64)
+    fit = _fit(values=values.tolist())
+    forged_approximation = fit_pwl(
+        F.gelu, (-2.0, 2.0), 4, 129, function_name='silu')
+    forged = json.loads(json.dumps(fit))
+    forged['coefficients'] = {
+        'breakpoints': forged_approximation.breakpoints.tolist(),
+        'slopes': forged_approximation.slopes.tolist(),
+        'intercepts': forged_approximation.intercepts.tolist(),
+    }
+
+    def metric(bounds, samples):
+        grid = torch.linspace(*bounds, samples, dtype=torch.float64)
+        error = (forged_approximation(grid) - F.silu(grid)).abs()
+        return {
+            'max': float(error.max()), 'mean': float(error.mean()),
+            'samples': int(error.numel()),
+        }
+
+    observed_error = (forged_approximation(values) - F.silu(values)).abs()
+    sample_metric = {
+        'max': float(observed_error.max()),
+        'mean': float(observed_error.mean()), 'samples': 3,
+    }
+    forged['in_domain_error'] = metric((-2.0, 2.0), 129)
+    forged['observed_range_error'] = metric((-1.0, 1.0), 129)
+    forged['observed_samples_error'] = sample_metric
+    forged['role_observations'][0]['observed_range_error'] = metric(
+        (-1.0, 1.0), 129)
+    forged['role_observations'][0]['observed_samples_error'] = sample_metric
+
+    with pytest.raises(PWLArtifactError, match='canonical'):
+        validate_pwl_fit_report(
+            forged, expected_candidate_id='pwl-silu-s-v1',
+            expected_policy=_policy())
+
+
+def test_out_of_domain_fit_is_publishable_but_not_rankable_or_installable():
+    """Break caught: measured saturation must never enter installation."""
+    from mambapose_opt.pwl_artifacts import (
+        PWLArtifactError, build_pwl_installation_manifest,
+        rank_pwl_fit_artifacts, validate_pwl_fit_report)
+
+    rejected = _fit(values=[-20.0, 0.0, 20.0])
+
+    assert rejected['admission'] == {
+        'decision': 'rejected',
+        'reasons': ['clamp-count-nonzero', 'observed-range-outside-domain'],
+    }
+    assert validate_pwl_fit_report(
+        rejected, expected_policy=_policy()) == rejected
+    with pytest.raises(PWLArtifactError, match='not admitted'):
+        rank_pwl_fit_artifacts([rejected])
+    with pytest.raises(PWLArtifactError, match='not admitted'):
+        build_pwl_installation_manifest(
+            candidate_id='pwl-silu-s-v1', fit=rejected,
+            fit_reference={'path': 'work_dirs/optimization/fit.json',
+                           'sha256': 'a' * 64})
+
+
+def test_fit_admission_rejects_compound_zero_clamp_with_outside_range():
+    from mambapose_opt.pwl_artifacts import (
+        PWLArtifactError, validate_pwl_fit_report)
+
+    forged = _fit(values=[-20.0, 0.0, 20.0])
+    forged['clamp'] = {'below': 0, 'above': 0, 'total': 3, 'ratio': 0.0}
+    forged['role_observations'][0]['clamp'] = dict(forged['clamp'])
+    forged['admission'] = {'decision': 'passed', 'reasons': []}
+
+    with pytest.raises(PWLArtifactError, match='admission'):
+        validate_pwl_fit_report(forged, expected_policy=_policy())
+
+
 def test_exp_fit_retains_exact_export_time_constant_folding_comparator():
     fit = _fit('exp', values=[-1.0, 0.0, 1.0])
 
@@ -110,6 +270,117 @@ def test_exp_fit_retains_exact_export_time_constant_folding_comparator():
         'mean_error': 0.0,
         'preferred_over_pwl_when_exportable': True,
     }
+
+
+def test_four_candidate_selection_excludes_exportable_exp_and_is_measured():
+    """Break caught: exp metadata must control the production decision."""
+    from mambapose_opt.pwl_selection import build_pwl_selection_record
+
+    selection = build_pwl_selection_record(
+        manifest_reference={
+            'path': 'optimization/candidates.json', 'sha256': '2' * 64},
+        calibrations=_selection_calibrations())
+
+    assert selection['artifact_kind'] == 'pwl-four-candidate-selection'
+    assert [row['candidate_id'] for row in selection['candidates']] == [
+        'pwl-silu-s-v1', 'pwl-gelu-s-v1',
+        'pwl-softplus-s-v1', 'pwl-exp-s-v1']
+    exp = next(row for row in selection['candidates']
+               if row['candidate_id'] == 'pwl-exp-s-v1')
+    assert exp['selection_status'] == 'excluded-exact-constant-fold'
+    assert 'pwl-exp-s-v1' not in selection['ranking']
+    assert selection['selected_candidate_id'] == selection['ranking'][0]
+    assert selection['selected_candidate_id'] != 'pwl-exp-s-v1'
+
+
+@pytest.mark.parametrize(
+    ('mutation', 'message'),
+    [
+        (lambda values: values.pop('pwl-gelu-s-v1'), 'exactly four'),
+        (lambda values: values['pwl-gelu-s-v1']['calibration']['source']
+         .__setitem__('git_commit', '9' * 40), 'source authority'),
+        (lambda values: values['pwl-gelu-s-v1']['calibration']['identity']
+         .__setitem__('checkpoint_sha256', '9' * 64), 'source authority'),
+        (lambda values: values['pwl-gelu-s-v1']['calibration']['protocol']
+         .__setitem__('sample_order_sha256', '9' * 64), 'protocol'),
+        (lambda values: values['pwl-gelu-s-v1']['calibration']['protocol']
+         .__setitem__('sample_count', 511), 'protocol'),
+    ],
+)
+def test_four_candidate_selection_requires_cross_artifact_authority(
+        mutation, message):
+    from mambapose_opt.pwl_selection import (
+        PWLSelectionError, build_pwl_selection_record)
+
+    values = _selection_calibrations()
+    mutation(values)
+
+    with pytest.raises(PWLSelectionError, match=message):
+        build_pwl_selection_record(
+            manifest_reference={
+                'path': 'optimization/candidates.json', 'sha256': '2' * 64},
+            calibrations=values)
+
+
+def test_selection_reference_is_relative_hash_bound_and_rejects_aliases(
+        tmp_path):
+    from mambapose_opt.pwl_selection import (
+        PWLSelectionError, load_pwl_selection_reference)
+
+    from mambapose_opt.pwl_selection import (
+        _load_selection_file, build_pwl_selection_record)
+
+    artifact = build_selection = build_pwl_selection_record(
+        manifest_reference={
+            'path': 'optimization/candidates.json', 'sha256': '2' * 64},
+        calibrations=_selection_calibrations())
+    path = tmp_path / (
+        'work_dirs/optimization/ssm-quant-pwl/pwl-selection/selection.json')
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(artifact), encoding='utf-8')
+    reference = {
+        'path': path.relative_to(tmp_path).as_posix(),
+        'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    assert _load_selection_file(
+        reference, repository_root=tmp_path) == build_selection
+
+    traversal = dict(reference, path=(
+        'work_dirs/optimization/ssm-quant-pwl/alias/../'
+        'pwl-selection/selection.json'))
+    with pytest.raises(PWLSelectionError, match='unsafe'):
+        load_pwl_selection_reference(
+            traversal, repository_root=tmp_path,
+            manifest_path=Path('optimization/candidates.json'))
+    alias = path.with_name('selection-alias.json')
+    alias.symlink_to(path)
+    with pytest.raises(PWLSelectionError, match='symlink'):
+        load_pwl_selection_reference(
+            {'path': alias.relative_to(tmp_path).as_posix(),
+             'sha256': reference['sha256']}, repository_root=tmp_path,
+            manifest_path=Path('optimization/candidates.json'))
+
+
+def test_exp_pwl_cannot_be_installed_even_with_an_admitted_fit():
+    from mambapose_opt.numeric_conversion import (
+        NumericBindingError, install_pwl_fit)
+    from mambapose_opt.pwl_artifacts import PWLInstallationReport
+
+    fit = _fit('exp', values=[-1.0, 0.0, 1.0])
+    report = PWLInstallationReport(
+        function_name='exp', source='ss2d-transition', roles=('block.act',),
+        input_roles=('block.act.transition_exp_input',), domain=(-2.0, 2.0),
+        segments=4, in_domain_max_error=fit['in_domain_error']['max'],
+        in_domain_mean_error=fit['in_domain_error']['mean'],
+        observed_range=(-1.0, 1.0),
+        observed_range_max_error=fit['observed_range_error']['max'],
+        observed_range_mean_error=fit['observed_range_error']['mean'],
+        clamp_ratio=0.0, fit_artifact_path='work_dirs/optimization/fit.json',
+        fit_artifact_sha256='a' * 64,
+        exact_comparator=fit['exact_comparator'])
+
+    with pytest.raises(NumericBindingError, match='constant fold'):
+        install_pwl_fit(torch.nn.Module(), fit=fit, expected_report=report)
 
 
 def test_pwl_fit_reference_is_relative_hash_bound_and_rejects_symlinks(
@@ -279,13 +550,27 @@ def test_numeric_runtime_installs_only_hash_bound_fit_and_manifest(
         'path': install_path.relative_to(tmp_path).as_posix(),
         'sha256': hashlib.sha256(install_path.read_bytes()).hexdigest(),
     }
+    selection_path = (
+        tmp_path / 'work_dirs/optimization/ssm-quant-pwl/'
+        'pwl-selection/selection.json')
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text('{}', encoding='utf-8')
+    selection_reference = {
+        'path': selection_path.relative_to(tmp_path).as_posix(),
+        'sha256': hashlib.sha256(selection_path.read_bytes()).hexdigest(),
+    }
     policy = _policy()
     policy.update({
         'candidate_id': 'pwl-silu-s-v1',
         'fit_artifact': fit_reference,
         'installation_manifest': install_reference,
+        'selection_artifact': selection_reference,
     })
     monkeypatch.setattr(numeric_conversion, 'REPOSITORY_ROOT', tmp_path)
+    monkeypatch.setattr(
+        'mambapose_opt.pwl_selection.load_pwl_selection_reference',
+        lambda *_args, **_kwargs: {
+            'selected_candidate_id': 'pwl-silu-s-v1'})
     model = torch.nn.ModuleDict({
         'block': torch.nn.ModuleDict({'act': torch.nn.SiLU()})})
 
@@ -345,6 +630,36 @@ def test_pwl_convert_requires_fit_artifact_before_model_load(
     assert entered == []
 
 
+def test_pwl_convert_requires_hash_bound_four_candidate_selection_before_load(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tools.optimization import convert_numeric
+
+    candidate = SimpleNamespace(
+        id='pwl-silu-s-v1', route='ssm-quant-pwl',
+        features={'numeric_kind': 'pwl'}, config=Path('configs/pwl.py'),
+        checkpoint=Path('checkpoint.pth'), checkpoint_sha256='a' * 64)
+    calibration = tmp_path / 'work_dirs/optimization/calibrate.json'
+    calibration.parent.mkdir(parents=True)
+    calibration.write_text('{}', encoding='utf-8')
+    entered = []
+    monkeypatch.setattr(
+        convert_numeric, 'authorize_manifest_candidate',
+        lambda *_args: SimpleNamespace(candidate=candidate))
+    monkeypatch.setattr(
+        'mmpose.apis.init_model',
+        lambda *_args, **_kwargs: entered.append(True))
+
+    with pytest.raises(ValueError, match='selection'):
+        convert_numeric.convert(
+            candidate, stage='convert',
+            output=tmp_path / 'work_dirs/optimization/pwl/convert.json',
+            manifest_path=tmp_path / 'optimization/candidates.json',
+            calibration_artifact=calibration)
+    assert entered == []
+
+
 def test_pwl_campaign_convert_consumes_canonical_calibrate_output(
         tmp_path, monkeypatch):
     from mambapose_opt.schema import CandidateSpec
@@ -371,6 +686,9 @@ def test_pwl_campaign_convert_consumes_canonical_calibrate_output(
     index = command.index('--calibration-artifact')
     assert command[index + 1].endswith(
         'pwl-silu-s-v1/calibrate/calibrate.json')
+    selection_index = command.index('--selection-artifact')
+    assert command[selection_index + 1].endswith(
+        'ssm-quant-pwl/pwl-selection/selection.json')
 
 
 def test_pwl_runtime_resolver_fails_closed_before_convert(
@@ -489,10 +807,32 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
     monkeypatch.setattr(
         'mambapose_opt.numeric_calibration.validate_calibration_provenance',
         lambda value, **_kwargs: value)
+    selection_path = (
+        tmp_path / 'work_dirs/optimization/ssm-quant-pwl/'
+        'pwl-selection/selection.json')
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text('{}', encoding='utf-8')
+    monkeypatch.setattr(
+        convert_numeric, 'load_pwl_selection_reference',
+        lambda *_args, **_kwargs: {
+            'decision': 'selected',
+            'selected_candidate_id': 'pwl-silu-s-v1'})
+    monkeypatch.setattr(
+        'mambapose_opt.pwl_selection.load_pwl_selection_reference',
+        lambda *_args, **_kwargs: {
+            'decision': 'selected',
+            'selected_candidate_id': 'pwl-silu-s-v1'})
+    monkeypatch.setattr(
+        'mambapose_opt.pwl_smoke.pwl_stage_a_binding',
+        lambda *_args, **_kwargs: {
+            'path': ('work_dirs/optimization/ssm-quant-pwl/'
+                     'pwl-silu-s-v1/0/smoke-stage-a/smoke.json'),
+            'sha256': '9' * 64})
 
     produced = convert_numeric.convert(
         candidate, stage='convert', output=output, manifest_path=manifest,
-        calibration_artifact=calibration_path)
+        calibration_artifact=calibration_path,
+        selection_artifact=selection_path)
     output.write_text(json.dumps(produced), encoding='utf-8')
     round_tripped = json.loads(output.read_text(encoding='utf-8'))
 
@@ -511,5 +851,6 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
         for stage in ('profile', 'evaluate', 'latency')]
     assert len({item['config_sha256'] for item in runtimes}) == 1
     assert len({item['pwl_installation']['sha256'] for item in runtimes}) == 1
+    assert len({item['pwl_stage_a']['sha256'] for item in runtimes}) == 1
     assert all(item['pwl_installation'] == produced['result']['installation']
                for item in runtimes)

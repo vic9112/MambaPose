@@ -24,6 +24,10 @@ class PWLArtifactError(ValueError):
 _SHA256 = re.compile(r'^[0-9a-f]{64}$')
 _FUNCTIONS = frozenset({'silu', 'gelu', 'softplus', 'exp'})
 _SELECTION_POLICY = 'observed-range-max-then-mean-v1'
+_TAIL_PERCENTILES = (0.9, 0.99, 0.999)
+_TAIL_BINS = 256
+_TAIL_MIN_EXP = -32.0
+_TAIL_MAX_EXP = 32.0
 
 
 @dataclass(frozen=True)
@@ -136,6 +140,120 @@ def _range_error(
     return _metric(error)
 
 
+def _new_tail_record() -> dict[str, Any]:
+    return {
+        'histogram': torch.zeros(_TAIL_BINS, dtype=torch.int64),
+        'zero_count': 0, 'underflow_count': 0, 'overflow_count': 0,
+    }
+
+
+def _observe_tail(record: dict[str, Any], observed: torch.Tensor) -> None:
+    absolute = observed.abs()
+    record['zero_count'] += int((absolute == 0).sum())
+    nonzero = absolute[absolute != 0]
+    if not nonzero.numel():
+        return
+    lower = 2 ** _TAIL_MIN_EXP
+    upper = 2 ** _TAIL_MAX_EXP
+    underflow = nonzero < lower
+    overflow = nonzero > upper
+    record['underflow_count'] += int(underflow.sum())
+    record['overflow_count'] += int(overflow.sum())
+    bounded = nonzero[~(underflow | overflow)]
+    if bounded.numel():
+        width = (_TAIL_MAX_EXP - _TAIL_MIN_EXP) / _TAIL_BINS
+        indices = torch.floor(
+            (torch.log2(bounded) - _TAIL_MIN_EXP) / width
+        ).to(torch.int64).clamp(0, _TAIL_BINS - 1)
+        record['histogram'].add_(torch.bincount(
+            indices, minlength=_TAIL_BINS).cpu())
+
+
+def _tail_percentile(
+        histogram: Sequence[int], *, zero_count: int,
+        total: int, percentile: float) -> float:
+    rank = max(1, math.ceil(percentile * total))
+    if rank <= zero_count:
+        return 0.0
+    cumulative = 0
+    for index, count in enumerate(histogram):
+        cumulative += count
+        if cumulative >= rank - zero_count:
+            width = (_TAIL_MAX_EXP - _TAIL_MIN_EXP) / _TAIL_BINS
+            return float(2 ** (_TAIL_MIN_EXP + (index + 1) * width))
+    raise PWLArtifactError('PWL tail histogram does not cover its samples')
+
+
+def _tail_report(record: Mapping[str, Any], *, total: int) -> dict[str, Any]:
+    histogram = [int(item) for item in record['histogram'].tolist()]
+    bounded = not (record['underflow_count'] or record['overflow_count'])
+    return {
+        'algorithm': 'fixed-log2-absolute-histogram-v1',
+        'sample_count': total,
+        'zero_count': record['zero_count'],
+        'underflow_count': record['underflow_count'],
+        'overflow_count': record['overflow_count'],
+        'histogram_bins': _TAIL_BINS,
+        'histogram_domain': [2 ** _TAIL_MIN_EXP, 2 ** _TAIL_MAX_EXP],
+        'histogram': histogram,
+        'percentile_bound_valid': bounded,
+        'absolute_percentiles': {
+            str(percentile): (
+                _tail_percentile(
+                    histogram, zero_count=record['zero_count'], total=total,
+                    percentile=percentile)
+                if bounded else None)
+            for percentile in _TAIL_PERCENTILES
+        },
+    }
+
+
+def _validate_tail_statistics(value: object, *, expected_total: int) -> bool:
+    fields = {
+        'algorithm', 'sample_count', 'zero_count', 'underflow_count',
+        'overflow_count', 'histogram_bins', 'histogram_domain', 'histogram',
+        'percentile_bound_valid', 'absolute_percentiles'}
+    if not isinstance(value, Mapping) or set(value) != fields:
+        return False
+    counts = ('sample_count', 'zero_count', 'underflow_count', 'overflow_count')
+    if (value['algorithm'] != 'fixed-log2-absolute-histogram-v1'
+            or value['sample_count'] != expected_total
+            or any(not isinstance(value[name], int)
+                   or isinstance(value[name], bool) or value[name] < 0
+                   for name in counts)
+            or value['histogram_bins'] != _TAIL_BINS
+            or value['histogram_domain'] != [
+                2 ** _TAIL_MIN_EXP, 2 ** _TAIL_MAX_EXP]
+            or not isinstance(value['histogram'], list)
+            or len(value['histogram']) != _TAIL_BINS
+            or any(not isinstance(item, int) or isinstance(item, bool) or item < 0
+                   for item in value['histogram'])
+            or sum(value['histogram']) + value['zero_count']
+            + value['underflow_count'] + value['overflow_count']
+            != expected_total):
+        return False
+    bounded = not (value['underflow_count'] or value['overflow_count'])
+    if value['percentile_bound_valid'] is not bounded:
+        return False
+    percentiles = value['absolute_percentiles']
+    if not isinstance(percentiles, Mapping) or set(percentiles) != {
+            str(item) for item in _TAIL_PERCENTILES}:
+        return False
+    if not bounded:
+        return all(item is None for item in percentiles.values())
+    expected = {
+        str(percentile): _tail_percentile(
+            value['histogram'], zero_count=value['zero_count'],
+            total=expected_total, percentile=percentile)
+        for percentile in _TAIL_PERCENTILES}
+    return all(
+        isinstance(percentiles[name], (int, float))
+        and not isinstance(percentiles[name], bool)
+        and math.isclose(
+            float(percentiles[name]), wanted, rel_tol=0.0, abs_tol=0.0)
+        for name, wanted in expected.items())
+
+
 class PWLObservationAccumulator:
     """Streaming exact-input observation without retaining calibration data."""
 
@@ -150,7 +268,7 @@ class PWLObservationAccumulator:
             role: {
                 'count': 0, 'minimum': math.inf, 'maximum': -math.inf,
                 'below': 0, 'above': 0, 'error_sum': 0.0,
-                'error_max': 0.0,
+                'error_max': 0.0, 'tail': _new_tail_record(),
             }
             for role in self.policy['roles']
         }
@@ -180,6 +298,7 @@ class PWLObservationAccumulator:
         record['above'] += int((observed > upper).sum())
         record['error_sum'] += float(error.sum())
         record['error_max'] = max(record['error_max'], float(error.max()))
+        _observe_tail(record['tail'], observed)
 
     def report(self, *, candidate_id: str) -> dict[str, Any]:
         if not isinstance(candidate_id, str) or not candidate_id:
@@ -217,6 +336,8 @@ class PWLObservationAccumulator:
                     self.approximation, self.reference, bounds,
                     policy['grid_points']),
                 'observed_samples_error': observed_error,
+                'tail_statistics': _tail_report(
+                    record['tail'], total=count),
                 'clamp': {
                     'below': role_below,
                     'above': role_above,
@@ -242,6 +363,11 @@ class PWLObservationAccumulator:
                 'mean_error': 0.0,
                 'preferred_over_pwl_when_exportable': True,
             }
+        reasons = []
+        if below + above:
+            reasons.append('clamp-count-nonzero')
+        if observed_min < policy['domain'][0] or observed_max > policy['domain'][1]:
+            reasons.append('observed-range-outside-domain')
         return {
             'schema_version': 1,
             'candidate_id': candidate_id,
@@ -280,6 +406,10 @@ class PWLObservationAccumulator:
             'clamp': {
                 'below': below, 'above': above, 'total': total,
                 'ratio': (below + above) / total,
+            },
+            'admission': {
+                'decision': 'rejected' if reasons else 'passed',
+                'reasons': reasons,
             },
             'role_observations': rows,
             'exact_comparator': exact_comparator,
@@ -369,7 +499,7 @@ def validate_pwl_fit_report(
         'saturation', 'qat_form', 'selection_policy', 'coefficients',
         'observed_range', 'in_domain_error', 'observed_range_error',
         'observed_samples_error', 'clamp', 'role_observations',
-        'exact_comparator'}
+        'admission', 'exact_comparator'}
     if not isinstance(value, Mapping) or set(value) != fields:
         raise PWLArtifactError('PWL fit artifact fields are invalid')
     if value.get('schema_version') != 1:
@@ -425,6 +555,16 @@ def validate_pwl_fit_report(
     if (approximation.domain != policy['domain']
             or approximation.segments != policy['segments']):
         raise PWLArtifactError('PWL coefficients disagree with fit policy')
+    canonical = fit_pwl(
+        _reference(policy['enabled_function']), policy['domain'],
+        policy['segments'], policy['grid_points'],
+        function_name=policy['enabled_function'])
+    if any(not torch.equal(actual, wanted) for actual, wanted in (
+            (approximation.breakpoints, canonical.breakpoints),
+            (approximation.slopes, canonical.slopes),
+            (approximation.intercepts, canonical.intercepts))):
+        raise PWLArtifactError(
+            'PWL coefficients disagree with canonical tracked-policy fit')
     observed_range = value['observed_range']
     if not _finite_range(observed_range):
         raise PWLArtifactError('PWL observed range is invalid')
@@ -447,7 +587,8 @@ def validate_pwl_fit_report(
     for row, input_role in zip(rows, wanted_input_roles):
         if (set(row) != {
                 'operation_role', 'exact_input_role', 'observed_range',
-                'observed_range_error', 'observed_samples_error', 'clamp'}
+                'observed_range_error', 'observed_samples_error',
+                'tail_statistics', 'clamp'}
                 or row['exact_input_role'] != input_role['exact_input_role']
                 or not _finite_range(row['observed_range'])
                 or not _finite_metric(row['observed_range_error'])
@@ -457,6 +598,11 @@ def validate_pwl_fit_report(
                 or row['observed_samples_error']['samples'] !=
                 row['clamp']['total']):
             raise PWLArtifactError('PWL role observation schema is invalid')
+        if not _validate_tail_statistics(
+                row['tail_statistics'],
+                expected_total=row['observed_samples_error']['samples']):
+            raise PWLArtifactError(
+                'PWL role tail statistics are invalid or not recomputable')
         recomputed = _range_error(
             approximation, reference, tuple(row['observed_range']),
             policy['grid_points'])
@@ -488,6 +634,19 @@ def validate_pwl_fit_report(
                 float(aggregate_sample_mean), rel_tol=1e-12, abs_tol=1e-15)):
         raise PWLArtifactError(
             'PWL aggregate observations disagree with role observations')
+    expected_reasons = []
+    if aggregate_below + aggregate_above:
+        expected_reasons.append('clamp-count-nonzero')
+    if (float(observed_range[0]) < policy['domain'][0]
+            or float(observed_range[1]) > policy['domain'][1]):
+        expected_reasons.append('observed-range-outside-domain')
+    expected_admission = {
+        'decision': 'rejected' if expected_reasons else 'passed',
+        'reasons': expected_reasons,
+    }
+    if value['admission'] != expected_admission:
+        raise PWLArtifactError(
+            'PWL fit admission disagrees with measured domain evidence')
     recomputed_domain = _range_error(
         approximation, reference, policy['domain'], policy['grid_points'])
     recomputed_observed = _range_error(
@@ -512,10 +671,32 @@ def validate_pwl_fit_report(
     return dict(value)
 
 
+def require_pwl_fit_admitted(value: Mapping[str, Any]) -> dict[str, Any]:
+    fitted = validate_pwl_fit_report(value)
+    if fitted['admission'] != {'decision': 'passed', 'reasons': []}:
+        raise PWLArtifactError(
+            'PWL measured fit is not admitted for ranking or installation')
+    return fitted
+
+
+def require_pwl_runtime_candidate(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Admit a runtime PWL only when no exact static comparator supersedes it."""
+    fitted = require_pwl_fit_admitted(value)
+    comparator = fitted['exact_comparator']
+    if (fitted['function_name'] == 'exp'
+            and isinstance(comparator, Mapping)
+            and comparator.get('preferred_over_pwl_when_exportable') is True
+            and comparator.get('applicable_source') == 'static-parameter'
+            and comparator.get('runtime_nonlinear_operations') == 0):
+        raise PWLArtifactError(
+            'exp PWL is superseded by exact export-time constant folding')
+    return fitted
+
+
 def rank_pwl_fit_artifacts(
         values: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
     """Rank only by measured observed-range max, then mean and clamp ratio."""
-    validated = [validate_pwl_fit_report(value) for value in values]
+    validated = [require_pwl_runtime_candidate(value) for value in values]
     return tuple(sorted(validated, key=lambda item: (
         float(item['observed_range_error']['max']),
         float(item['observed_range_error']['mean']),
@@ -578,6 +759,7 @@ def load_pwl_fit_reference(
 def _installation_report_from_fit(
         fitted: Mapping[str, Any],
         reference: Mapping[str, str]) -> PWLInstallationReport:
+    require_pwl_runtime_candidate(fitted)
     return PWLInstallationReport(
         function_name=fitted['function_name'], source=fitted['source'],
         roles=tuple(fitted['operation_roles']),
@@ -600,6 +782,7 @@ def build_pwl_installation_manifest(
         fit_reference: Mapping[str, str]) -> dict[str, Any]:
     fitted = validate_pwl_fit_report(
         fit, expected_candidate_id=candidate_id)
+    require_pwl_runtime_candidate(fitted)
     reference = dict(fit_reference)
     if (set(reference) != {'path', 'sha256'}
             or not isinstance(reference['path'], str)
@@ -698,5 +881,7 @@ __all__ = [
     'PWLObservationAccumulator', 'build_pwl_installation_manifest',
     'exact_input_role', 'fit_pwl_observations',
     'load_pwl_fit_reference', 'load_pwl_installation_reference',
-    'rank_pwl_fit_artifacts', 'validate_pwl_fit_report',
+    'rank_pwl_fit_artifacts', 'require_pwl_fit_admitted',
+    'require_pwl_runtime_candidate',
+    'validate_pwl_fit_report',
     'validate_pwl_installation_manifest']

@@ -114,6 +114,12 @@ class SubprocessStageRunner:
                 calibration = artifact.parent.parent / 'calibrate/calibrate.json'
                 command.extend([
                     '--calibration-artifact', self._relative(calibration)])
+            if candidate.features.get('numeric_kind') == 'pwl':
+                selection = (
+                    self.campaign_root / candidate.route /
+                    'pwl-selection/selection.json')
+                command.extend([
+                    '--selection-artifact', self._relative(selection)])
             return command
         if stage == 'calibrate' and candidate.route == 'ssm-quant-pwl':
             return [

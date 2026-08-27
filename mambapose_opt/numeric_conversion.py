@@ -22,7 +22,8 @@ from mmpose.models.utils.hardware_friendly.pwl import (
     PiecewiseLinearApproximation)
 from mambapose_opt.pwl_artifacts import (
     PWLArtifactError, PWLInstallationReport, load_pwl_fit_reference,
-    load_pwl_installation_reference, validate_pwl_fit_report)
+    load_pwl_installation_reference, require_pwl_runtime_candidate,
+    validate_pwl_fit_report)
 
 
 class NumericBindingError(ValueError):
@@ -284,6 +285,10 @@ def install_pwl_fit(
         expected_report: PWLInstallationReport) -> PWLInstallationReport:
     """Install only coefficients authenticated by a measured fit report."""
     fitted = validate_pwl_fit_report(fit)
+    try:
+        require_pwl_runtime_candidate(fitted)
+    except PWLArtifactError as error:
+        raise NumericBindingError(str(error)) from error
     expected = {
         'function_name': fitted['function_name'],
         'source': fitted['source'],
@@ -360,7 +365,8 @@ def _install_pwl_runtime(
     required = {
         'enabled_function', 'source', 'roles', 'domain', 'segments',
         'grid_points', 'saturation', 'qat_form', 'selection_policy',
-        'candidate_id', 'fit_artifact', 'installation_manifest'}
+        'candidate_id', 'fit_artifact', 'installation_manifest',
+        'selection_artifact'}
     if not isinstance(value, Mapping) or set(value) != required:
         raise NumericBindingError(
             'PWL runtime requires fit artifact and installation manifest')
@@ -372,6 +378,13 @@ def _install_pwl_runtime(
             'enabled_function', 'source', 'roles', 'domain', 'segments',
             'grid_points', 'saturation', 'qat_form', 'selection_policy')}
     try:
+        from mambapose_opt.pwl_selection import load_pwl_selection_reference
+        selection = load_pwl_selection_reference(
+            value['selection_artifact'], repository_root=REPOSITORY_ROOT,
+            manifest_path=REPOSITORY_ROOT / 'optimization/candidates.json')
+        if selection.get('selected_candidate_id') != candidate_id:
+            raise NumericBindingError(
+                'PWL runtime candidate is not selected by four-way decision')
         fit = load_pwl_fit_reference(
             value['fit_artifact'], repository_root=REPOSITORY_ROOT,
             expected_candidate_id=candidate_id, expected_policy=policy)
@@ -379,7 +392,9 @@ def _install_pwl_runtime(
             value['installation_manifest'], repository_root=REPOSITORY_ROOT,
             expected_candidate_id=candidate_id,
             expected_fit_reference=value['fit_artifact'], expected_fit=fit)
-    except PWLArtifactError as error:
+    except (PWLArtifactError, ValueError) as error:
+        if isinstance(error, NumericBindingError):
+            raise
         raise NumericBindingError(
             f'PWL measured deployment binding is invalid: {error}') from error
     return install_pwl_fit(

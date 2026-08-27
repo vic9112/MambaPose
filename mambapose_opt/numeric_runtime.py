@@ -61,7 +61,7 @@ def validate_numeric_convert_artifact(
     result = value['result']
     expected_fields = (
         {'source', 'runtime_bindings', 'runtime_config', 'installation',
-         'operation_manifest', 'latency_claim'}
+         'selection', 'operation_manifest', 'latency_claim'}
         if kind == 'pwl' else
         {'source', 'runtime_bindings', 'conversion', 'precision_invariants',
          'latency_claim'})
@@ -84,6 +84,8 @@ def validate_numeric_convert_artifact(
     expected_roles = {'config', 'checkpoint', 'policy'}
     if kind in {'w8a8', 'pwl'}:
         expected_roles.add('calibration')
+    if kind == 'pwl':
+        expected_roles.add('selection')
     if not isinstance(bindings, Mapping) or set(bindings) != expected_roles:
         raise NumericRuntimeError('numeric runtime bindings are incomplete')
     expected_static = {
@@ -201,6 +203,18 @@ def validate_numeric_convert_artifact(
                     'segments', 'grid_points', 'saturation', 'qat_form',
                     'selection_policy')}
             try:
+                from .pwl_selection import load_pwl_selection_reference
+                selection_reference = result.get('selection')
+                if (not isinstance(selection_reference, Mapping)
+                        or bindings.get('selection') != selection_reference):
+                    raise NumericRuntimeError(
+                        'PWL selection binding is incomplete')
+                selection = load_pwl_selection_reference(
+                    selection_reference, repository_root=repository_root,
+                    manifest_path=manifest_path)
+                if selection.get('selected_candidate_id') != candidate.id:
+                    raise NumericRuntimeError(
+                        'PWL candidate is not admitted by selection artifact')
                 fit = load_pwl_fit_reference(
                     calibration_reference, repository_root=repository_root,
                     expected_candidate_id=candidate.id,
@@ -219,7 +233,9 @@ def validate_numeric_convert_artifact(
                     expected_candidate_id=candidate.id,
                     expected_fit_reference=calibration_reference,
                     expected_fit=fit)
-            except PWLArtifactError as error:
+            except NumericRuntimeError:
+                raise
+            except ValueError as error:
                 raise NumericRuntimeError(
                     f'PWL fit/install binding is invalid: {error}') from error
             if result.get('operation_manifest') != installed[
@@ -231,6 +247,8 @@ def validate_numeric_convert_artifact(
                 'sha256': calibration_reference['sha256']}
             policy_config.numeric_optimization.pwl.installation_manifest = (
                 dict(installation_reference))
+            policy_config.numeric_optimization.pwl.selection_artifact = (
+                dict(selection_reference))
         if Config.fromfile(runtime_path).to_dict() != policy_config.to_dict():
             raise NumericRuntimeError(
                 'numeric runtime config was not derived from candidate policy')
@@ -845,9 +863,12 @@ def resolve_numeric_runtime(
             repository_root, result.get('runtime_config'),
             'numeric runtime config')
         bindings = result.get('runtime_bindings')
+        expected_binding_roles = {
+            'config', 'checkpoint', 'policy', 'calibration'}
+        if candidate.features.get('numeric_kind') == 'pwl':
+            expected_binding_roles.add('selection')
         if (not isinstance(bindings, Mapping)
-                or set(bindings) != {
-                    'config', 'checkpoint', 'policy', 'calibration'}):
+                or set(bindings) != expected_binding_roles):
             raise NumericRuntimeError('numeric runtime bindings are incomplete')
         for name, reference in bindings.items():
             if name == 'checkpoint':
@@ -870,6 +891,15 @@ def resolve_numeric_runtime(
         }
         if candidate.features.get('numeric_kind') == 'pwl':
             runtime['pwl_installation'] = dict(result['installation'])
+            try:
+                from .pwl_smoke import pwl_stage_a_binding
+                runtime['pwl_stage_a'] = pwl_stage_a_binding(
+                    candidate, repository_root=repository_root,
+                    manifest_path=manifest_path)
+            except ValueError as error:
+                raise NumericRuntimeError(
+                    f'PWL profile/evaluate/latency requires valid full-model '
+                    f'Stage-A smoke: {error}') from error
         return runtime
     if candidate.features.get('recovery_candidate') is not True:
         return {

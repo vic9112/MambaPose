@@ -134,7 +134,6 @@ class _FunctionalPWLHost(nn.Module):
 
 @pytest.mark.parametrize(('function_name', 'reference'), [
     ('softplus', F.softplus),
-    ('exp', torch.exp),
 ])
 def test_pwl_runtime_installs_functional_ss2d_source_and_is_called(
         function_name, reference):

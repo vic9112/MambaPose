@@ -492,6 +492,8 @@ class OptimizationController:
             expected_bindings = {'config', 'checkpoint', 'policy'}
             if self.candidate.features.get('numeric_kind') in {'w8a8', 'pwl'}:
                 expected_bindings.add('calibration')
+            if self.candidate.features.get('numeric_kind') == 'pwl':
+                expected_bindings.add('selection')
             if not isinstance(bindings, dict) or set(bindings) != expected_bindings:
                 raise ArtifactValidationError(
                     'numeric stage runtime bindings are incomplete')
