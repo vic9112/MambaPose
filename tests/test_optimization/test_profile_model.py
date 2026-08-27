@@ -86,3 +86,33 @@ def test_profile_cli_rejects_symlinked_output_escape(tmp_path):
     assert result.returncode == 2
     assert 'work_dirs/optimization' in result.stderr
     assert not (outside / 'profile.json').exists()
+
+
+def test_profile_cli_rejects_symlinked_optimization_artifact_root(tmp_path):
+    root = Path(__file__).parents[2]
+    artifact_root = root / 'work_dirs' / 'optimization'
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    assert not artifact_root.exists()
+    artifact_root.symlink_to(outside, target_is_directory=True)
+
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                'tools/optimization/profile_model.py',
+                'full-s-v1',
+                '--output',
+                'work_dirs/optimization/profile.json',
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        artifact_root.unlink(missing_ok=True)
+
+    assert result.returncode == 2
+    assert 'work_dirs/optimization' in result.stderr
+    assert not (outside / 'profile.json').exists()
