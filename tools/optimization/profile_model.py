@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Create a CPU-only, reproducible inventory for a frozen candidate."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+import torch
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from mambapose_opt.inventory import collect_module_inventory, count_parameters
+from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _shape_tree(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return list(value.shape)
+    if isinstance(value, tuple):
+        return [_shape_tree(item) for item in value]
+    if isinstance(value, list):
+        return [_shape_tree(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _shape_tree(item) for key, item in value.items()}
+    return type(value).__name__
+
+
+def _atomic_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f'.{path.name}.', suffix='.tmp', dir=path.parent, text=True)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+            json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+
+
+def _parse_shape(value: str) -> tuple[int, ...]:
+    try:
+        shape = tuple(int(part) for part in value.split(','))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('shape must be comma-separated integers') from error
+    if len(shape) != 4 or any(dimension <= 0 for dimension in shape):
+        raise argparse.ArgumentTypeError('shape must be four positive dimensions')
+    return shape
+
+
+def _candidate(manifest: Path, identifier: str) -> CandidateSpec:
+    for candidate in load_candidate_manifest(manifest):
+        if candidate.id == identifier:
+            return candidate
+    raise ValueError(f'candidate not found: {identifier}')
+
+
+def profile(candidate: CandidateSpec, input_shape: tuple[int, ...]) -> dict[str, Any]:
+    """Load one candidate on CPU, validate its checkpoint, and inventory it."""
+    checkpoint = REPOSITORY_ROOT / candidate.checkpoint
+    actual_checksum = _sha256(checkpoint)
+    if actual_checksum != candidate.checkpoint_sha256:
+        raise ValueError(
+            f'checkpoint sha256 mismatch for {candidate.id}: '
+            f'expected {candidate.checkpoint_sha256}, got {actual_checksum}')
+
+    from mmpose.apis import init_model
+
+    model = init_model(
+        REPOSITORY_ROOT / candidate.config, checkpoint, device='cpu')
+    input_tensor = torch.zeros(input_shape, device='cpu')
+    with torch.inference_mode():
+        outputs = model(input_tensor, data_samples=None, mode='tensor')
+    parameters = count_parameters(model)
+    return {
+        'schema_version': 1,
+        'git_commit': subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY_ROOT, text=True).strip(),
+        'candidate': candidate.id,
+        'config': candidate.config.as_posix(),
+        'checkpoint': candidate.checkpoint.as_posix(),
+        'checkpoint_sha256': actual_checksum,
+        'input_shapes': _shape_tree(input_tensor),
+        'output_shapes': _shape_tree(outputs),
+        'parameters': {
+            'total': parameters.total,
+            'trainable': parameters.trainable,
+            'bytes_by_dtype': dict(parameters.bytes_by_dtype),
+            'by_prefix': dict(parameters.by_prefix),
+        },
+        'modules': [
+            {
+                'name': record.name,
+                'kind': record.kind,
+                'parameters': record.parameters,
+                'hazard': record.hazard,
+            }
+            for record in collect_module_inventory(model)
+        ],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('candidate_id')
+    parser.add_argument('--manifest', type=Path,
+                        default=REPOSITORY_ROOT / 'optimization/candidates.json')
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--input-shape', type=_parse_shape, default=(1, 3, 256, 192))
+    args = parser.parse_args()
+
+    candidate = _candidate(args.manifest, args.candidate_id)
+    _atomic_json(args.output, profile(candidate, args.input_shape))
+
+
+if __name__ == '__main__':
+    main()
