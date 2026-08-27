@@ -119,6 +119,19 @@ def _latency(candidate_id='full-s-v1'):
                     'annotation_record_count': 11004,
                     'detection_record_count': 104125,
                     'verified_image_count': 5000,
+                    'inventory_projection': {
+                        'inventory_path': 'data/inventory.json',
+                        'inventory_sha256': 'c' * 64,
+                        'annotation_asset_id': 'coco-annotations',
+                        'annotation_declared_sha256': '3' * 64,
+                        'annotation_observed_archive_sha256': '3' * 64,
+                        'image_asset_id': 'coco-val2017',
+                        'image_declared_sha256': '4' * 64,
+                        'image_observed_archive_sha256': '4' * 64,
+                        'detection_asset_id': 'coco-val-detections',
+                        'detection_declared_sha256': '2' * 64,
+                        'detection_observed_sha256': '2' * 64,
+                    },
                 },
             },
             'modes': {'flip': summary, 'no_flip': summary},
@@ -127,6 +140,7 @@ def _latency(candidate_id='full-s-v1'):
                 'boot_id': '11111111-1111-1111-1111-111111111111',
                 'timestamp': '2026-08-27T00:00:00+00:00',
                 'device_index': 0, 'allowed_pids': [123],
+                'lease_id': '7' * 64,
             },
         },
     }
@@ -170,6 +184,19 @@ def _evaluation(candidate_id='full-s-v1'):
                 'checkpoint': (
                     'work_dirs/reproduction/runs/coco-s-v1/best.pth'),
                 'data_inventory': 'data/inventory.json',
+                'inventory_projection': {
+                    'inventory_path': 'data/inventory.json',
+                    'inventory_sha256': 'c' * 64,
+                    'annotation_asset_id': 'coco-annotations',
+                    'annotation_declared_sha256': '3' * 64,
+                    'annotation_observed_archive_sha256': '3' * 64,
+                    'image_asset_id': 'coco-val2017',
+                    'image_declared_sha256': '4' * 64,
+                    'image_observed_archive_sha256': '4' * 64,
+                    'detection_asset_id': 'coco-val-detections',
+                    'detection_declared_sha256': '2' * 64,
+                    'detection_observed_sha256': '2' * 64,
+                },
             },
         }
     return {
@@ -255,8 +282,6 @@ def _bound_artifacts(
         'config_sha256': digest(config),
         'authority_path': 'optimization/coco_val2017_authority.json',
         'authority_sha256': digest(authority),
-        'data_inventory_path': 'data/inventory.json',
-        'data_inventory_sha256': digest(inventory),
     }
     evaluation = _evaluation()
     evaluation['result']['source'] = dict(source)
@@ -265,6 +290,8 @@ def _bound_artifacts(
         row['provenance']['data_inventory_sha256'] = digest(inventory)
         row['determinism']['provenance'] = dict(row['provenance'])
         row['protocol']['authority_sha256'] = digest(authority)
+        row['protocol']['inventory_projection']['inventory_sha256'] = digest(
+            inventory)
     profile = _profile()
     profile['git_commit'] = commit
     latency = _latency()
@@ -275,6 +302,8 @@ def _bound_artifacts(
         'data_inventory_sha256': digest(inventory),
     })
     latency['result']['protocol']['data']['authority_sha256'] = digest(authority)
+    latency['result']['protocol']['data']['inventory_projection'][
+        'inventory_sha256'] = digest(inventory)
     root = repo / 'work_dirs/optimization/candidates/full-s-v1'
     _write_json(root / 'evaluate/evaluate.json', evaluation)
     if write_profile:
@@ -449,6 +478,52 @@ def test_source_binding_hashes_tracked_manifest_and_rejects_worktree_drift(
             git_commit=expected['git_commit'])
 
 
+def test_historical_candidate_result_does_not_reopen_mutable_inventory(
+        tmp_path, monkeypatch):
+    from mambapose_opt.evaluation import CandidateResult
+
+    root = _bound_artifacts(tmp_path, monkeypatch)
+    inventory = root.parents[3] / 'data/inventory.json'
+    inventory.write_text('{"mutable": "later observation"}\n')
+
+    assert CandidateResult.from_artifacts(root).candidate_id == 'full-s-v1'
+
+
+def test_project_asset_root_accepts_only_common_checkout_shared_layout(
+        tmp_path):
+    from mambapose_opt.evaluation import resolve_project_asset_root
+
+    main = tmp_path / 'main'
+    main.mkdir()
+    subprocess.run(['git', 'init', '-q'], cwd=main, check=True)
+    (main / 'tracked.txt').write_text('tracked\n')
+    subprocess.run(['git', 'add', 'tracked.txt'], cwd=main, check=True)
+    subprocess.run(
+        ['git', '-c', 'user.name=Fixture', '-c',
+         'user.email=fixture@example.com', 'commit', '-qm', 'fixture'],
+        cwd=main, check=True)
+    (main / 'data').mkdir()
+    (main / 'work_dirs/reproduction').mkdir(parents=True)
+    linked = tmp_path / 'linked'
+    subprocess.run(
+        ['git', 'worktree', 'add', '-q', '--detach', str(linked), 'HEAD'],
+        cwd=main, check=True)
+    (linked / 'data').symlink_to(main / 'data', target_is_directory=True)
+    (linked / 'work_dirs').mkdir()
+    (linked / 'work_dirs/reproduction').symlink_to(
+        main / 'work_dirs/reproduction', target_is_directory=True)
+
+    assert resolve_project_asset_root(linked) == main.resolve()
+    assert resolve_project_asset_root(main) == main.resolve()
+
+    (linked / 'data').unlink()
+    alternate = tmp_path / 'alternate-data'
+    alternate.mkdir()
+    (linked / 'data').symlink_to(alternate, target_is_directory=True)
+    with pytest.raises(ValueError, match='shared.*data|asset'):
+        resolve_project_asset_root(linked)
+
+
 def test_candidate_result_requires_directory_and_both_evaluation_modes(
         tmp_path, monkeypatch):
     from mambapose_opt.evaluation import CandidateResult, MetricError
@@ -482,13 +557,18 @@ def test_candidate_result_requires_strict_profile_latency_and_lease(
     _write_json(root / 'profile/profile.json', profile)
     source = json.loads(
         (root / 'evaluate/evaluate.json').read_text())['result']['source']
+    inventory_hash = json.loads(
+        (root / 'evaluate/evaluate.json').read_text())['result']['modes'][
+            'flip']['provenance']['data_inventory_sha256']
     latency = _latency()
     latency['result']['source'] = dict(source)
     latency['result']['provenance'].update({
         'git_commit': source['git_commit'],
         'config_sha256': source['config_sha256'],
-        'data_inventory_sha256': source['data_inventory_sha256'],
+        'data_inventory_sha256': inventory_hash,
     })
+    latency['result']['protocol']['data']['inventory_projection'][
+        'inventory_sha256'] = inventory_hash
     latency['result']['protocol']['data']['authority_sha256'] = (
         source['authority_sha256'])
     _write_json(root / 'latency/latency.json', latency)
@@ -585,6 +665,7 @@ def test_formal_evaluation_runs_flip_and_no_flip_before_envelope(
 
 
 def _coco_fixture(tmp_path):
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
     annotation = tmp_path / 'data/coco/annotations/person_keypoints_val2017.json'
     detection = tmp_path / (
         'data/coco/person_detection_results/'

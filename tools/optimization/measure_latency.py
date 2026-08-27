@@ -27,13 +27,15 @@ if str(REPO_ROOT) not in sys.path:
 from mmengine.config import Config
 
 from mambapose_opt.evaluation import (
-    build_source_binding, stage_envelope, validate_coco_val_protocol)
+    build_source_binding, resolve_project_asset_root, stage_envelope,
+    validate_coco_val_protocol)
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.gpu_guard import controller_process_tree
 from mambapose_opt.latency import (
     LEASE_MAX_AGE_SECONDS, LEASE_MAX_FUTURE_SKEW_SECONDS,
     build_latency_result, measure_latency_samples, validate_gpu_lease)
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
+from mambapose_opt.source import clean_git_commit
 
 
 LEASE_MAX_AGE = timedelta(seconds=LEASE_MAX_AGE_SECONDS)
@@ -126,13 +128,7 @@ def _active_gpu_lease(
 
 
 def _git_commit() -> str:
-    dirty = subprocess.run(
-        ['git', 'status', '--porcelain', '--untracked-files=no'],
-        cwd=REPO_ROOT, check=True, capture_output=True, text=True)
-    if dirty.stdout.strip():
-        raise RuntimeError('latency measurement requires a clean tracked worktree')
-    return subprocess.check_output(
-        ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True).strip()
+    return clean_git_commit(REPO_ROOT)
 
 
 def _latency_admission(
@@ -143,7 +139,7 @@ def _latency_admission(
     if checkpoint_hash != candidate.checkpoint_sha256:
         raise ValueError(f'checkpoint sha256 mismatch for {candidate.id}')
     config_path = REPO_ROOT / candidate.config
-    inventory_path = REPO_ROOT / 'data/inventory.json'
+    inventory_path = resolve_project_asset_root(REPO_ROOT) / 'data/inventory.json'
     config_hash = _sha256(config_path)
     inventory_hash = _sha256(inventory_path)
     lease = _active_gpu_lease(candidate.id, device_index)

@@ -29,7 +29,7 @@ from .gpu_guard import (
 )
 from .evaluation import (
     MetricError, resolve_artifact_source, validate_evaluation_envelope,
-    validate_latency_envelope)
+    validate_latency_envelope, validate_live_coco_observation)
 from .schema import CandidateSpec
 
 
@@ -297,7 +297,10 @@ class OptimizationController:
             message=message,
         )
 
-    def _artifact_schema(self, stage: str, path: Path) -> str:
+    def _artifact_schema(
+            self, stage: str, path: Path, *,
+            expected_gpu_lease: GpuLease | None = None,
+            require_fresh_lease: bool = False) -> str:
         try:
             value = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError) as error:
@@ -406,14 +409,12 @@ class OptimizationController:
                 if source_candidate != self.candidate:
                     raise MetricError(
                         'evaluate source candidate disagrees with controller')
-                validate_evaluation_envelope(
+                validated_evaluation = validate_evaluation_envelope(
                     value,
                     expected_candidate_id=self.candidate.id,
                     expected_route=self.candidate.route,
                     expected_checkpoint_sha256=(
                         self.candidate.checkpoint_sha256),
-                    expected_data_inventory_sha256=(
-                        source['data_inventory_sha256']),
                     expected_authority_sha256=source['authority_sha256'],
                     expected_source_config=self.candidate.config.as_posix(),
                     expected_checkpoint=self.candidate.checkpoint.as_posix(),
@@ -423,6 +424,12 @@ class OptimizationController:
                     expected_authority=authority,
                     require_source_binding=True,
                 )
+                from mmengine.config import Config
+                config = Config.fromfile(
+                    self.repository_root / self.candidate.config)
+                validate_live_coco_observation(
+                    validated_evaluation['modes']['flip']['protocol'],
+                    config=config, repository_root=self.repository_root)
             except (MetricError, OSError) as error:
                 raise ArtifactValidationError(
                     f'evaluate artifact is invalid: {error}') from error
@@ -434,14 +441,12 @@ class OptimizationController:
                 if source_candidate != self.candidate:
                     raise MetricError(
                         'latency source candidate disagrees with controller')
-                validate_latency_envelope(
+                validated_latency = validate_latency_envelope(
                     value,
                     expected_candidate_id=self.candidate.id,
                     expected_route=self.candidate.route,
                     expected_checkpoint_sha256=(
                         self.candidate.checkpoint_sha256),
-                    expected_data_inventory_sha256=(
-                        source['data_inventory_sha256']),
                     expected_authority_sha256=source['authority_sha256'],
                     expected_source_config=self.candidate.config.as_posix(),
                     expected_checkpoint=self.candidate.checkpoint.as_posix(),
@@ -452,10 +457,57 @@ class OptimizationController:
                     expected_authority=authority,
                     require_source_binding=True,
                 )
+                if expected_gpu_lease is None:
+                    raise MetricError(
+                        'latency artifact requires controller lease evidence')
+                self._match_latency_lease(
+                    validated_latency['gpu_lease'], expected_gpu_lease,
+                    require_fresh=require_fresh_lease)
+                from mmengine.config import Config
+                validate_live_coco_observation(
+                    validated_latency['protocol']['data'],
+                    config=Config.fromfile(
+                        self.repository_root / self.candidate.config),
+                    repository_root=self.repository_root)
             except (MetricError, OSError) as error:
                 raise ArtifactValidationError(
                     f'latency artifact is invalid: {error}') from error
         return 'optimization-stage-envelope-v1'
+
+    def _match_latency_lease(
+            self, actual: Mapping[str, object], expected: GpuLease, *,
+            require_fresh: bool) -> None:
+        expected_identity = {
+            'stage_id': expected.stage_id,
+            'pid': expected.pid,
+            'boot_id': expected.boot_id,
+            'device_index': expected.device_index,
+            'allowed_pids': tuple(expected.allowed_pids),
+            'lease_id': expected.lease_id,
+        }
+        mismatched = tuple(
+            name for name, value in expected_identity.items()
+            if actual.get(name) != value)
+        if mismatched:
+            raise MetricError(
+                'latency GPU lease does not match controller acquisition: '
+                + ', '.join(mismatched))
+        try:
+            acquired_at = datetime.fromisoformat(expected.timestamp)
+            observed_at = datetime.fromisoformat(str(actual['timestamp']))
+            if (
+                    acquired_at.tzinfo is None or observed_at.tzinfo is None
+                    or observed_at < acquired_at):
+                raise ValueError('lease timestamp order is invalid')
+        except (KeyError, TypeError, ValueError) as error:
+            raise MetricError('latency GPU lease timestamp is invalid') from error
+        if require_fresh:
+            current = self.now()
+            if (
+                    current - observed_at > timedelta(seconds=300)
+                    or observed_at - current > timedelta(seconds=30)):
+                raise MetricError(
+                    'latency GPU lease timestamp is outside freshness bounds')
 
     def _validate_artifacts(
             self, stage: str, outcome: StageOutcome
@@ -479,7 +531,9 @@ class OptimizationController:
             if expected is None or expected != actual:
                 raise ArtifactValidationError(
                     f'{stage} artifact sha256 mismatch: {path}')
-            schema = self._artifact_schema(stage, path)
+            schema = self._artifact_schema(
+                stage, path, expected_gpu_lease=outcome.gpu_lease,
+                require_fresh_lease=stage == 'latency')
             evidence.append({
                 'path': path.relative_to(self.root.resolve()).as_posix(),
                 'sha256': actual,
@@ -500,6 +554,8 @@ class OptimizationController:
         artifacts: list[Path] = []
         hashes: dict[str, str] = {}
         try:
+            stored_lease = (
+                self._stored_gpu_lease(run) if stage == 'latency' else None)
             for record in evidence:
                 if not isinstance(record, dict):
                     return False
@@ -511,7 +567,9 @@ class OptimizationController:
                 path.relative_to(self.root.resolve())
                 if not path.is_file() or _sha256(path) != record['sha256']:
                     return False
-                if self._artifact_schema(stage, path) != record['schema']:
+                if self._artifact_schema(
+                        stage, path,
+                        expected_gpu_lease=stored_lease) != record['schema']:
                     return False
                 artifacts.append(path)
                 hashes[str(path)] = record['sha256']
@@ -524,12 +582,40 @@ class OptimizationController:
                 artifacts_valid=True,
                 artifacts=tuple(artifacts),
                 artifact_sha256=hashes,
+                gpu_lease=stored_lease,
             )
             return (
                 self.artifact_validator(stage, outcome)
                 if self.artifact_validator is not None else True)
         except Exception:
             return False
+
+    @staticmethod
+    def _stored_gpu_lease(run: Mapping[str, object]) -> GpuLease:
+        value = run.get('gpu_lease')
+        required = {
+            'stage_id', 'pid', 'boot_id', 'timestamp', 'device_index',
+            'allowed_pids', 'lease_id'}
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise MetricError('stored controller GPU lease is invalid')
+        allowed = value['allowed_pids']
+        if not isinstance(allowed, list):
+            raise MetricError('stored controller GPU lease is invalid')
+        lease = GpuLease(
+            stage_id=value['stage_id'], pid=value['pid'],
+            boot_id=value['boot_id'], timestamp=value['timestamp'],
+            device_index=value['device_index'], allowed_pids=tuple(allowed),
+            lease_id=value['lease_id'])
+        # Reuse the artifact-side strict type validator without imposing age.
+        from .latency import validate_gpu_lease
+        validate_gpu_lease({
+            'stage_id': lease.stage_id, 'pid': lease.pid,
+            'boot_id': lease.boot_id, 'timestamp': lease.timestamp,
+            'device_index': lease.device_index,
+            'allowed_pids': list(lease.allowed_pids),
+            'lease_id': lease.lease_id,
+        })
+        return lease
 
     def _record(
             self, outcome: StageOutcome, status: str,
@@ -562,6 +648,7 @@ class OptimizationController:
                 'timestamp': outcome.gpu_lease.timestamp,
                 'device_index': outcome.gpu_lease.device_index,
                 'allowed_pids': list(outcome.gpu_lease.allowed_pids),
+                'lease_id': outcome.gpu_lease.lease_id,
             }
         self.store.transition(
             outcome.stage_id, status, attempt=outcome.attempt, **details)

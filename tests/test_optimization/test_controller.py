@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -8,6 +9,9 @@ import subprocess
 import sys
 
 import pytest
+
+
+_ACTIVE_TEST_LEASE = None
 
 
 def _sha256(path):
@@ -128,9 +132,6 @@ def _write_generic_artifact(
             'authority_path': 'optimization/coco_val2017_authority.json',
             'authority_sha256': _sha256(
                 repo_root / 'optimization/coco_val2017_authority.json'),
-            'data_inventory_path': 'data/inventory.json',
-            'data_inventory_sha256': _sha256(
-                repo_root / 'data/inventory.json'),
         }
     if stage in {'evaluate', 'latency'}:
         provenance = {
@@ -138,7 +139,8 @@ def _write_generic_artifact(
                 b'parent checkpoint').hexdigest(),
             'config_sha256': (
                 'b' * 64 if stage == 'evaluate' else source['config_sha256']),
-            'data_inventory_sha256': source['data_inventory_sha256'],
+            'data_inventory_sha256': _sha256(
+                repo_root / 'data/inventory.json'),
             'git_commit': source['git_commit'],
         }
         protocol = {
@@ -167,6 +169,20 @@ def _write_generic_artifact(
             'source_config': 'configs/candidate.py',
             'checkpoint': 'checkpoints/parent.pth',
             'data_inventory': 'data/inventory.json',
+            'inventory_projection': {
+                'inventory_path': 'data/inventory.json',
+                'inventory_sha256': _sha256(
+                    repo_root / 'data/inventory.json'),
+                'annotation_asset_id': 'coco-annotations',
+                'annotation_declared_sha256': '3' * 64,
+                'annotation_observed_archive_sha256': '3' * 64,
+                'image_asset_id': 'coco-val2017',
+                'image_declared_sha256': '4' * 64,
+                'image_observed_archive_sha256': '4' * 64,
+                'detection_asset_id': 'coco-val-detections',
+                'detection_declared_sha256': '2' * 64,
+                'detection_observed_sha256': '2' * 64,
+            },
         }
         determinism = {
             'python_seed': 0, 'numpy_seed': 0, 'torch_seed': 0,
@@ -218,13 +234,17 @@ def _write_generic_artifact(
                     'data_inventory': 'data/inventory.json', 'data': data,
                 },
                 'modes': {'flip': summary, 'no_flip': summary},
-                'gpu_lease': {
-                    'stage_id': 'fixture:latency', 'pid': os.getpid(),
-                    'boot_id': '11111111-1111-1111-1111-111111111111',
-                    'timestamp': '2026-08-27T00:00:00+00:00',
-                    'device_index': device_index,
-                    'allowed_pids': [os.getpid()],
-                },
+                'gpu_lease': (
+                    {**asdict(_ACTIVE_TEST_LEASE),
+                     'allowed_pids': list(_ACTIVE_TEST_LEASE.allowed_pids)}
+                    if _ACTIVE_TEST_LEASE is not None else {
+                        'stage_id': 'fixture:latency', 'pid': os.getpid(),
+                        'boot_id': '11111111-1111-1111-1111-111111111111',
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                        'device_index': device_index,
+                        'allowed_pids': [os.getpid()],
+                        'lease_id': '7' * 64,
+                    }),
             }
     path.write_text(json.dumps({
         'schema_version': 1,
@@ -344,6 +364,29 @@ def test_controller_binds_evaluation_to_repository_authority_hash(tmp_path):
         controller._artifact_schema('evaluate', path)
 
 
+def test_controller_reobserves_live_assets_before_accepting_evaluation(
+        tmp_path, monkeypatch):
+    import mambapose_opt.controller as controller_module
+    from mambapose_opt.controller import (
+        ArtifactValidationError, OptimizationController)
+    from mambapose_opt.evaluation import MetricError
+
+    candidate = _candidate(tmp_path)
+    campaign = tmp_path / 'work_dirs/optimization'
+    controller = OptimizationController(
+        campaign, candidate, lambda *args: None,
+        repository_root=tmp_path)
+    path = campaign / 'candidates/fixture/evaluate/evaluate.json'
+    _write_generic_artifact(path, 'evaluate')
+    monkeypatch.setattr(
+        controller_module, 'validate_live_coco_observation',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            MetricError('live corpus changed')))
+
+    with pytest.raises(ArtifactValidationError, match='live corpus changed'):
+        controller._artifact_schema('evaluate', path)
+
+
 @pytest.mark.parametrize('stage, tool', [
     ('evaluate', 'evaluate_candidate.py'),
     ('latency', 'measure_latency.py'),
@@ -392,12 +435,23 @@ def _mock_lease(monkeypatch, entered):
 
     @contextmanager
     def lease(lock_path, device_index, allowed_pids, *, stage_id):
+        global _ACTIVE_TEST_LEASE
         entered.append((Path(lock_path), device_index, stage_id, set(allowed_pids)))
-        yield GpuLease(
-            stage_id, os.getpid(), 'boot', 'now', device_index,
-            tuple(sorted(allowed_pids)))
+        acquired = GpuLease(
+            stage_id, os.getpid(),
+            '11111111-1111-1111-1111-111111111111',
+            datetime.now(timezone.utc).isoformat(), device_index,
+            tuple(sorted(allowed_pids)), '7' * 64)
+        _ACTIVE_TEST_LEASE = acquired
+        try:
+            yield acquired
+        finally:
+            _ACTIVE_TEST_LEASE = None
 
     monkeypatch.setattr(controller, 'exclusive_cuda_stage', lease)
+    monkeypatch.setattr(
+        controller, 'validate_live_coco_observation',
+        lambda recorded, **unused: recorded)
 
 
 def test_stage_completes_only_after_artifacts_validate(tmp_path, monkeypatch):
@@ -882,6 +936,10 @@ def test_isolated_campaign_roots_collide_on_canonical_gpu_lock(
 
     candidate = _candidate(tmp_path)
     monkeypatch.setattr(gpu_guard, 'query_compute_processes', lambda _: ())
+    import mambapose_opt.controller as controller_module
+    monkeypatch.setattr(
+        controller_module, 'validate_live_coco_observation',
+        lambda recorded, **unused: recorded)
     canonical_lock = tmp_path / 'shared/work_dirs/optimization/gpu.lock'
     nested_results = []
 
@@ -940,6 +998,57 @@ def test_device_one_is_used_for_admission_and_runner_environment(
     assert result.exit_code == 0
     assert entered[0][1] == 1
     assert subprocess_runner.environment()['CUDA_VISIBLE_DEVICES'] == '1'
+
+
+def test_controller_rejects_latency_nonce_not_from_its_acquisition(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'latency.json'
+        _write_generic_artifact(artifact, stage)
+        value = json.loads(artifact.read_text())
+        value['result']['gpu_lease']['lease_id'] = '8' * 64
+        artifact.write_text(json.dumps(value))
+        return _outcome(stage, artifact)
+
+    result = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path, stages=('latency',),
+        gpu_lock_path=tmp_path / 'shared/work_dirs/optimization/gpu.lock',
+        shared_lock_root=tmp_path / 'shared').run_next()
+
+    assert result.exit_code == 78
+    assert 'lease' in result.message and 'lease_id' in result.message
+
+
+def test_completed_latency_revalidates_persisted_controller_lease(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _candidate(tmp_path)
+    _mock_lease(monkeypatch, [])
+
+    def runner(candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'latency.json'
+        _write_generic_artifact(artifact, stage)
+        return _outcome(stage, artifact)
+
+    controller = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path, stages=('latency',),
+        gpu_lock_path=tmp_path / 'shared/work_dirs/optimization/gpu.lock',
+        shared_lock_root=tmp_path / 'shared')
+    assert controller.run_next().exit_code == 0
+    run = controller.store.read()['runs']['fixture:latency']
+    assert controller._completed_evidence_valid('latency', run)
+
+    counterfeit = json.loads(json.dumps(run))
+    counterfeit['gpu_lease']['lease_id'] = '8' * 64
+    assert not controller._completed_evidence_valid('latency', counterfeit)
 
 
 @pytest.mark.parametrize('stage', ['calibrate', 'evaluate', 'latency'])

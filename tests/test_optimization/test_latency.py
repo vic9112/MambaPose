@@ -64,6 +64,7 @@ def test_latency_protocol_requires_batch_one_both_flip_modes_and_lease():
             'boot_id': '11111111-1111-1111-1111-111111111111',
             'timestamp': '2026-08-27T00:00:00+00:00',
             'device_index': 0, 'allowed_pids': [123],
+            'lease_id': '7' * 64,
         },
     )
     assert result['protocol'] == {
@@ -94,6 +95,7 @@ def test_gpu_lease_validation_rejects_malformed_provenance(change):
         'boot_id': '11111111-1111-1111-1111-111111111111',
         'timestamp': '2026-08-27T00:00:00+00:00',
         'device_index': 0, 'allowed_pids': [123],
+        'lease_id': '7' * 64,
     }
     with pytest.raises(LatencyError):
         validate_gpu_lease({**lease, **change})
@@ -106,6 +108,8 @@ def test_latency_admission_rejects_unlocked_lease_before_model_or_cuda(
     import tools.optimization.measure_latency as tool
     from mambapose_opt.schema import CandidateSpec
 
+    __import__('subprocess').run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+
     (tmp_path / 'config.py').write_text('model = dict()')
     checkpoint = tmp_path / 'model.pth'
     checkpoint.write_bytes(b'checkpoint')
@@ -117,6 +121,7 @@ def test_latency_admission_rejects_unlocked_lease_before_model_or_cuda(
         'boot_id': '11111111-1111-1111-1111-111111111111',
         'timestamp': '2026-08-27T00:00:00+00:00',
         'device_index': 0, 'allowed_pids': [123],
+        'lease_id': '7' * 64,
     }))
     candidate = CandidateSpec.from_dict({
         'id': 'fixture', 'route': 'accuracy-first', 'kind': 'float',
@@ -150,6 +155,7 @@ def test_active_gpu_lease_checks_boot_device_and_live_descendant(
         'boot_id': boot_id,
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'device_index': 2, 'allowed_pids': [os.getpid()],
+        'lease_id': '7' * 64,
     }
     lock.write_text(json.dumps(lease))
     monkeypatch.setattr(tool, '_canonical_gpu_lock', lambda: lock)
@@ -181,6 +187,7 @@ def test_active_gpu_lease_rejects_stale_or_future_timestamp(
         'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
         'timestamp': timestamp, 'device_index': 2,
         'allowed_pids': [os.getpid()],
+        'lease_id': '7' * 64,
     }))
     monkeypatch.setattr(tool, '_canonical_gpu_lock', lambda: lock)
     with lock.open('r+') as owner:
@@ -203,6 +210,7 @@ def test_active_gpu_lease_rejects_exactly_301_seconds_without_heartbeat(
         'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
         'timestamp': start.isoformat(), 'device_index': 2,
         'allowed_pids': [os.getpid()],
+        'lease_id': '7' * 64,
     }))
     monkeypatch.setattr(tool, '_canonical_gpu_lock', lambda: lock)
     with lock.open('r+') as owner:
