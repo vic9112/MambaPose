@@ -1,6 +1,7 @@
 _base_ = ['./pwl_silu.py']
 numeric_optimization = dict(
     pwl=dict(
+        candidate_id='pwl-softplus-s-v1',
         enabled_function='softplus', source='ss2d-transition',
         roles=(
             'backbone.layers.0.blocks.0.op',

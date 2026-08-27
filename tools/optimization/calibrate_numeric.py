@@ -31,6 +31,7 @@ from mambapose_opt.numeric_calibration import (
     validate_calibration_artifact)
 from mambapose_opt.schema import load_candidate_manifest
 from mambapose_opt.numeric_source import build_numeric_source_binding
+from mambapose_opt.pwl_artifacts import PWLObservationAccumulator
 from mambapose_opt.source import clean_git_commit
 from mmpose.models.utils.hardware_friendly import ActivationRangeObserver
 
@@ -138,12 +139,17 @@ def _tensor(value: Any) -> torch.Tensor | None:
 
 
 class _HookSession:
-    def __init__(self, model: torch.nn.Module, targets: CalibrationTargets):
+    def __init__(
+            self, model: torch.nn.Module, targets: CalibrationTargets,
+            *, pwl_policy: Mapping[str, Any] | None = None):
         self.model = model
         self.targets = targets
         self.observers: dict[str, ActivationRangeObserver] = {}
         self.handles = []
         self.functional_modules = []
+        self.pwl = (
+            PWLObservationAccumulator(pwl_policy)
+            if pwl_policy is not None else None)
 
     def _record(self, name: str, value: Any, granularity: str = 'tensor') -> None:
         tensor = _tensor(value)
@@ -155,6 +161,26 @@ class _HookSession:
 
     def __enter__(self):
         modules = dict(self.model.named_modules())
+        if self.pwl is not None and self.pwl.policy['source'] == 'module':
+            missing = tuple(
+                role for role in self.pwl.policy['roles']
+                if role not in modules)
+            if missing:
+                raise ValueError(f'PWL calibration roles are missing: {missing}')
+            expected = (
+                torch.nn.SiLU
+                if self.pwl.policy['enabled_function'] == 'silu'
+                else torch.nn.GELU)
+            invalid = tuple(
+                role for role in self.pwl.policy['roles']
+                if type(modules[role]) is not expected)
+            if invalid:
+                raise ValueError(
+                    f'PWL calibration module roles are incompatible: {invalid}')
+            for role in self.pwl.policy['roles']:
+                self.handles.append(modules[role].register_forward_pre_hook(
+                    lambda _module, inputs, operation_role=role:
+                    self.pwl.observe(operation_role, _tensor(inputs))))
         for name in self.targets.ss2d_boundaries:
             module = modules[name]
             self.handles.append(module.register_forward_pre_hook(
@@ -199,7 +225,7 @@ class _HookSession:
             module = modules[name]
             module.set_numeric_observer(
                 lambda role, value, prefix=name:
-                self._record(f'{prefix}.{role}', value))
+                self._functional_record(prefix, role, value))
             self.functional_modules.append(module)
         parameters = dict(self.model.named_parameters())
         for name in self.targets.transition_parameters:
@@ -214,6 +240,23 @@ class _HookSession:
 
     def records(self) -> dict[str, dict[str, Any]]:
         return {name: observer.summary() for name, observer in self.observers.items()}
+
+    def _functional_record(
+            self, prefix: str, role: str, value: torch.Tensor) -> None:
+        exact = {'transition_exp_input', 'transition_softplus_input'}
+        if role in exact:
+            if (self.pwl is not None
+                    and self.pwl.policy['source'] == 'ss2d-transition'
+                    and self.pwl.policy['enabled_function'] in role
+                    and prefix in self.pwl.policy['roles']):
+                self.pwl.observe(prefix, value)
+            return
+        self._record(f'{prefix}.{role}', value)
+
+    def pwl_report(self, *, candidate_id: str) -> dict[str, Any]:
+        if self.pwl is None:
+            raise ValueError('PWL calibration policy is not installed')
+        return self.pwl.report(candidate_id=candidate_id)
 
 
 def _required_records(targets: CalibrationTargets) -> tuple[str, ...]:
@@ -336,7 +379,21 @@ def calibrate(
                                          diff_rank_seed=False)
     order = hashlib.sha256()
     observed = 0
-    with _HookSession(model, targets) as session, torch.inference_mode():
+    target_config = Config.fromfile(policy)
+    target_numeric = target_config.numeric_optimization
+    target_features = getattr(target, 'features', {})
+    raw_pwl_policy = (
+        target_numeric.get('pwl')
+        if target_features.get('numeric_kind') == 'pwl' else None)
+    pwl_policy = ({
+        name: raw_pwl_policy[name] for name in (
+            'enabled_function', 'source', 'roles', 'domain', 'segments',
+            'grid_points', 'saturation', 'qat_form', 'selection_policy')}
+        if raw_pwl_policy is not None else None)
+    session_context = (
+        _HookSession(model, targets, pwl_policy=pwl_policy)
+        if pwl_policy is not None else _HookSession(model, targets))
+    with session_context as session, torch.inference_mode():
         for batch in dataloader:
             identifiers = _sample_ids(batch)
             for identifier in identifiers:
@@ -350,9 +407,10 @@ def calibrate(
             raise ValueError(
                 f'calibration observed {observed} samples, expected {samples}')
         records = session.records()
-    from mmengine.config import Config
-    target_config = Config.fromfile(policy)
-    policy_value = target_config.numeric_optimization.get('quant_policy', {})
+        pwl_fit = (
+            session.pwl_report(candidate_id=target.id)
+            if pwl_policy is not None else None)
+    policy_value = target_numeric.get('quant_policy', {})
     activation_observers = policy_value.get('activation_observers', {})
     activation_scales = _w8a8_activation_scales_from_records(
         activation_observers, records)
@@ -360,7 +418,9 @@ def calibrate(
     if identity_after != identity_before:
         raise ValueError('calibration inputs changed during production run')
     artifact = {
-        'schema_version': 2,
+        'schema_version': int(
+            target_numeric.get('calibration', {}).get(
+                'artifact_schema_version', 2)),
         'candidate_id': target.id,
         'stage': 'calibrate',
         'source': build_numeric_source_binding(
@@ -381,6 +441,8 @@ def calibrate(
             'activation_scales': activation_scales,
         },
     }
+    if pwl_fit is not None:
+        artifact['pwl_fit'] = pwl_fit
     validate_calibration_artifact(artifact)
     return artifact
 

@@ -354,17 +354,21 @@ def discover_calibration_targets(model: nn.Module) -> CalibrationTargets:
 def validate_calibration_artifact(
         value: Mapping[str, Any], *,
         expected_candidate_id: str | None = None) -> Mapping[str, Any]:
-    required = {'schema_version', 'candidate_id', 'stage', 'source',
-                'identity', 'protocol', 'hooks'}
-    if not isinstance(value, Mapping) or set(value) != required:
+    base_required = {'schema_version', 'candidate_id', 'stage', 'source',
+                     'identity', 'protocol', 'hooks'}
+    if not isinstance(value, Mapping):
         raise CalibrationContractError(
             'calibration artifact fields do not match a supported schema')
-    schema_version = value['schema_version']
+    schema_version = value.get('schema_version')
     if (isinstance(schema_version, bool)
             or not isinstance(schema_version, int)
-            or schema_version not in (1, 2)):
+            or schema_version not in (1, 2, 3)):
         raise CalibrationContractError(
             'calibration artifact schema version is unsupported')
+    required = base_required | ({'pwl_fit'} if schema_version == 3 else set())
+    if set(value) != required:
+        raise CalibrationContractError(
+            'calibration artifact fields do not match a supported schema')
     if value['stage'] != 'calibrate' \
             or not isinstance(value['candidate_id'], str) \
             or not value['candidate_id']:
@@ -433,10 +437,11 @@ def validate_calibration_artifact(
     if schema_version == 1 and protocol_fields != legacy_protocol_fields:
         raise CalibrationContractError(
             'calibration schema v1 requires the exact legacy protocol')
-    if schema_version == 2 \
+    if schema_version in (2, 3) \
             and protocol_fields != deterministic_protocol_fields:
         raise CalibrationContractError(
-            'calibration schema v2 requires root determinism protocol')
+            f'calibration schema v{schema_version} requires root '
+            'determinism protocol')
     expected = {
         'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
         'worker_count': 0,
@@ -451,7 +456,7 @@ def validate_calibration_artifact(
     if not isinstance(protocol.get('sample_order_sha256'), str) or not re.fullmatch(
             r'[0-9a-f]{64}', protocol['sample_order_sha256']):
         raise CalibrationContractError('calibration sample order hash is invalid')
-    if schema_version == 2:
+    if schema_version in (2, 3):
         root_determinism = protocol['root_determinism']
         seed_fields = {
             'seed', 'python_seed', 'numpy_seed', 'torch_seed',
@@ -599,6 +604,15 @@ def validate_calibration_artifact(
                     f'calibration activation scale is invalid for {role!r}')
             validate_activation_scale_record(
                 role, record, hooks['records'][record['source_record']])
+    if schema_version == 3:
+        try:
+            from .pwl_artifacts import validate_pwl_fit_report
+            validate_pwl_fit_report(
+                value['pwl_fit'],
+                expected_candidate_id=value['candidate_id'])
+        except ValueError as error:
+            raise CalibrationContractError(
+                f'PWL fit artifact is invalid: {error}') from error
     return value
 
 
@@ -630,14 +644,14 @@ def validate_calibration_provenance(
         if isinstance(calibration_policy, Mapping) else None
     if (isinstance(expected_schema_version, bool)
             or not isinstance(expected_schema_version, int)
-            or expected_schema_version not in (1, 2)):
+            or expected_schema_version not in (1, 2, 3)):
         raise CalibrationContractError(
             'calibration source policy schema version is invalid')
     if value['schema_version'] != expected_schema_version:
         raise CalibrationContractError(
             'calibration artifact version disagrees with source policy')
     identity = value['identity']
-    if (value['schema_version'] == 2
+    if (value['schema_version'] in (2, 3)
             and value['protocol']['root_determinism']['seed']
             != expected_candidate.seed):
         raise CalibrationContractError(
@@ -700,9 +714,32 @@ def validate_calibration_provenance(
     if identity != expected_identity:
         raise CalibrationContractError(
             'calibration identity disagrees with canonical production inputs')
+    kind = expected_candidate.features.get('numeric_kind')
+    if kind == 'pwl':
+        if value['schema_version'] != 3:
+            raise CalibrationContractError(
+                'PWL calibration requires measured fit schema v3')
+        try:
+            from .pwl_artifacts import validate_pwl_fit_report
+            pwl_policy = numeric.get('pwl')
+            if not isinstance(pwl_policy, Mapping):
+                raise CalibrationContractError('PWL calibration policy is missing')
+            validate_pwl_fit_report(
+                value['pwl_fit'], expected_candidate_id=expected_candidate.id,
+                expected_policy={
+                    name: pwl_policy[name] for name in (
+                        'enabled_function', 'source', 'roles', 'domain',
+                        'segments', 'grid_points', 'saturation', 'qat_form',
+                        'selection_policy')})
+        except ValueError as error:
+            raise CalibrationContractError(
+                f'PWL fit policy binding is invalid: {error}') from error
+    elif value['schema_version'] == 3:
+        raise CalibrationContractError(
+            'PWL calibration schema is forbidden for non-PWL candidate')
     policy = numeric.get('quant_policy', {})
     observers = policy.get('activation_observers', {})
-    if expected_candidate.features.get('numeric_kind') == 'w8a8':
+    if kind == 'w8a8':
         scales = value['hooks'].get('activation_scales')
         if (not isinstance(observers, Mapping) or not observers
                 or not isinstance(scales, Mapping)

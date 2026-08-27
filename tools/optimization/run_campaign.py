@@ -110,7 +110,7 @@ class SubprocessStageRunner:
                 '--manifest', str(self.manifest_path),
                 '--output', self._relative(artifact),
             ]
-            if candidate.features.get('numeric_kind') == 'w8a8':
+            if candidate.features.get('numeric_kind') in {'w8a8', 'pwl'}:
                 calibration = artifact.parent.parent / 'calibrate/calibrate.json'
                 command.extend([
                     '--calibration-artifact', self._relative(calibration)])

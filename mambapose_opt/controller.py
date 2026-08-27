@@ -490,7 +490,7 @@ class OptimizationController:
                     f'numeric stage canonical output is invalid: {error}') from error
             bindings = result.get('runtime_bindings')
             expected_bindings = {'config', 'checkpoint', 'policy'}
-            if self.candidate.features.get('numeric_kind') == 'w8a8':
+            if self.candidate.features.get('numeric_kind') in {'w8a8', 'pwl'}:
                 expected_bindings.add('calibration')
             if not isinstance(bindings, dict) or set(bindings) != expected_bindings:
                 raise ArtifactValidationError(
@@ -517,27 +517,30 @@ class OptimizationController:
                         or _sha256(binding_path) != binding['sha256']):
                     raise ArtifactValidationError(
                         f'numeric {role} binding hash mismatch')
-            if result.get('latency_claim') != (
-                    'none-fake-quant-is-not-an-integer-kernel'):
+            expected_latency_claim = (
+                'none-pwl-pytorch-runtime-is-not-fpga-proof'
+                if self.candidate.features.get('numeric_kind') == 'pwl'
+                else 'none-fake-quant-is-not-an-integer-kernel')
+            if result.get('latency_claim') != expected_latency_claim:
                 raise ArtifactValidationError(
-                    'numeric fake-quant stage made an invalid latency claim')
-            if self.candidate.features.get('numeric_kind') == 'w8a8':
+                    'numeric stage made an invalid latency claim')
+            if self.candidate.features.get('numeric_kind') in {'w8a8', 'pwl'}:
                 runtime_config = result.get('runtime_config')
                 if not isinstance(runtime_config, dict) or set(runtime_config) != {
                         'path', 'sha256'}:
                     raise ArtifactValidationError(
-                        'W8A8 runtime config reference is invalid')
+                        'numeric runtime config reference is invalid')
                 runtime_path = (
                     self.repository_root / str(runtime_config['path'])).resolve()
                 try:
                     runtime_path.relative_to(self.repository_root)
                 except ValueError as error:
                     raise ArtifactValidationError(
-                        'W8A8 runtime config escapes repository') from error
+                        'numeric runtime config escapes repository') from error
                 if (not runtime_path.is_file()
                         or _sha256(runtime_path) != runtime_config['sha256']):
                     raise ArtifactValidationError(
-                        'W8A8 runtime config hash mismatch')
+                        'numeric runtime config hash mismatch')
             if stage == 'export':
                 exported = result.get('export')
                 if not isinstance(exported, dict) or set(exported) != {
