@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 import sys
+from uuid import uuid4
 
 import pytest
 
@@ -47,3 +48,41 @@ def test_profile_cli_rejects_output_outside_optimization_artifacts(output):
 
     assert result.returncode == 2
     assert 'work_dirs/optimization' in result.stderr
+
+
+def test_profile_cli_rejects_symlinked_output_escape(tmp_path):
+    root = Path(__file__).parents[2]
+    artifact_root = root / 'work_dirs' / 'optimization'
+    escape = artifact_root / f'profile-symlink-escape-{uuid4().hex}'
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    created_work_dirs = not artifact_root.parent.exists()
+    created_artifact_root = not artifact_root.exists()
+    escape.parent.mkdir(parents=True, exist_ok=True)
+    escape.symlink_to(outside, target_is_directory=True)
+    output = f'work_dirs/optimization/{escape.name}/profile.json'
+
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                'tools/optimization/profile_model.py',
+                'full-s-v1',
+                '--output',
+                output,
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        escape.unlink(missing_ok=True)
+        if created_artifact_root:
+            artifact_root.rmdir()
+        if created_work_dirs:
+            artifact_root.parent.rmdir()
+
+    assert result.returncode == 2
+    assert 'work_dirs/optimization' in result.stderr
+    assert not (outside / 'profile.json').exists()
