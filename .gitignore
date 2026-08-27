@@ -87,6 +87,7 @@ celerybeat-schedule
 .env
 .venv
 /.tools/
+/.worktrees/
 env/
 venv/
 ENV/
