@@ -187,3 +187,28 @@ def test_active_gpu_lease_rejects_stale_or_future_timestamp(
         fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(ValueError, match='timestamp|fresh'):
             tool._active_gpu_lease('fixture', 2)
+
+
+def test_active_gpu_lease_rejects_exactly_301_seconds_without_heartbeat(
+        tmp_path, monkeypatch):
+    import fcntl
+    import json
+    import os
+    import tools.optimization.measure_latency as tool
+
+    start = datetime(2026, 8, 27, tzinfo=timezone.utc)
+    lock = tmp_path / 'gpu.lock'
+    lock.write_text(json.dumps({
+        'stage_id': 'fixture:latency', 'pid': os.getpid(),
+        'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+        'timestamp': start.isoformat(), 'device_index': 2,
+        'allowed_pids': [os.getpid()],
+    }))
+    monkeypatch.setattr(tool, '_canonical_gpu_lock', lambda: lock)
+    with lock.open('r+') as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match='stale'):
+            tool._active_gpu_lease(
+                'fixture', 2,
+                now=lambda: start + __import__('datetime').timedelta(
+                    seconds=301))

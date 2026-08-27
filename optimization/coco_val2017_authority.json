@@ -13,6 +13,8 @@
   "images": {
     "prefix": "data/coco/val2017",
     "image_count": 5000,
+    "corpus_digest_algorithm": "sha256-filename-size-content-v1",
+    "corpus_sha256": "af63eef4b4bf35f39406462ec147f9411b203f99f7de47ebb0bccaecf8b86b68",
     "inventory_asset_id": "coco-val2017",
     "inventory_archive_sha256": "4f7e2ccb2866ec5041993c9cf2a952bbed69647b115d0f74da7ce8f4bef82f05"
   },

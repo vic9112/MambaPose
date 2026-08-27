@@ -24,7 +24,8 @@ from mambapose_opt.determinism import (
     build_determinism_record, deterministic_dataloader_config,
     repeated_order_hash)
 from mambapose_opt.evaluation import (
-    load_coco_metrics, stage_envelope, validate_coco_val_protocol)
+    build_source_binding, load_coco_metrics, stage_envelope,
+    validate_coco_val_protocol)
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 
@@ -159,7 +160,8 @@ def _evaluate_mode(
 
 def evaluate(
         candidate: CandidateSpec, output: Path, *,
-        modes: tuple[str, ...] = ('flip', 'no_flip')) -> dict:
+        modes: tuple[str, ...] = ('flip', 'no_flip'),
+        manifest_path: Path | None = None) -> dict:
     checkpoint = REPO_ROOT / candidate.checkpoint
     checkpoint_sha256 = _sha256(checkpoint)
     if checkpoint_sha256 != candidate.checkpoint_sha256:
@@ -167,6 +169,10 @@ def evaluate(
             f'checkpoint sha256 mismatch for {candidate.id}: '
             f'{checkpoint_sha256}')
     git_commit = _git_commit()
+    source = build_source_binding(
+        repository_root=REPO_ROOT, candidate=candidate,
+        manifest_path=(manifest_path or REPO_ROOT / 'optimization/candidates.json'),
+        git_commit=git_commit)
     rows = {
         mode: _evaluate_mode(
             candidate, output, flip_test=mode == 'flip',
@@ -177,6 +183,7 @@ def evaluate(
         'route': candidate.route,
         'calibration_split': None,
         'modes': rows,
+        'source': source,
     })
 
 
@@ -194,7 +201,8 @@ def main() -> int:
     candidate = _candidate(args.manifest, args.candidate_id)
     modes = ('flip', 'no_flip') if args.flip_test is None else (
         ('flip',) if args.flip_test else ('no_flip',))
-    _atomic_json(args.output, evaluate(candidate, args.output, modes=modes))
+    _atomic_json(args.output, evaluate(
+        candidate, args.output, modes=modes, manifest_path=args.manifest))
     return 0
 
 

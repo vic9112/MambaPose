@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -26,9 +27,37 @@ def _candidate(repo_root):
     authority = repo_root / 'optimization/coco_val2017_authority.json'
     inventory.parent.mkdir(parents=True, exist_ok=True)
     authority.parent.mkdir(parents=True, exist_ok=True)
-    inventory.write_text('{"fixture": "inventory"}\n')
-    authority.write_text('{"fixture": "authority"}\n')
-    return CandidateSpec.from_dict({
+    authority.write_text(json.dumps({
+        'schema_version': 1, 'dataset': 'coco', 'split': 'val2017',
+        'annotation': {
+            'path': 'data/coco/annotations/person_keypoints_val2017.json',
+            'sha256': '1' * 64, 'image_count': 5000,
+            'annotation_count': 11004,
+            'inventory_asset_id': 'coco-annotations',
+            'inventory_archive_sha256': '3' * 64,
+        },
+        'images': {
+            'prefix': 'data/coco/val2017', 'image_count': 5000,
+            'corpus_digest_algorithm': 'sha256-filename-size-content-v1',
+            'corpus_sha256': '6' * 64,
+            'inventory_asset_id': 'coco-val2017',
+            'inventory_archive_sha256': '4' * 64,
+        },
+        'detections': {
+            'path': ('data/coco/person_detection_results/'
+                     'COCO_val2017_detections_AP_H_56_person.json'),
+            'sha256': '2' * 64, 'record_count': 104125,
+            'inventory_asset_id': 'coco-val-detections',
+        },
+    }))
+    inventory.write_text(json.dumps({
+        'schema_version': 1, 'assets': [
+            {'id': 'coco-annotations', 'sha256': '3' * 64},
+            {'id': 'coco-val2017', 'sha256': '4' * 64},
+            {'id': 'coco-val-detections', 'sha256': '2' * 64},
+        ],
+    }))
+    candidate = CandidateSpec.from_dict({
         'id': 'fixture',
         'route': 'accuracy-first',
         'kind': 'float',
@@ -38,6 +67,29 @@ def _candidate(repo_root):
         'seed': 0,
         'features': {},
     })
+    manifest = repo_root / 'optimization/candidates.json'
+    manifest.write_text(json.dumps({
+        'schema_version': 1,
+        'candidates': [{
+            'id': candidate.id, 'route': candidate.route,
+            'kind': candidate.kind, 'config': candidate.config.as_posix(),
+            'checkpoint': candidate.checkpoint.as_posix(),
+            'checkpoint_sha256': candidate.checkpoint_sha256,
+            'seed': candidate.seed, 'features': dict(candidate.features),
+        }],
+    }))
+    if not (repo_root / '.git').exists():
+        subprocess.run(['git', 'init', '-q'], cwd=repo_root, check=True)
+        subprocess.run(
+            ['git', 'add', 'configs/candidate.py',
+             'optimization/candidates.json',
+             'optimization/coco_val2017_authority.json',
+             'data/inventory.json'], cwd=repo_root, check=True)
+        subprocess.run(
+            ['git', '-c', 'user.name=Fixture',
+             '-c', 'user.email=fixture@example.com', 'commit', '-qm',
+             'fixture source'], cwd=repo_root, check=True)
+    return candidate
 
 
 def _outcome(stage, artifact, *, exit_code=0, valid=True, fingerprint='ok'):
@@ -56,29 +108,55 @@ def _outcome(stage, artifact, *, exit_code=0, valid=True, fingerprint='ok'):
     )
 
 
-def _write_generic_artifact(path, stage, candidate_id='fixture'):
+def _write_generic_artifact(
+        path, stage, candidate_id='fixture', *, device_index=0):
     path.parent.mkdir(parents=True, exist_ok=True)
     result = {}
-    if stage == 'evaluate':
+    repo_root = next(
+        (parent for parent in path.parents if (parent / '.git').exists()), None)
+    source = None
+    if repo_root is not None:
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=repo_root, text=True).strip()
+        source = {
+            'git_commit': commit,
+            'manifest_path': 'optimization/candidates.json',
+            'manifest_sha256': _sha256(
+                repo_root / 'optimization/candidates.json'),
+            'config_path': 'configs/candidate.py',
+            'config_sha256': _sha256(repo_root / 'configs/candidate.py'),
+            'authority_path': 'optimization/coco_val2017_authority.json',
+            'authority_sha256': _sha256(
+                repo_root / 'optimization/coco_val2017_authority.json'),
+            'data_inventory_path': 'data/inventory.json',
+            'data_inventory_sha256': _sha256(
+                repo_root / 'data/inventory.json'),
+        }
+    if stage in {'evaluate', 'latency'}:
         provenance = {
             'checkpoint_sha256': hashlib.sha256(
                 b'parent checkpoint').hexdigest(),
-            'config_sha256': 'b' * 64,
-            'data_inventory_sha256': hashlib.sha256(
-                b'{"fixture": "inventory"}\n').hexdigest(),
-            'git_commit': 'd' * 40,
+            'config_sha256': (
+                'b' * 64 if stage == 'evaluate' else source['config_sha256']),
+            'data_inventory_sha256': source['data_inventory_sha256'],
+            'git_commit': source['git_commit'],
         }
         protocol = {
             'dataset': 'coco', 'split': 'val2017',
             'complete_split': True, 'batch_size': 1,
             'authority_path': 'optimization/coco_val2017_authority.json',
-            'authority_sha256': hashlib.sha256(
-                b'{"fixture": "authority"}\n').hexdigest(),
+            'authority_sha256': source['authority_sha256'],
             'authority_image_count': 5000,
             'authority_annotation_count': 11004,
             'authority_detection_count': 104125,
             'annotation_authority_sha256': '1' * 64,
             'detection_authority_sha256': '2' * 64,
+            'image_corpus_digest_algorithm': (
+                'sha256-filename-size-content-v1'),
+            'image_corpus_authority_sha256': '6' * 64,
+            'image_corpus_sha256': '6' * 64,
+            'inventory_annotation_archive_sha256': '3' * 64,
+            'inventory_image_archive_sha256': '4' * 64,
             'annotation_sha256': '1' * 64,
             'detection_sha256': '2' * 64,
             'inventory_detection_sha256': '2' * 64,
@@ -112,10 +190,42 @@ def _write_generic_artifact(path, stage, candidate_id='fixture'):
             'determinism': determinism,
             'protocol': protocol,
         }
-        result = {
-            'route': 'accuracy-first', 'calibration_split': None,
-            'modes': {'flip': row, 'no_flip': row},
-        }
+        if stage == 'evaluate':
+            result = {
+                'route': 'accuracy-first', 'calibration_split': None,
+                'modes': {'flip': row, 'no_flip': row}, 'source': source,
+            }
+        else:
+            summary = {
+                'median_ms': 1.0, 'p90_ms': 1.2, 'p95_ms': 1.3,
+                'sample_count': 200,
+            }
+            data = dict(protocol)
+            for key in ('batch_size', 'source_config', 'checkpoint',
+                        'data_inventory'):
+                data.pop(key)
+            result = {
+                'route': 'accuracy-first', 'provenance': provenance,
+                'source': source,
+                'protocol': {
+                    'batch_size': 1, 'warmup': 50, 'iterations': 200,
+                    'timer': 'torch.cuda.Event', 'synchronize': True,
+                    'scope': 'full_topdown_model',
+                    'lease_max_age_seconds': 300,
+                    'lease_max_future_skew_seconds': 30,
+                    'source_config': 'configs/candidate.py',
+                    'checkpoint': 'checkpoints/parent.pth',
+                    'data_inventory': 'data/inventory.json', 'data': data,
+                },
+                'modes': {'flip': summary, 'no_flip': summary},
+                'gpu_lease': {
+                    'stage_id': 'fixture:latency', 'pid': os.getpid(),
+                    'boot_id': '11111111-1111-1111-1111-111111111111',
+                    'timestamp': '2026-08-27T00:00:00+00:00',
+                    'device_index': device_index,
+                    'allowed_pids': [os.getpid()],
+                },
+            }
     path.write_text(json.dumps({
         'schema_version': 1,
         'candidate_id': candidate_id,
@@ -193,6 +303,25 @@ def test_controller_refuses_empty_dual_mode_rows_as_complete(tmp_path):
 
     with pytest.raises(ArtifactValidationError, match='metrics|provenance'):
         controller._artifact_schema('evaluate', path)
+
+
+def test_controller_refuses_empty_latency_result_as_complete(tmp_path):
+    from mambapose_opt.controller import (
+        ArtifactValidationError, OptimizationController)
+
+    candidate = _candidate(tmp_path)
+    campaign = tmp_path / 'work_dirs/optimization'
+    controller = OptimizationController(
+        campaign, candidate, lambda *args: None,
+        repository_root=tmp_path)
+    path = campaign / 'candidates/fixture/latency/latency.json'
+    _write_generic_artifact(path, 'latency')
+    payload = json.loads(path.read_text())
+    payload['result'] = {}
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ArtifactValidationError, match='latency'):
+        controller._artifact_schema('latency', path)
 
 
 def test_controller_binds_evaluation_to_repository_authority_hash(tmp_path):
@@ -793,7 +922,7 @@ def test_device_one_is_used_for_admission_and_runner_environment(
 
     def runner(candidate, stage, stage_dir, attempt):
         artifact = stage_dir / 'latency.json'
-        _write_generic_artifact(artifact, stage)
+        _write_generic_artifact(artifact, stage, device_index=1)
         return _outcome(stage, artifact)
 
     result = OptimizationController(

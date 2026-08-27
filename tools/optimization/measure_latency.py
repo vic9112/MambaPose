@@ -14,7 +14,7 @@ import random
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -26,7 +26,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from mmengine.config import Config
 
-from mambapose_opt.evaluation import stage_envelope, validate_coco_val_protocol
+from mambapose_opt.evaluation import (
+    build_source_binding, stage_envelope, validate_coco_val_protocol)
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.gpu_guard import controller_process_tree
 from mambapose_opt.latency import (
@@ -86,7 +87,9 @@ def _canonical_gpu_lock() -> Path:
     return common_path.parent / 'work_dirs/optimization/gpu.lock'
 
 
-def _active_gpu_lease(candidate_id: str, device_index: int) -> dict[str, Any]:
+def _active_gpu_lease(
+        candidate_id: str, device_index: int, *,
+        now: Callable[[], datetime] | None = None) -> dict[str, Any]:
     lock_path = _canonical_gpu_lock()
     try:
         stream = lock_path.open('r+', encoding='utf-8')
@@ -112,10 +115,10 @@ def _active_gpu_lease(candidate_id: str, device_index: int) -> dict[str, Any]:
     if value['device_index'] != device_index:
         raise ValueError('active GPU lease device does not match latency device')
     timestamp = datetime.fromisoformat(value['timestamp'])
-    now = datetime.now(timezone.utc)
-    if now - timestamp > LEASE_MAX_AGE:
+    current = now() if now is not None else datetime.now(timezone.utc)
+    if current - timestamp > LEASE_MAX_AGE:
         raise ValueError('active GPU lease timestamp is stale')
-    if timestamp - now > LEASE_MAX_FUTURE_SKEW:
+    if timestamp - current > LEASE_MAX_FUTURE_SKEW:
         raise ValueError('active GPU lease timestamp is in the future')
     if os.getpid() not in controller_process_tree({value['pid']}):
         raise ValueError('latency process is not a live controller descendant')
@@ -155,13 +158,18 @@ def _latency_admission(
 
 def measure_candidate(
         candidate: CandidateSpec, *, warmup: int, repeats: int,
-        device_index: int | None = None) -> dict:
+        device_index: int | None = None,
+        manifest_path: Path | None = None) -> dict:
     if device_index is None:
         try:
             device_index = int(os.environ['MAMBAPOSE_PHYSICAL_DEVICE_INDEX'])
         except (KeyError, ValueError) as error:
             raise ValueError('physical GPU device index is required') from error
     admission = _latency_admission(candidate, device_index=device_index)
+    source = build_source_binding(
+        repository_root=REPO_ROOT, candidate=candidate,
+        manifest_path=(manifest_path or REPO_ROOT / 'optimization/candidates.json'),
+        git_commit=admission['git_commit'])
     checkpoint = REPO_ROOT / candidate.checkpoint
     config_path = REPO_ROOT / candidate.config
     config = Config.fromfile(config_path)
@@ -201,6 +209,7 @@ def measure_candidate(
                 'checkpoint_sha256', 'config_sha256',
                 'data_inventory_sha256', 'git_commit')
         },
+        'source': source,
     })
     result['protocol']['data'] = data_protocol
     result['protocol'].update({
@@ -222,7 +231,8 @@ def main() -> int:
     args = parser.parse_args()
     candidate = _candidate(args.manifest, args.candidate_id)
     _atomic_json(args.output, measure_candidate(
-        candidate, warmup=args.warmup, repeats=args.iterations))
+        candidate, warmup=args.warmup, repeats=args.iterations,
+        manifest_path=args.manifest))
     return 0
 
 

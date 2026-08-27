@@ -1,5 +1,8 @@
 import os
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
+import json
+import threading
 
 import pytest
 
@@ -119,3 +122,36 @@ def test_lease_record_contains_durable_owner_identity(tmp_path, monkeypatch):
         assert record['timestamp'] == lease.timestamp
         assert Path('/proc/sys/kernel/random/boot_id').read_text().strip() == (
             record['boot_id'])
+
+
+def test_lease_heartbeat_refreshes_same_locked_inode_after_301_seconds(
+        tmp_path, monkeypatch):
+    from mambapose_opt import gpu_guard
+    from mambapose_opt.gpu_guard import exclusive_cuda_stage
+
+    monkeypatch.setattr(gpu_guard, 'query_compute_processes', lambda _: ())
+    start = datetime(2026, 8, 27, tzinfo=timezone.utc)
+    clock = iter((start, start + timedelta(seconds=301)))
+    refresh_observed = threading.Event()
+    waits = 0
+    initial_inode = []
+
+    def heartbeat_wait(stop, interval):
+        nonlocal waits
+        waits += 1
+        if waits == 1:
+            initial_inode.append(lock_path.stat().st_ino)
+            return False
+        refresh_observed.set()
+        return stop.wait(1.0)
+
+    lock_path = tmp_path / 'gpu.lock'
+    with exclusive_cuda_stage(
+            lock_path, 0, {os.getpid()}, stage_id='fixture:latency',
+            heartbeat_interval=30.0, clock=lambda: next(clock),
+            heartbeat_wait=heartbeat_wait):
+        assert refresh_observed.wait(1.0)
+        record = json.loads(lock_path.read_text())
+        assert datetime.fromisoformat(record['timestamp']) == (
+            start + timedelta(seconds=301))
+        assert lock_path.stat().st_ino == initial_inode[0]
