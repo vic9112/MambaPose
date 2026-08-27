@@ -61,7 +61,7 @@
 
 - [ ] **Step 1: Write strict failing schema tests**
 
-Add tests proving that the parser rejects unknown or missing keys, duplicate run IDs, absolute/traversing paths, non-hex hashes, booleans as seeds, duplicate seeds, any primary set other than `(0, 1, 2)`, any conditional set other than `(3, 4)`, epochs other than 300, persistent workers, baseline/no-PIF config asymmetry outside the declared PIF mode and run identity, and an initialization path placed in an output field. Path tests must also admit the exact declared `pretrained`, `data`, and `work_dirs/reproduction` links into the canonical main-checkout asset roots, while rejecting an alternate same-byte tree, changed link targets, primary-link drift, hash drift, traversal, and every unapproved external root.
+Add tests proving that the parser rejects unknown or missing keys, duplicate run IDs, absolute/traversing paths, non-hex hashes, booleans as seeds, duplicate seeds, any primary set other than `(0, 1, 2)`, any conditional set other than `(3, 4)`, epochs other than 300, persistent workers, baseline/no-PIF config asymmetry outside the declared PIF mode and run identity, and an initialization path placed in an output field. Path tests must also admit the exact declared `pretrained`, `data`, and `work_dirs/reproduction` links into the canonical main-checkout asset roots, while rejecting an alternate same-byte tree, changed link targets, primary-link drift, hash drift, traversal, and every unapproved external root. Builder tests must prove that the tracked manifest is stable across the commit that adds it: it contains closure content hashes and asset authorities but never its own containing Git commit, so `--check` has no self-referential commit/SHA cycle.
 
 ```python
 def test_manifest_requires_exact_paired_seed_matrix(valid_document, repo):
@@ -95,7 +95,7 @@ Use frozen dataclasses and explicit key sets. Lexically normalize every relative
 
 The common base inherits `configs/reproduction/coco_s_v1.py`, fixes `deterministic=True`, worker count `2`, `persistent_workers=False`, the seeded sampler/worker-init contracts, 300 epochs, effective batch, evaluator, detections, and TTA. Each leaf overrides only seed, experiment/run ID, work directory, and `pif_mode` (`full` or `disabled`). Seeds 3-4 exist in Git but remain conditional in the manifest.
 
-The builder hashes the entire config inheritance closure, source commit, dataset/annotation/detection files, and initialization. It refuses a dirty tree and atomically writes canonical sorted JSON. It must not import Torch or load a checkpoint.
+The builder hashes the entire config inheritance closure, dataset/annotation/detection files, and initialization. The tracked manifest deliberately does not contain its own source commit: doing so would become stale at the commit that adds the manifest. It may build deterministically from the current tracked/staged file contents while the Task-1 tree is dirty, and atomically writes canonical sorted JSON. After the implementation is reviewed and frozen, `FormalRunInit` binds the clean runtime HEAD, tracked manifest SHA, and recomputed config closure. The builder must not import Torch or load a checkpoint.
 
 - [ ] **Step 5: Run focused and adjacent GREEN tests**
 
@@ -105,7 +105,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 .venv/bin/python -B tools/optimizat
 git diff --check
 ```
 
-Expected: all tests pass; `--check` reports the tracked manifest is canonical and current without rewriting it.
+Expected: all tests pass; `--check` reports the tracked manifest is canonical and current without rewriting it, and a post-commit replay demonstrates that no containing-commit field can make it stale.
 
 - [ ] **Step 6: Commit and review the contract**
 
