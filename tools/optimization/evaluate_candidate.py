@@ -28,6 +28,7 @@ from mambapose_opt.evaluation import (
     validate_coco_val_protocol)
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
+from mambapose_opt.source import clean_git_commit
 
 
 def _sha256(path: Path) -> str:
@@ -79,13 +80,7 @@ def _dump_config(config: Config, path: Path) -> None:
 
 
 def _git_commit() -> str:
-    dirty = subprocess.run(
-        ['git', 'status', '--porcelain', '--untracked-files=no'],
-        cwd=REPO_ROOT, check=True, capture_output=True, text=True)
-    if dirty.stdout.strip():
-        raise RuntimeError('evaluation requires a clean tracked Git worktree')
-    return subprocess.check_output(
-        ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True).strip()
+    return clean_git_commit(REPO_ROOT)
 
 
 def _deterministic_config(candidate: CandidateSpec, flip_test: bool) -> Config:
@@ -114,7 +109,8 @@ def _evaluate_mode(
     provenance = {
         'checkpoint_sha256': checkpoint_sha256,
         'config_sha256': _sha256(resolved),
-        'data_inventory_sha256': _sha256(REPO_ROOT / 'data/inventory.json'),
+        'data_inventory_sha256': protocol['inventory_projection'][
+            'inventory_sha256'],
         'git_commit': git_commit,
     }
     order_hash = repeated_order_hash(

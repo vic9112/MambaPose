@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
 import re
 from pathlib import Path
 import subprocess
@@ -49,8 +50,57 @@ _COCO_DETECTION_COUNT = 104125
 _TRUSTED_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _SOURCE_BINDING_FIELDS = {
     'git_commit', 'manifest_path', 'manifest_sha256', 'config_path',
-    'config_sha256', 'authority_path', 'authority_sha256',
-    'data_inventory_path', 'data_inventory_sha256'}
+    'config_sha256', 'authority_path', 'authority_sha256'}
+
+
+def resolve_project_asset_root(repository_root: Path) -> Path:
+    """Resolve the one approved shared-asset checkout for a Git worktree.
+
+    Linked worktrees may expose ignored ``data`` through a symlink, but that
+    symlink must target the primary checkout identified by Git's common dir.
+    An arbitrary caller-selected or symlink-selected asset tree is rejected.
+    """
+    root = Path(repository_root).resolve(strict=True)
+    try:
+        top = Path(subprocess.check_output(
+            ['git', 'rev-parse', '--show-toplevel'], cwd=root,
+            text=True).strip()).resolve(strict=True)
+        common_value = subprocess.check_output(
+            ['git', 'rev-parse', '--git-common-dir'], cwd=root,
+            text=True).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise MetricError('asset root requires a valid Git worktree') from error
+    if top != root:
+        raise MetricError('asset root must be resolved from the worktree root')
+    common = Path(common_value)
+    if not common.is_absolute():
+        common = root / common
+    common = common.resolve(strict=True)
+    if common.name != '.git' or not common.is_dir():
+        raise MetricError('Git common directory is not an approved checkout')
+    asset_root = common.parent.resolve(strict=True)
+    expected_data = asset_root / 'data'
+    exposed_data = root / 'data'
+    if root == asset_root:
+        if exposed_data.is_symlink() or not exposed_data.is_dir():
+            raise MetricError('primary checkout data asset root is invalid')
+    else:
+        try:
+            link_target = Path(os.path.abspath(
+                exposed_data.parent / os.readlink(exposed_data)))
+        except OSError as error:
+            raise MetricError(
+                'linked worktree shared data link is unreadable') from error
+        if (
+                not exposed_data.is_symlink()
+                or not expected_data.is_dir()
+                or link_target != expected_data.absolute()
+                or exposed_data.resolve(strict=True) != expected_data.resolve(
+                    strict=True)):
+            raise MetricError(
+                'linked worktree shared data must target the Git common '
+                'checkout asset root')
+    return asset_root
 
 
 def _file_sha256(path: Path) -> str:
@@ -94,7 +144,7 @@ def _git_blob(repository_root: Path, commit: str, relative: str) -> bytes:
 def build_source_binding(
         *, repository_root: Path, candidate: CandidateSpec,
         manifest_path: Path, git_commit: str) -> dict[str, str]:
-    """Bind one candidate to immutable tracked source and current inventory."""
+    """Bind one candidate only to immutable, commit-addressed source."""
     if not isinstance(git_commit, str) or not _COMMIT.fullmatch(git_commit):
         raise MetricError('source git commit is invalid')
     root = Path(repository_root).resolve()
@@ -104,8 +154,6 @@ def build_source_binding(
         candidate.config, root, label='candidate config')
     authority_relative = _safe_repository_relative(
         _COCO_AUTHORITY, root, label='COCO authority')
-    inventory_relative = _safe_repository_relative(
-        'data/inventory.json', root, label='data inventory')
     tracked = {
         'manifest': (manifest_relative, root / manifest_relative),
         'config': (config_relative, root / config_relative),
@@ -138,8 +186,6 @@ def build_source_binding(
         'config_sha256': hashes['config'],
         'authority_path': authority_relative,
         'authority_sha256': hashes['authority'],
-        'data_inventory_path': inventory_relative,
-        'data_inventory_sha256': _file_sha256(root / inventory_relative),
     }
 
 
@@ -221,18 +267,14 @@ def resolve_artifact_source(
     commit = normalized.get('git_commit')
     if not isinstance(commit, str) or not _COMMIT.fullmatch(commit):
         raise MetricError('artifact source git commit is invalid')
-    for name in (
-            'manifest_path', 'config_path', 'authority_path',
-            'data_inventory_path'):
+    for name in ('manifest_path', 'config_path', 'authority_path'):
         item = normalized.get(name)
         if (
                 not isinstance(item, str) or not item
                 or Path(item).is_absolute()
                 or any(part in {'.', '..'} for part in Path(item).parts)):
             raise MetricError(f'artifact source {name} is invalid')
-    for name in (
-            'manifest_sha256', 'config_sha256', 'authority_sha256',
-            'data_inventory_sha256'):
+    for name in ('manifest_sha256', 'config_sha256', 'authority_sha256'):
         item = normalized.get(name)
         if not isinstance(item, str) or not _SHA256.fullmatch(item):
             raise MetricError(f'artifact source {name} is invalid')
@@ -251,16 +293,10 @@ def resolve_artifact_source(
         blobs[name] = blob
     if normalized['authority_path'] != _COCO_AUTHORITY:
         raise MetricError('artifact source authority path is invalid')
-    if normalized['data_inventory_path'] != 'data/inventory.json':
-        raise MetricError('artifact source data inventory path is invalid')
-    inventory_path = root / normalized['data_inventory_path']
-    if _file_sha256(inventory_path) != normalized['data_inventory_sha256']:
-        raise MetricError('artifact source data inventory hash is invalid')
     try:
         manifest_value = json.loads(blobs['manifest'])
         authority_value = json.loads(blobs['authority'])
-        inventory_value = json.loads(inventory_path.read_text(encoding='utf-8'))
-    except (json.JSONDecodeError, OSError) as error:
+    except json.JSONDecodeError as error:
         raise MetricError(f'artifact source JSON is invalid: {error}') from error
     try:
         candidates = parse_candidate_manifest(manifest_value)
@@ -274,28 +310,6 @@ def resolve_artifact_source(
     if candidate.config.as_posix() != normalized['config_path']:
         raise MetricError('artifact source config disagrees with manifest')
     expectations = _official_authority_expectations(authority_value)
-    assets = inventory_value.get('assets') if isinstance(
-        inventory_value, Mapping) else None
-    if not isinstance(assets, list):
-        raise MetricError('artifact source inventory is malformed')
-    by_id: dict[str, Mapping[str, Any]] = {}
-    for row in assets:
-        if not isinstance(row, Mapping) or not isinstance(row.get('id'), str):
-            raise MetricError('artifact source inventory is malformed')
-        if row['id'] in by_id:
-            raise MetricError('artifact source inventory asset IDs are duplicated')
-        by_id[row['id']] = row
-    expected_inventory = {
-        expectations['annotation_inventory_asset_id']:
-            expectations['inventory_annotation_archive_sha256'],
-        expectations['image_inventory_asset_id']:
-            expectations['inventory_image_archive_sha256'],
-        expectations['detection_inventory_asset_id']:
-            expectations['detection_authority_sha256'],
-    }
-    if any(by_id.get(asset_id, {}).get('sha256') != digest
-           for asset_id, digest in expected_inventory.items()):
-        raise MetricError('artifact source inventory disagrees with authority')
     return MappingProxyType(normalized), candidate, MappingProxyType(expectations)
 
 
@@ -314,6 +328,27 @@ def _repository_root_from_artifacts(root: Path) -> Path:
         raise MetricError(
             'candidate artifacts must belong to the trusted source repository')
     return resolved
+
+
+def _reject_artifact_root_symlinks(root: Path) -> None:
+    """Reject lexical symlinks before any candidate-root resolution."""
+    trusted = _TRUSTED_REPOSITORY_ROOT.resolve(strict=True)
+    lexical = Path(root)
+    if not lexical.is_absolute():
+        lexical = Path.cwd() / lexical
+    lexical = lexical.absolute()
+    try:
+        relative = lexical.relative_to(trusted)
+    except ValueError as error:
+        raise MetricError(
+            'candidate artifact root must belong to the trusted source '
+            'repository') from error
+    cursor = trusted
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise MetricError(
+                'candidate artifact root and ancestors must not be symlinks')
 
 
 def _image_corpus_sha256(image_dir: Path, file_names: set[str]) -> str:
@@ -394,11 +429,12 @@ def validate_coco_val_protocol(
     if not isinstance(image_prefix, Mapping) or image_prefix.get('img') != 'val2017/':
         raise MetricError('CocoDataset image prefix must be val2017')
 
-    root = Path(repository_root).resolve()
-    annotation_path = root / _COCO_ANNOTATION
-    detection_path = root / _COCO_DETECTIONS
-    inventory_path = root / 'data/inventory.json'
-    authority_path = root / _COCO_AUTHORITY
+    source_root = Path(repository_root).resolve()
+    asset_root = resolve_project_asset_root(source_root)
+    annotation_path = asset_root / _COCO_ANNOTATION
+    detection_path = asset_root / _COCO_DETECTIONS
+    inventory_path = asset_root / 'data/inventory.json'
+    authority_path = source_root / _COCO_AUTHORITY
     try:
         annotation = json.loads(annotation_path.read_text(encoding='utf-8'))
         detections = json.loads(detection_path.read_text(encoding='utf-8'))
@@ -494,7 +530,7 @@ def validate_coco_val_protocol(
     ids: set[int] = set()
     file_names: set[str] = set()
     file_identities: set[tuple[int, int]] = set()
-    image_dir = root / data_root / 'val2017'
+    image_dir = asset_root / data_root / 'val2017'
     for row in images:
         if (
                 not isinstance(row, Mapping)
@@ -549,11 +585,11 @@ def validate_coco_val_protocol(
             for asset_id, expected_hash in required_assets.items()):
         raise MetricError('data inventory hashes disagree with COCO authority')
     annotation_archive_sha256 = _verify_inventory_archive(
-        root, by_id[annotation_authority['inventory_asset_id']],
+        asset_root, by_id[annotation_authority['inventory_asset_id']],
         annotation_authority['inventory_archive_sha256'],
         label='annotation')
     image_archive_sha256 = _verify_inventory_archive(
-        root, by_id[image_authority['inventory_asset_id']],
+        asset_root, by_id[image_authority['inventory_asset_id']],
         image_authority['inventory_archive_sha256'], label='image')
     detection_entry = by_id[detection_authority['inventory_asset_id']]
     if detection_entry.get('path') != _COCO_DETECTIONS:
@@ -578,6 +614,22 @@ def validate_coco_val_protocol(
         'image_corpus_sha256': image_corpus_sha256,
         'inventory_annotation_archive_sha256': annotation_archive_sha256,
         'inventory_image_archive_sha256': image_archive_sha256,
+        'inventory_projection': {
+            'inventory_path': 'data/inventory.json',
+            'inventory_sha256': _file_sha256(inventory_path),
+            'annotation_asset_id': annotation_authority[
+                'inventory_asset_id'],
+            'annotation_declared_sha256': annotation_authority[
+                'inventory_archive_sha256'],
+            'annotation_observed_archive_sha256': annotation_archive_sha256,
+            'image_asset_id': image_authority['inventory_asset_id'],
+            'image_declared_sha256': image_authority[
+                'inventory_archive_sha256'],
+            'image_observed_archive_sha256': image_archive_sha256,
+            'detection_asset_id': detection_authority['inventory_asset_id'],
+            'detection_declared_sha256': detection_entry['sha256'],
+            'detection_observed_sha256': detection_sha256,
+        },
         'annotation_sha256': annotation_sha256,
         'detection_sha256': detection_sha256,
         'inventory_detection_sha256': detection_entry['sha256'],
@@ -586,6 +638,19 @@ def validate_coco_val_protocol(
         'detection_record_count': len(detections),
         'verified_image_count': len(images),
     }
+
+
+def validate_live_coco_observation(
+        recorded: Mapping[str, Any], *, config: Mapping[str, Any],
+        repository_root: Path) -> Mapping[str, Any]:
+    """Reobserve external COCO assets and match a formal recorded claim."""
+    live = validate_coco_val_protocol(
+        config, repository_root=repository_root)
+    for name, observed in live.items():
+        if recorded.get(name) != observed:
+            raise MetricError(
+                f'recorded COCO asset observation is stale or invalid: {name}')
+    return _freeze(live)
 
 
 def _finite_number(value: object) -> bool:
@@ -769,7 +834,7 @@ def _validate_recorded_coco_protocol(
         'inventory_detection_sha256', 'annotation_image_count',
         'annotation_record_count', 'detection_record_count',
         'verified_image_count', 'source_config', 'checkpoint',
-        'data_inventory'}
+        'data_inventory', 'inventory_projection'}
     if not isinstance(value, Mapping) or set(value) != required:
         raise MetricError(
             'evaluation protocol must contain the exact authority fields')
@@ -844,6 +909,34 @@ def _validate_recorded_coco_protocol(
             raise MetricError(f'evaluation protocol {name} path is invalid')
     if value['data_inventory'] != 'data/inventory.json':
         raise MetricError('evaluation protocol data inventory path is invalid')
+    projection_fields = {
+        'inventory_path', 'inventory_sha256', 'annotation_asset_id',
+        'annotation_declared_sha256',
+        'annotation_observed_archive_sha256', 'image_asset_id',
+        'image_declared_sha256', 'image_observed_archive_sha256',
+        'detection_asset_id', 'detection_declared_sha256',
+        'detection_observed_sha256'}
+    projection = value['inventory_projection']
+    if (
+            not isinstance(projection, Mapping)
+            or set(projection) != projection_fields
+            or projection.get('inventory_path') != 'data/inventory.json'
+            or not isinstance(projection.get('inventory_sha256'), str)
+            or not _SHA256.fullmatch(projection['inventory_sha256'])):
+        raise MetricError('evaluation inventory projection is invalid')
+    for name in (
+            'annotation_declared_sha256', 'image_declared_sha256',
+            'detection_declared_sha256', 'detection_observed_sha256'):
+        item = projection[name]
+        if not isinstance(item, str) or not _SHA256.fullmatch(item):
+            raise MetricError('evaluation inventory projection hash is invalid')
+    for name in (
+            'annotation_observed_archive_sha256',
+            'image_observed_archive_sha256'):
+        item = projection[name]
+        if item is not None and (
+                not isinstance(item, str) or not _SHA256.fullmatch(item)):
+            raise MetricError('evaluation inventory observation is invalid')
     if expected_authority is not None:
         for name in (
                 'authority_image_count', 'authority_annotation_count',
@@ -861,6 +954,34 @@ def _validate_recorded_coco_protocol(
             if value[name] is not None and value[name] != expected_authority[name]:
                 raise MetricError(
                     f'evaluation protocol {name} disagrees with authority blob')
+        expected_projection = {
+            'annotation_asset_id': expected_authority[
+                'annotation_inventory_asset_id'],
+            'annotation_declared_sha256': expected_authority[
+                'inventory_annotation_archive_sha256'],
+            'image_asset_id': expected_authority['image_inventory_asset_id'],
+            'image_declared_sha256': expected_authority[
+                'inventory_image_archive_sha256'],
+            'detection_asset_id': expected_authority[
+                'detection_inventory_asset_id'],
+            'detection_declared_sha256': expected_authority[
+                'detection_authority_sha256'],
+            'detection_observed_sha256': expected_authority[
+                'detection_authority_sha256'],
+        }
+        if any(projection[name] != expected
+               for name, expected in expected_projection.items()):
+            raise MetricError(
+                'evaluation inventory projection disagrees with authority blob')
+        observed_pairs = (
+            ('annotation_observed_archive_sha256',
+             'inventory_annotation_archive_sha256'),
+            ('image_observed_archive_sha256',
+             'inventory_image_archive_sha256'))
+        if any(projection[observed] != value[protocol]
+               for observed, protocol in observed_pairs):
+            raise MetricError(
+                'evaluation inventory observations disagree with protocol')
     return _freeze(value)
 
 
@@ -948,6 +1069,10 @@ def validate_evaluation_envelope(
                     expected_data_inventory_sha256)):
             raise MetricError(
                 'evaluation data inventory hash disagrees with repository')
+        if provenance['data_inventory_sha256'] != (
+                protocol['inventory_projection']['inventory_sha256']):
+            raise MetricError(
+                'evaluation inventory observation disagrees with provenance')
         if (
                 expected_authority_sha256 is not None
                 and protocol['authority_sha256'] != expected_authority_sha256):
@@ -984,7 +1109,7 @@ def validate_evaluation_envelope(
             'detection_authority_sha256', 'image_corpus_digest_algorithm',
             'image_corpus_authority_sha256', 'image_corpus_sha256',
             'inventory_annotation_archive_sha256',
-            'inventory_image_archive_sha256'):
+            'inventory_image_archive_sha256', 'inventory_projection'):
         if normalized_modes['flip']['protocol'][field] != (
                 normalized_modes['no_flip']['protocol'][field]):
             raise MetricError(f'evaluation mode protocol disagrees on {field}')
@@ -1019,6 +1144,7 @@ class CandidateResult:
     def from_artifacts(
             cls, root: Path | str, *, mode: str = 'flip') -> 'CandidateResult':
         root = Path(root)
+        _reject_artifact_root_symlinks(root)
         if root.is_file() or not root.is_dir():
             raise MetricError('candidate artifact root must be a directory')
         if mode not in {'flip', 'no_flip'}:
@@ -1036,8 +1162,6 @@ class CandidateResult:
             expected_candidate_id=candidate.id,
             expected_route=candidate.route,
             expected_checkpoint_sha256=candidate.checkpoint_sha256,
-            expected_data_inventory_sha256=(
-                source['data_inventory_sha256']),
             expected_authority_sha256=source['authority_sha256'],
             expected_source_config=candidate.config.as_posix(),
             expected_checkpoint=candidate.checkpoint.as_posix(),
@@ -1313,6 +1437,10 @@ def validate_latency_envelope(
         'checkpoint': protocol['checkpoint'],
         'data_inventory': protocol['data_inventory'],
     }, expected_authority=expected_authority)
+    if latency_provenance['data_inventory_sha256'] != (
+            data_protocol['inventory_projection']['inventory_sha256']):
+        raise MetricError(
+            'latency inventory observation disagrees with provenance')
     if (
             expected_authority_sha256 is not None
             and data_protocol['authority_sha256'] != expected_authority_sha256):

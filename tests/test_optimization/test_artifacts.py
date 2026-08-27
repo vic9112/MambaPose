@@ -62,3 +62,20 @@ def test_optimization_output_rejects_symlinked_root_even_when_target_is_in_repo(
     with pytest.raises(argparse.ArgumentTypeError):
         optimization_output_path(
             'work_dirs/optimization/result.json', repository_root=tmp_path)
+
+
+def test_candidate_result_rejects_symlink_candidate_root_inside_repository(
+        tmp_path, monkeypatch):
+    import mambapose_opt.evaluation as evaluation_module
+    from mambapose_opt.evaluation import CandidateResult, MetricError
+
+    repository = tmp_path / 'repo'
+    actual = repository / 'work_dirs/optimization/candidates/actual'
+    actual.mkdir(parents=True)
+    linked = repository / 'work_dirs/optimization/candidates/linked'
+    linked.symlink_to(actual, target_is_directory=True)
+    monkeypatch.setattr(
+        evaluation_module, '_TRUSTED_REPOSITORY_ROOT', repository)
+
+    with pytest.raises(MetricError, match='symlink'):
+        CandidateResult.from_artifacts(linked)

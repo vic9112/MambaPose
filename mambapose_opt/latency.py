@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import math
+import re
 import uuid
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -15,6 +16,7 @@ class LatencyError(ValueError):
 
 LEASE_MAX_AGE_SECONDS = 300
 LEASE_MAX_FUTURE_SKEW_SECONDS = 30
+_LEASE_ID = re.compile(r'^[0-9a-f]{64}$')
 
 
 class LatencyTimer(Protocol):
@@ -125,7 +127,7 @@ def measure_latency_samples(
 def validate_gpu_lease(value: object) -> dict[str, Any]:
     required = {
         'stage_id', 'pid', 'boot_id', 'timestamp', 'device_index',
-        'allowed_pids',
+        'allowed_pids', 'lease_id',
     }
     if not isinstance(value, Mapping) or set(value) != required:
         raise LatencyError('GPU lease provenance has invalid fields')
@@ -155,6 +157,10 @@ def validate_gpu_lease(value: object) -> dict[str, Any]:
     device = value['device_index']
     if isinstance(device, bool) or not isinstance(device, int) or device < 0:
         raise LatencyError('GPU lease device_index is invalid')
+    if (
+            not isinstance(value['lease_id'], str)
+            or not _LEASE_ID.fullmatch(value['lease_id'])):
+        raise LatencyError('GPU lease lease_id must be lowercase 64-hex')
     return dict(value)
 
 

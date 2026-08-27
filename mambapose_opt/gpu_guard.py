@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import secrets
 import subprocess
 import threading
 from typing import Callable, Collection, Iterator
@@ -40,6 +41,7 @@ class GpuLease:
     timestamp: str
     device_index: int
     allowed_pids: tuple[int, ...]
+    lease_id: str
 
 
 def _write_lease(stream, lease: GpuLease) -> None:
@@ -187,6 +189,7 @@ def exclusive_cuda_stage(
             timestamp=now().isoformat(),
             device_index=device_index,
             allowed_pids=process_tree,
+            lease_id=secrets.token_hex(32),
         )
         _write_lease(stream, lease)
         stop = threading.Event()

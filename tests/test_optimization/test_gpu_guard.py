@@ -120,8 +120,28 @@ def test_lease_record_contains_durable_owner_identity(tmp_path, monkeypatch):
         assert record['pid'] == os.getpid()
         assert record['boot_id'] == lease.boot_id
         assert record['timestamp'] == lease.timestamp
+        assert record['lease_id'] == lease.lease_id
+        assert len(record['lease_id']) == 64
+        assert set(record['lease_id']) <= set('0123456789abcdef')
         assert Path('/proc/sys/kernel/random/boot_id').read_text().strip() == (
             record['boot_id'])
+
+
+def test_each_lock_acquisition_gets_a_distinct_unpredictable_lease_id(
+        tmp_path, monkeypatch):
+    from mambapose_opt import gpu_guard
+    from mambapose_opt.gpu_guard import exclusive_cuda_stage
+
+    monkeypatch.setattr(gpu_guard, 'query_compute_processes', lambda _: ())
+    lock_path = tmp_path / 'gpu.lock'
+    with exclusive_cuda_stage(
+            lock_path, 0, {os.getpid()}, stage_id='fixture:latency') as first:
+        first_id = first.lease_id
+    with exclusive_cuda_stage(
+            lock_path, 0, {os.getpid()}, stage_id='fixture:latency') as second:
+        second_id = second.lease_id
+
+    assert first_id != second.lease_id
 
 
 def test_lease_heartbeat_refreshes_same_locked_inode_after_301_seconds(

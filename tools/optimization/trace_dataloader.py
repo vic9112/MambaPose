@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 
@@ -24,6 +23,8 @@ from mambapose_opt.determinism import (
     repeated_order_hash)
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 from mambapose_opt.artifacts import optimization_output_path
+from mambapose_opt.evaluation import resolve_project_asset_root
+from mambapose_opt.source import clean_git_commit
 
 
 def _output_path(value: str) -> Path:
@@ -61,13 +62,7 @@ def _atomic_json(path: Path, value: object) -> None:
 
 
 def _git_commit() -> str:
-    status = subprocess.run(
-        ['git', 'status', '--porcelain', '--untracked-files=no'],
-        cwd=REPO_ROOT, check=True, capture_output=True, text=True)
-    if status.stdout.strip():
-        raise RuntimeError('data-order trace requires a clean tracked worktree')
-    return subprocess.check_output(
-        ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True).strip()
+    return clean_git_commit(REPO_ROOT)
 
 
 def trace_candidate(
@@ -79,7 +74,7 @@ def trace_candidate(
     checkpoint_sha256 = _sha256(checkpoint_path)
     if checkpoint_sha256 != candidate.checkpoint_sha256:
         raise ValueError(f'checkpoint sha256 mismatch for {candidate.id}')
-    data_inventory = REPO_ROOT / 'data/inventory.json'
+    data_inventory = resolve_project_asset_root(REPO_ROOT) / 'data/inventory.json'
     config_sha256 = _sha256(config_path)
     data_inventory_sha256 = _sha256(data_inventory)
     config = Config.fromfile(config_path)
