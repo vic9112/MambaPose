@@ -20,6 +20,7 @@ from torch import Tensor, nn
 from functools import partial
 
 from .pif import PoseInteraction
+from mmpose.models.utils.hardware_friendly.binary_qk import binary_qk_logits
 
 MIN_NUM_PATCHES = 16
 BN_MOMENTUM = 0.1
@@ -181,9 +182,13 @@ class Attention(nn.Module):
     Self-attention Module
     """
 
-    def __init__(self, dim, heads=8, dropout=0., num_keypoints=None, scale_with_head=False):
+    def __init__(self, dim, heads=8, dropout=0., num_keypoints=None,
+                 scale_with_head=False, qk_mode='float'):
         super().__init__()
+        if qk_mode not in {'float', 'binary'}:
+            raise ValueError("qk_mode must be 'float' or 'binary'")
         self.heads = heads
+        self.qk_mode = qk_mode
         self.scale = (dim // heads) ** -0.5 if scale_with_head else dim ** -0.5
 
         self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
@@ -198,7 +203,10 @@ class Attention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), qkv)
 
-        dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
+        if self.qk_mode == 'float':
+            dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
+        else:
+            dots = binary_qk_logits(q, k) * self.scale
         mask_value = -torch.finfo(dots.dtype).max
 
         if mask is not None:
@@ -230,15 +238,20 @@ class Transformer(nn.Module):
     """
 
     def __init__(self, dim, depth, heads, mlp_dim, dropout, num_keypoints=None, all_attn=False, scale_with_head=False,
-                 pruning_loc=[3, 6, 9]):
+                 pruning_loc=[3, 6, 9], qk_mode='float'):
         super().__init__()
+        if qk_mode not in {'float', 'binary'}:
+            raise ValueError("qk_mode must be 'float' or 'binary'")
+        if qk_mode == 'binary' and depth != 6:
+            raise ValueError('binary qk_mode is admitted only for six head layers')
         self.layers = nn.ModuleList([])
         self.all_attn = all_attn
         self.num_keypoints = num_keypoints
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 Residual(PreNorm(dim, Attention(dim, heads=heads, dropout=dropout, num_keypoints=num_keypoints,
-                                                scale_with_head=scale_with_head))),
+                                                scale_with_head=scale_with_head,
+                                                qk_mode=qk_mode))),
                 Residual(PreNorm(dim, FeedForward(dim, mlp_dim, dropout=dropout)))
             ]))
         self.pruning_loc = pruning_loc
@@ -350,7 +363,8 @@ class TokenPose_TB_base(nn.Module):
     def __init__(self, *, feature_size, patch_size, num_keypoints, dim, depth, heads,
                  mlp_ratio, apply_init=False, apply_multi=True, heatmap_size=[64, 48],
                  patch_dim=0, dropout=0., emb_dropout=0.,
-                 pos_embedding_type="learnable", pif_mode='full'):
+                 pos_embedding_type="learnable", pif_mode='full',
+                 qk_mode='float'):
         """
         TokenPose base head, heatmap-based prediction head.
         """
@@ -392,7 +406,7 @@ class TokenPose_TB_base(nn.Module):
         # transformer
         self.transformer = Transformer(dim, depth, heads, mlp_dim, dropout,
                                        num_keypoints=num_keypoints, all_attn=self.all_attn,
-                                       scale_with_head=True)
+                                       scale_with_head=True, qk_mode=qk_mode)
 
         self.to_keypoint_token = nn.Identity()
 

@@ -337,7 +337,7 @@ class SS2Dv0:
         # assert len(xs.shape) == 3 and len(dts.shape) == 3 and len(Bs.shape) == 4 and len(Cs.shape) == 4
         # assert len(As.shape) == 2 and len(Ds.shape) == 1 and len(dt_projs_bias.shape) == 1
         to_fp32 = lambda *args: (_a.to(torch.float32) for _a in args)
-        
+
         if force_fp32:
             xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
 
@@ -566,6 +566,10 @@ class SS2Dv2:
         channel_first = self.channel_first
         to_fp32 = lambda *args: (_a.to(torch.float32) for _a in args)
 
+        if cascade2d and self._numeric_observer_callback is not None:
+            raise RuntimeError(
+                "numeric observation does not support cascade2d SS2D")
+
         B, D, H, W = x.shape
         D, N = A_logs.shape
         K, D, R = dt_projs_weight.shape
@@ -662,6 +666,9 @@ class SS2Dv2:
                 dts, Bs, Cs = torch.split(x_dbl, [R, N, N], dim=2)
                 dts = torch.einsum("b k r l, k d r -> b k d l", dts, dt_projs_weight)
 
+            self._observe_numeric("x_proj", x_dbl)
+            self._observe_numeric("dt_proj", dts)
+
             xs = xs.view(B, -1, L)
             dts = dts.contiguous().view(B, -1, L)
             As = -torch.exp(A_logs.to(torch.float)) # (k * c, d_state)
@@ -673,9 +680,18 @@ class SS2Dv2:
             if force_fp32:
                 xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
 
+            self._observe_numeric("scan_input_u", xs)
+            self._observe_numeric("scan_input_dt", dts)
+            self._observe_numeric("transition_A", As)
+            self._observe_numeric("transition_B", Bs)
+            self._observe_numeric("transition_C", Cs)
+            self._observe_numeric("transition_D", Ds)
+            self._observe_numeric("transition_delta_bias", delta_bias)
             ys: torch.Tensor = selective_scan(
                 xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
-            ).view(B, K, -1, H, W)
+            )
+            self._observe_numeric("scan_output", ys)
+            ys = ys.view(B, K, -1, H, W)
             
             y: torch.Tensor = CrossMerge.apply(ys)
 
@@ -1024,6 +1040,18 @@ class SS2D(nn.Module, mamba_init, SS2Dv0, SS2Dv2, SS2Dv3):
             self.__initxv__(**kwargs)
         else:
             self.__initv2__(**kwargs)
+        self._numeric_observer_callback = None
+
+    def set_numeric_observer(self, callback=None):
+        """Install a default-off calibration callback without model state."""
+        if callback is not None and not callable(callback):
+            raise TypeError("numeric observer callback must be callable or None")
+        self._numeric_observer_callback = callback
+
+    def _observe_numeric(self, role, value):
+        callback = self._numeric_observer_callback
+        if callback is not None:
+            callback(role, value.detach())
 
 
 # =====================================================

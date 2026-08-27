@@ -88,8 +88,12 @@ def _git_commit() -> str:
 def _deterministic_config(candidate: CandidateSpec, flip_test: bool) -> Config:
     config = Config.fromfile(REPO_ROOT / candidate.config)
     config.randomness = dict(seed=candidate.seed, deterministic=True)
+    configured_imports = list(
+        config.get('custom_imports', {}).get('imports', ()))
+    if 'mambapose_opt.determinism' not in configured_imports:
+        configured_imports.append('mambapose_opt.determinism')
     config.custom_imports = dict(
-        imports=['mambapose_opt.determinism'], allow_failed_imports=False)
+        imports=configured_imports, allow_failed_imports=False)
     for name in ('train_dataloader', 'val_dataloader', 'test_dataloader'):
         config[name] = deterministic_dataloader_config(
             config[name], seed=candidate.seed, worker_count=2)

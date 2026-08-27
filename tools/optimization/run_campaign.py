@@ -28,6 +28,7 @@ from mambapose_opt.schema import (
     load_candidate_manifest,
 )
 from mambapose_repro.orchestrator import PERMANENT_EXIT, failure_fingerprint
+from mambapose_opt.numeric_conversion import numeric_stage_plan
 
 
 CAMPAIGN_ROOT = REPO_ROOT / 'work_dirs/optimization'
@@ -101,6 +102,21 @@ class SubprocessStageRunner:
             artifact: Path) -> list[str]:
         python = str(REPO_ROOT / '.venv/bin/python')
         common = [candidate.id, '--output', self._relative(artifact)]
+        if stage in {'convert', 'export'}:
+            return [
+                python, str(REPO_ROOT / 'tools/optimization/convert_numeric.py'),
+                candidate.id, '--stage', stage,
+                '--manifest', str(self.manifest_path),
+                '--output', self._relative(artifact),
+            ]
+        if stage == 'calibrate' and candidate.route == 'ssm-quant-pwl':
+            return [
+                python, str(REPO_ROOT / 'tools/optimization/calibrate_numeric.py'),
+                '--candidate', candidate.id,
+                '--manifest', str(self.manifest_path),
+                '--policy', str(REPO_ROOT / candidate.config),
+                '--output', self._relative(artifact),
+            ]
         if stage == 'profile':
             return [
                 python, str(REPO_ROOT / 'tools/optimization/profile_model.py'),
@@ -191,16 +207,38 @@ def _status(root: Path) -> int:
 
 def _select(
         candidates: Sequence[CandidateSpec],
-        identifiers: Sequence[str]) -> tuple[CandidateSpec, ...]:
+        identifiers: Sequence[str], *,
+        admit_conditional: bool = False) -> tuple[CandidateSpec, ...]:
     if not identifiers:
-        return tuple(candidates)
+        return tuple(
+            candidate for candidate in candidates
+            if candidate.features.get('auto_run', True) is not False)
     wanted = set(identifiers)
     selected = tuple(item for item in candidates if item.id in wanted)
     missing = wanted - {item.id for item in selected}
     if missing:
         raise CandidateManifestError(
             f'candidate not found: {sorted(missing)}')
+    conditional = tuple(
+        item.id for item in selected
+        if item.features.get('conditional') is True)
+    if conditional and not admit_conditional:
+        raise CandidateManifestError(
+            f'conditional candidates require --admit-conditional: '
+            f'{list(conditional)}')
     return selected
+
+
+def _stages_for_candidate(candidate: CandidateSpec) -> tuple[str, ...]:
+    if candidate.route != 'ssm-quant-pwl':
+        return ('profile', 'calibrate', 'train', 'evaluate', 'latency',
+                'compare')
+    kind = candidate.features.get('numeric_kind')
+    if not isinstance(kind, str):
+        raise CandidateManifestError(
+            f'numeric candidate {candidate.id} has no numeric_kind')
+    return numeric_stage_plan(
+        kind, conditional=candidate.features.get('conditional') is True)
 
 
 def _canonical_checkout_root() -> Path:
@@ -245,6 +283,7 @@ def main() -> int:
     parser.add_argument('--manifest', type=Path, default=MANIFEST_PATH)
     parser.add_argument('--campaign-root', type=Path, default=CAMPAIGN_ROOT)
     parser.add_argument('--device-index', type=int, default=0)
+    parser.add_argument('--admit-conditional', action='store_true')
     parser.add_argument('--gpu-lock-path', type=Path)
     args = parser.parse_args()
     if args.status:
@@ -264,7 +303,8 @@ def main() -> int:
 
     try:
         candidates = _select(
-            load_candidate_manifest(args.manifest), args.candidate)
+            load_candidate_manifest(args.manifest), args.candidate,
+            admit_conditional=args.admit_conditional)
     except CandidateManifestError as error:
         print(str(error), file=sys.stderr)
         return PERMANENT_EXIT
@@ -278,8 +318,7 @@ def main() -> int:
     expected_run_ids = tuple(
         f'{candidate.id}:{stage}'
         for candidate in candidates
-        for stage in ('profile', 'calibrate', 'train', 'evaluate', 'latency',
-                      'compare'))
+        for stage in _stages_for_candidate(candidate))
     try:
         runner = SubprocessStageRunner(
             args.campaign_root, args.manifest, device_index=args.device_index)
@@ -293,6 +332,7 @@ def main() -> int:
                 device_index=args.device_index,
                 gpu_lock_path=gpu_lock_path,
                 shared_lock_root=shared_lock_root,
+                stages=_stages_for_candidate(candidate),
                 expected_run_ids=expected_run_ids,
             )
             while True:

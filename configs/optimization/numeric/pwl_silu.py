@@ -1,0 +1,10 @@
+_base_ = ['../coco_s_v1_deterministic.py']
+
+numeric_optimization = dict(
+    schema_version=1, route='ssm-quant-pwl', candidate_kind='pwl',
+    conditional_admission=True,
+    pwl=dict(enabled_function='silu', domain=(-6.0, 6.0), segments=16,
+             grid_points=4097, saturation='clamp', qat_form='differentiable'),
+    attention_softmax='exact-floating',
+    stage_order=('train', 'profile', 'evaluate', 'latency', 'compare'),
+)

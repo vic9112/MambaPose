@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Calibrate Route 3 only from manifest-bound full S-V1 train2017 data."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+sys.dont_write_bytecode = True
+
+import torch
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from mambapose_opt.artifacts import optimization_output_path
+from mambapose_opt.numeric_calibration import (
+    CalibrationTargets, calibration_identity, discover_calibration_targets,
+    validate_calibration_artifact)
+from mambapose_opt.schema import load_candidate_manifest
+from mmpose.models.utils.hardware_friendly import ActivationRangeObserver
+
+
+def _candidate(path: Path, identifier: str):
+    candidates = tuple(
+        candidate for candidate in load_candidate_manifest(path)
+        if candidate.id == identifier)
+    if len(candidates) != 1:
+        raise ValueError(f'candidate must resolve exactly once: {identifier}')
+    return candidates[0]
+
+
+def _git_commit(*, require_clean: bool) -> str:
+    commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY_ROOT,
+        text=True).strip()
+    if require_clean:
+        status = subprocess.check_output(
+            ['git', 'status', '--porcelain'], cwd=REPOSITORY_ROOT,
+            text=True)
+        if status:
+            raise ValueError('production calibration requires clean source')
+    return commit
+
+
+def _identity(candidate, policy: Path) -> dict[str, Any]:
+    value = calibration_identity(
+        repository_root=REPOSITORY_ROOT,
+        candidate_id=candidate.id,
+        config=candidate.config,
+        checkpoint=candidate.checkpoint,
+        expected_checkpoint_sha256=candidate.checkpoint_sha256,
+        policy=policy.relative_to(REPOSITORY_ROOT),
+        split='train2017',
+        annotation=Path(
+            'data/coco/annotations/person_keypoints_train2017.json'),
+        image_prefix=Path('data/coco/train2017'))
+    value['git_commit'] = _git_commit(require_clean=False)
+    return value
+
+
+def _target_dict(targets: CalibrationTargets) -> dict[str, list[str]]:
+    return {
+        name: list(getattr(targets, name))
+        for name in targets.__dataclass_fields__
+    }
+
+
+def audit(candidate, policy: Path) -> dict[str, Any]:
+    """CPU checkpoint/config load audit; no dataset iteration or artifact write."""
+    from mmpose.apis import init_model
+
+    model = init_model(
+        str(REPOSITORY_ROOT / candidate.config),
+        str(REPOSITORY_ROOT / candidate.checkpoint),
+        device='cpu')
+    model.eval()
+    targets = discover_calibration_targets(model)
+    return {
+        'status': 'audit-only',
+        'identity': _identity(candidate, policy),
+        'model_mode': 'eval',
+        'grad_enabled': False,
+        'targets': _target_dict(targets),
+    }
+
+
+def _tensor(value: Any) -> torch.Tensor | None:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (tuple, list)):
+        return next((item for child in value if (item := _tensor(child)) is not None),
+                    None)
+    if isinstance(value, dict):
+        return next((item for child in value.values()
+                     if (item := _tensor(child)) is not None), None)
+    return None
+
+
+class _HookSession:
+    def __init__(self, model: torch.nn.Module, targets: CalibrationTargets):
+        self.model = model
+        self.targets = targets
+        self.observers: dict[str, ActivationRangeObserver] = {}
+        self.handles = []
+        self.functional_modules = []
+
+    def _record(self, name: str, value: Any, granularity: str = 'tensor') -> None:
+        tensor = _tensor(value)
+        if tensor is None:
+            raise ValueError(f'calibration hook {name} did not produce a tensor')
+        observer = self.observers.setdefault(
+            name, ActivationRangeObserver(granularity))
+        observer(tensor.detach())
+
+    def __enter__(self):
+        modules = dict(self.model.named_modules())
+        for name in self.targets.ss2d_boundaries:
+            module = modules[name]
+            self.handles.append(module.register_forward_pre_hook(
+                lambda _module, inputs, role=f'{name}.input':
+                self._record(role, inputs)))
+            self.handles.append(module.register_forward_hook(
+                lambda _module, _inputs, output, role=f'{name}.output':
+                self._record(role, output)))
+        for name in self.targets.vmamba_in_proj + self.targets.vmamba_out_proj:
+            self.handles.append(modules[name].register_forward_hook(
+                lambda _module, _inputs, output, role=name:
+                self._record(role, output, 'channel')))
+        for name in self.targets.attention_qkv:
+            def qkv_hook(_module, _inputs, output, role=name):
+                if not isinstance(output, torch.Tensor) or output.shape[-1] % 3:
+                    raise ValueError(f'{role} Q/K/V output is not divisible by three')
+                for suffix, tensor in zip(('q', 'k', 'v'), output.chunk(3, -1)):
+                    self._record(f'{role}.{suffix}', tensor, 'token')
+            self.handles.append(modules[name].register_forward_hook(qkv_hook))
+        for name in self.targets.pif_boundaries:
+            module = modules[name]
+            self.handles.append(module.register_forward_pre_hook(
+                lambda _module, inputs, role=f'{name}.input':
+                self._record(role, inputs, 'token')))
+            self.handles.append(module.register_forward_hook(
+                lambda _module, _inputs, output, role=f'{name}.output':
+                self._record(role, output, 'token')))
+        for name in self.targets.heatmap_projection:
+            self.handles.append(modules[name].register_forward_hook(
+                lambda _module, _inputs, output, role=name:
+                self._record(role, output, 'channel')))
+        for name in self.targets.functional_observers:
+            module = modules[name]
+            module.set_numeric_observer(
+                lambda role, value, prefix=name:
+                self._record(f'{prefix}.{role}', value))
+            self.functional_modules.append(module)
+        parameters = dict(self.model.named_parameters())
+        for name in self.targets.transition_parameters:
+            self._record(name, parameters[name])
+        return self
+
+    def __exit__(self, *_args):
+        for module in self.functional_modules:
+            module.set_numeric_observer(None)
+        for handle in self.handles:
+            handle.remove()
+
+    def records(self) -> dict[str, dict[str, Any]]:
+        return {name: observer.summary() for name, observer in self.observers.items()}
+
+
+def _required_records(targets: CalibrationTargets) -> tuple[str, ...]:
+    functional_roles = (
+        'x_proj', 'dt_proj', 'scan_input_u', 'scan_input_dt',
+        'transition_A', 'transition_B', 'transition_C', 'transition_D',
+        'transition_delta_bias', 'scan_output')
+    return (
+        tuple(f'{name}.{side}' for name in targets.ss2d_boundaries
+              for side in ('input', 'output'))
+        + targets.vmamba_in_proj + targets.vmamba_out_proj
+        + tuple(f'{name}.{role}' for name in targets.attention_qkv
+                for role in ('q', 'k', 'v'))
+        + tuple(f'{name}.{side}' for name in targets.pif_boundaries
+                for side in ('input', 'output'))
+        + targets.heatmap_projection
+        + targets.transition_parameters
+        + tuple(f'{name}.{role}' for name in targets.functional_observers
+                for role in functional_roles)
+    )
+
+
+def _sample_ids(batch: Any) -> tuple[str, ...]:
+    if not isinstance(batch, dict):
+        raise ValueError('calibration dataloader batch must be a mapping')
+    samples = batch.get('data_samples')
+    if not isinstance(samples, (tuple, list)) or not samples:
+        raise ValueError('calibration batch has no data_samples identity')
+    result = []
+    for sample in samples:
+        identifier = getattr(sample, 'img_id', None)
+        if identifier is None and hasattr(sample, 'metainfo'):
+            identifier = sample.metainfo.get('img_id')
+        if identifier is None:
+            raise ValueError('calibration sample has no img_id')
+        result.append(str(identifier))
+    return tuple(result)
+
+
+def calibrate(
+        candidate, policy: Path, *, samples: int, device: str,
+        target_candidate_id: str | None = None) -> dict:
+    if device != 'cuda:0':
+        raise ValueError('production numeric calibration requires cuda:0')
+    if samples <= 0 or samples > 4096:
+        raise ValueError('calibration samples must be in [1, 4096]')
+    _git_commit(require_clean=True)
+    from mmengine.config import Config
+    from mmengine.runner import Runner
+    from mmpose.apis import init_model
+
+    config = Config.fromfile(REPOSITORY_ROOT / candidate.config)
+    loader_config = dict(config.train_dataloader)
+    loader_config.update(batch_size=1, num_workers=0, persistent_workers=False)
+    loader_config['sampler'] = dict(type='DefaultSampler', shuffle=False)
+    model = init_model(
+        str(REPOSITORY_ROOT / candidate.config),
+        str(REPOSITORY_ROOT / candidate.checkpoint),
+        device=device)
+    model.eval()
+    if any(parameter.requires_grad for parameter in model.parameters()):
+        model.requires_grad_(False)
+    targets = discover_calibration_targets(model)
+    dataloader = Runner.build_dataloader(loader_config, seed=0,
+                                         diff_rank_seed=False)
+    order = hashlib.sha256()
+    observed = 0
+    with _HookSession(model, targets) as session, torch.inference_mode():
+        for batch in dataloader:
+            identifiers = _sample_ids(batch)
+            for identifier in identifiers:
+                order.update(identifier.encode('utf-8'))
+                order.update(b'\0')
+            model.test_step(batch)
+            observed += len(identifiers)
+            if observed >= samples:
+                break
+        if observed != samples:
+            raise ValueError(
+                f'calibration observed {observed} samples, expected {samples}')
+        records = session.records()
+    artifact = {
+        'schema_version': 1,
+        'candidate_id': target_candidate_id or candidate.id,
+        'stage': 'calibrate',
+        'identity': _identity(candidate, policy),
+        'protocol': {
+            'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
+            'worker_count': 0, 'sample_count': observed,
+            'sample_order_sha256': order.hexdigest(),
+        },
+        'hooks': {
+            'records': records,
+            'required_records': list(_required_records(targets)),
+            'unsupported_internals': list(targets.unsupported_internals),
+        },
+    }
+    validate_calibration_artifact(artifact)
+    return artifact
+
+
+def _atomic_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        dir=path.parent, prefix=f'.{path.name}.', suffix='.tmp')
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+            json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--candidate', required=True)
+    parser.add_argument('--manifest', type=Path,
+                        default=REPOSITORY_ROOT / 'optimization/candidates.json')
+    parser.add_argument('--policy', type=Path, required=True)
+    parser.add_argument('--output', type=str)
+    parser.add_argument('--samples', type=int, default=512)
+    parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--audit-only', action='store_true')
+    args = parser.parse_args()
+    try:
+        policy = args.policy.resolve()
+        policy.relative_to(REPOSITORY_ROOT.resolve())
+        target = _candidate(args.manifest, args.candidate)
+        source = (
+            _candidate(args.manifest, 'full-s-v1')
+            if target.route == 'ssm-quant-pwl' else target)
+        if args.audit_only:
+            value = audit(source, policy)
+            value['target_candidate_id'] = target.id
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        if not args.output:
+            raise ValueError('--output is required for production calibration')
+        output = optimization_output_path(
+            args.output, repository_root=REPOSITORY_ROOT)
+        _atomic_json(output, calibrate(
+            source, policy, samples=args.samples, device=args.device,
+            target_candidate_id=target.id))
+        return 0
+    except (OSError, RuntimeError, ValueError) as error:
+        parser.error(str(error))
+    return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

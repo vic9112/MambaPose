@@ -34,6 +34,7 @@ from .schema import CandidateSpec
 
 
 STAGES = ('profile', 'calibrate', 'train', 'evaluate', 'latency', 'compare')
+_KNOWN_STAGES = frozenset(STAGES) | {'convert', 'export'}
 CUDA_STAGES = frozenset(STAGES) - {'compare'}
 StageRunner = Callable[[CandidateSpec, str, Path, int], 'StageOutcome']
 ArtifactValidator = Callable[[str, 'StageOutcome'], bool]
@@ -186,7 +187,7 @@ class OptimizationController:
             max_attempts: int = 3,
             retry_delays: Sequence[int] = (30, 120, 600),
             now: Callable[[], datetime] | None = None):
-        unknown = set(stages) - set(STAGES)
+        unknown = set(stages) - _KNOWN_STAGES
         if unknown:
             raise ValueError(f'unknown optimization stages: {sorted(unknown)}')
         if len(stages) != len(set(stages)):
@@ -310,6 +311,15 @@ class OptimizationController:
         if not isinstance(value, dict):
             raise ArtifactValidationError(
                 f'{stage} artifact root must be an object: {path}')
+        if stage == 'calibrate' and self.candidate.route == 'ssm-quant-pwl':
+            try:
+                from .numeric_calibration import validate_calibration_artifact
+                validate_calibration_artifact(
+                    value, expected_candidate_id=self.candidate.id)
+            except ValueError as error:
+                raise ArtifactValidationError(
+                    f'numeric calibration artifact is invalid: {error}') from error
+            return 'numeric-calibration-v1'
         if stage == 'profile':
             required = {
                 'schema_version', 'git_commit', 'candidate', 'config',
@@ -402,6 +412,50 @@ class OptimizationController:
         if not isinstance(value.get('result'), dict):
             raise ArtifactValidationError(
                 f'{stage} artifact result must be an object')
+        if self.candidate.route == 'ssm-quant-pwl' and stage in {
+                'convert', 'export'}:
+            result = value['result']
+            bindings = result.get('runtime_bindings')
+            if not isinstance(bindings, dict) or set(bindings) != {
+                    'config', 'checkpoint', 'policy'}:
+                raise ArtifactValidationError(
+                    'numeric stage runtime bindings are incomplete')
+            for role, binding in bindings.items():
+                if not isinstance(binding, dict) or set(binding) != {
+                        'path', 'sha256'}:
+                    raise ArtifactValidationError(
+                        f'numeric {role} binding schema is invalid')
+                path = (self.repository_root / str(binding['path'])).resolve()
+                try:
+                    path.relative_to(self.repository_root)
+                except ValueError as error:
+                    raise ArtifactValidationError(
+                        f'numeric {role} binding escapes repository') from error
+                if not path.is_file() or _sha256(path) != binding['sha256']:
+                    raise ArtifactValidationError(
+                        f'numeric {role} binding hash mismatch')
+            if result.get('latency_claim') != (
+                    'none-fake-quant-is-not-an-integer-kernel'):
+                raise ArtifactValidationError(
+                    'numeric fake-quant stage made an invalid latency claim')
+            if stage == 'export':
+                exported = result.get('export')
+                if not isinstance(exported, dict) or set(exported) != {
+                        'path', 'sha256', 'bytes', 'format'}:
+                    raise ArtifactValidationError(
+                        'numeric export reference schema is invalid')
+                export_path = (
+                    self.repository_root / str(exported['path'])).resolve()
+                try:
+                    export_path.relative_to(self.repository_root)
+                except ValueError as error:
+                    raise ArtifactValidationError(
+                        'numeric export reference escapes repository') from error
+                if not export_path.is_file() \
+                        or _sha256(export_path) != exported['sha256'] \
+                        or export_path.stat().st_size != exported['bytes']:
+                    raise ArtifactValidationError(
+                        'numeric export reference hash or size mismatch')
         if stage == 'evaluate':
             try:
                 source, source_candidate, authority = resolve_artifact_source(

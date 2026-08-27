@@ -37,6 +37,99 @@
         "role": "teacher",
         "pif_mode": "full"
       }
+    },
+    {
+      "id": "numeric-observer-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "fake-quant",
+      "config": "configs/optimization/numeric/observer_only.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {
+        "numeric_kind": "observer",
+        "auto_run": false,
+        "calibration_split": "train2017"
+      }
+    },
+    {
+      "id": "w8-weight-only-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "fake-quant",
+      "config": "configs/optimization/numeric/w8_weight_only.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {
+        "numeric_kind": "weight-only",
+        "auto_run": false,
+        "simulation_only": true
+      }
+    },
+    {
+      "id": "w8a8-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "fake-quant",
+      "config": "configs/optimization/numeric/w8a8.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {
+        "numeric_kind": "w8a8",
+        "auto_run": false,
+        "conditional": true,
+        "calibration_split": "train2017"
+      }
+    },
+    {
+      "id": "pwl-silu-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "pwl",
+      "config": "configs/optimization/numeric/pwl_silu.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {"numeric_kind": "pwl", "pwl_function": "silu", "auto_run": false, "conditional": true}
+    },
+    {
+      "id": "pwl-gelu-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "pwl",
+      "config": "configs/optimization/numeric/pwl_gelu.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {"numeric_kind": "pwl", "pwl_function": "gelu", "auto_run": false, "conditional": true}
+    },
+    {
+      "id": "pwl-softplus-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "pwl",
+      "config": "configs/optimization/numeric/pwl_softplus.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {"numeric_kind": "pwl", "pwl_function": "softplus", "auto_run": false, "conditional": true}
+    },
+    {
+      "id": "pwl-exp-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "pwl",
+      "config": "configs/optimization/numeric/pwl_exp.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {"numeric_kind": "pwl", "pwl_function": "exp", "auto_run": false, "conditional": true}
+    },
+    {
+      "id": "binary-qk-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "binary-qk",
+      "config": "configs/optimization/numeric/binary_qk.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {"numeric_kind": "binary-qk", "auto_run": false, "conditional": true}
     }
   ]
 }

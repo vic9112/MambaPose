@@ -16,6 +16,7 @@ from typing import Any
 sys.dont_write_bytecode = True
 
 import torch
+from mmengine.config import Config
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 OPTIMIZATION_ARTIFACTS = Path('work_dirs/optimization')
@@ -23,6 +24,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from mambapose_opt.inventory import collect_module_inventory, count_parameters
+from mambapose_opt.numeric_conversion import apply_numeric_runtime
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 
@@ -95,8 +97,12 @@ def profile(candidate: CandidateSpec, input_shape: tuple[int, ...]) -> dict[str,
 
     from mmpose.apis import init_model
 
-    model = init_model(
-        REPOSITORY_ROOT / candidate.config, checkpoint, device='cpu')
+    config = Config.fromfile(REPOSITORY_ROOT / candidate.config)
+    model = init_model(str(REPOSITORY_ROOT / candidate.config),
+                       str(checkpoint), device='cpu')
+    numeric = config.get('numeric_optimization')
+    if numeric is not None:
+        apply_numeric_runtime(model, numeric)
     input_tensor = torch.zeros(input_shape, device='cpu')
     with torch.inference_mode():
         outputs = model(input_tensor, data_samples=None, mode='tensor')
