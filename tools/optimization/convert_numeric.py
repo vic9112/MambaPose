@@ -25,7 +25,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.numeric_conversion import (
     bind_numeric_inputs, quant_policy_from_config, verify_numeric_inputs)
-from mambapose_opt.numeric_calibration import validate_calibration_artifact
+from mambapose_opt.numeric_calibration import validate_calibration_provenance
 from mambapose_opt.numeric_source import build_numeric_source_binding
 from mambapose_opt.source import clean_git_commit
 from mambapose_opt.schema import load_candidate_manifest
@@ -84,8 +84,9 @@ def convert(
         calibration_artifact = calibration_artifact.resolve()
         calibration_artifact.relative_to(REPOSITORY_ROOT.resolve())
         calibration = json.loads(calibration_artifact.read_text(encoding='utf-8'))
-        validate_calibration_artifact(
-            calibration, expected_candidate_id=candidate.id)
+        validate_calibration_provenance(
+            calibration, expected_candidate=candidate,
+            repository_root=REPOSITORY_ROOT, manifest_path=manifest_path)
         config.numeric_optimization.quant_policy.calibration_artifact = {
             'path': calibration_artifact.relative_to(
                 REPOSITORY_ROOT).as_posix(),

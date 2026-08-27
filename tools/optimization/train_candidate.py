@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.numeric_source import (
     build_numeric_source_binding, file_sha256)
+from mambapose_opt.numeric_runtime import validate_recovery_admission
 from mambapose_opt.schema import load_candidate_manifest
 from mambapose_opt.source import clean_git_commit
 
@@ -70,27 +71,15 @@ def _safe_reference(record: object, *, label: str) -> Path:
     return path
 
 
-def _recovery_admission(path: Path, candidate_id: str) -> dict:
+def _recovery_admission(
+        path: Path, candidate, manifest_path: Path) -> dict:
     if not path.is_file():
         raise ValueError(
             'conditional numeric recovery is non-runnable until a Task-7 '
             'attributed-error admission artifact is supplied')
-    value = json.loads(path.read_text(encoding='utf-8'))
-    fields = {
-        'schema_version', 'candidate_id', 'decision', 'attributed_error',
-        'max_preliminary_ap_drop', 'evidence'}
-    if (not isinstance(value, dict) or set(value) != fields
-            or value.get('schema_version') != 1
-            or value.get('candidate_id') != candidate_id
-            or value.get('decision') != 'admit-one-bounded-recovery'
-            or not isinstance(value.get('attributed_error'), str)
-            or not value['attributed_error']
-            or isinstance(value.get('max_preliminary_ap_drop'), bool)
-            or not isinstance(value.get('max_preliminary_ap_drop'), (int, float))
-            or not 0 <= value['max_preliminary_ap_drop'] <= 0.3):
-        raise ValueError('numeric recovery admission contract is invalid')
-    _safe_reference(value['evidence'], label='recovery admission evidence')
-    return value
+    return validate_recovery_admission(
+        path, candidate=candidate, repository_root=REPO_ROOT,
+        manifest_path=manifest_path)
 
 
 def main() -> int:
@@ -112,7 +101,8 @@ def main() -> int:
     stage_dir = output.parent
     try:
         admission_path = stage_dir / 'recovery-admission.json'
-        admission = _recovery_admission(admission_path, candidate.id)
+        admission = _recovery_admission(
+            admission_path, candidate, args.manifest)
         commit = clean_git_commit(REPO_ROOT)
         config = Config.fromfile(REPO_ROOT / candidate.config)
         dependency = {'recovery_admission': {
@@ -188,8 +178,8 @@ def main() -> int:
                     'seed': candidate.seed,
                     'operation': 'one-bounded-numeric-recovery',
                     'attributed_error': admission['attributed_error'],
-                    'max_preliminary_ap_drop':
-                        admission['max_preliminary_ap_drop']},
+                    'preliminary_ap_drop':
+                        admission['preliminary_ap_drop']},
                 'runtime': {
                     'config': {'path': resolved.relative_to(REPO_ROOT).as_posix(),
                                'sha256': file_sha256(resolved)},

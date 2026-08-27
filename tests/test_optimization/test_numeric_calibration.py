@@ -153,6 +153,24 @@ def test_calibration_identity_is_source_checkpoint_policy_and_train_bound(
                 'data/coco/annotations/person_keypoints_train2017.json'),
             image_prefix=Path('data/coco/train2017'))
 
+    (repo / 'data/coco/train2017/000000000001.jpg').write_bytes(b'image')
+    config_bytes = config.read_bytes()
+    config.unlink()
+    (config.parent / 'actual.py').write_bytes(config_bytes)
+    config.symlink_to(config.parent / 'actual.py')
+    with pytest.raises(CalibrationContractError, match='symlink'):
+        calibration_identity(
+            repository_root=repo, candidate_id='full-s-v1',
+            config=Path('configs/reproduction/coco_s_v1.py'),
+            checkpoint=Path('checkpoints/full.pth'),
+            expected_checkpoint_sha256=hashlib.sha256(b'checkpoint').hexdigest(),
+            policy=Path('configs/policy.py'), split='train2017',
+            annotation=Path(
+                'data/coco/annotations/person_keypoints_train2017.json'),
+            image_prefix=Path('data/coco/train2017'))
+    config.unlink()
+    config.write_bytes(config_bytes)
+
     with pytest.raises(CalibrationContractError, match='train2017'):
         calibration_identity(
             repository_root=repo, candidate_id='full-s-v1',
@@ -173,10 +191,12 @@ def test_calibration_artifact_requires_deterministic_order_and_exact_hooks():
         'granularity': 'tensor', 'sample_count': 2, 'zero_count': 0,
         'underflow_count': 0, 'overflow_count': 0, 'max_abs': 1.0,
         'range': [-1.0, 1.0],
-        'percentiles': {'0.5': 1.0},
+        'percentiles': {'0.5': 1.0, '0.9': 1.0, '0.99': 1.0,
+                        '0.999': 1.0},
         'algorithm': 'fixed-log2-histogram-v1', 'histogram_bins': 256,
         'histogram_domain': [2 ** -32, 2 ** 32],
-        'percentile_bound_valid': True, 'relative_error_bound': 0.2,
+        'percentile_bound_valid': True,
+        'relative_error_bound': 2 ** 0.25 - 1,
         'outlier_ratio_above_p99_bin': 0.0, 'token_ids': None,
         'observed_shape': [],
     }
@@ -204,6 +224,55 @@ def test_calibration_artifact_requires_deterministic_order_and_exact_hooks():
     artifact['hooks']['required_records'].append('attention.0.q')
     with pytest.raises(CalibrationContractError, match='duplicated'):
         validate_calibration_artifact(artifact)
+
+
+def test_calibration_provenance_rejects_identity_commit_mismatch(
+        tmp_path, monkeypatch):
+    from mambapose_opt.numeric_calibration import (
+        CalibrationContractError, validate_calibration_provenance)
+    from mambapose_opt.schema import CandidateSpec
+
+    candidate = CandidateSpec.from_dict({
+        'id': 'w8a8', 'route': 'ssm-quant-pwl', 'kind': 'fake-quant',
+        'config': 'configs/w8a8.py', 'checkpoint': 'checkpoint.pth',
+        'checkpoint_sha256': 'a' * 64, 'seed': 0,
+        'features': {'numeric_kind': 'w8a8'},
+    })
+    record = {
+        'granularity': 'tensor', 'sample_count': 2, 'zero_count': 0,
+        'underflow_count': 0, 'overflow_count': 0, 'max_abs': 1.0,
+        'range': [-1.0, 1.0],
+        'percentiles': {'0.5': 1.0, '0.9': 1.0, '0.99': 1.0,
+                        '0.999': 1.0},
+        'algorithm': 'fixed-log2-histogram-v1', 'histogram_bins': 256,
+        'histogram_domain': [2 ** -32, 2 ** 32],
+        'percentile_bound_valid': True,
+        'relative_error_bound': 2 ** 0.25 - 1,
+        'outlier_ratio_above_p99_bin': 0.0, 'token_ids': None,
+        'observed_shape': [],
+    }
+    artifact = {
+        'schema_version': 1, 'candidate_id': 'w8a8', 'stage': 'calibrate',
+        'source': {}, 'identity': _valid_identity(),
+        'protocol': {
+            'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
+            'worker_count': 0, 'sample_count': 1,
+            'sample_order_sha256': 'a' * 64},
+        'hooks': {'records': {'layer.input': record},
+                  'required_records': ['layer.input'],
+                  'unsupported_internals': []},
+    }
+    monkeypatch.setattr(
+        'mambapose_opt.numeric_source.validate_numeric_source_binding',
+        lambda *_args, **_kwargs: {
+            'git_commit': 'c' * 40, 'policy_path': 'configs/w8a8.py',
+            'policy_sha256': 'a' * 64})
+
+    with pytest.raises(CalibrationContractError, match='commit'):
+        validate_calibration_provenance(
+            artifact, expected_candidate=candidate,
+            repository_root=tmp_path,
+            manifest_path=tmp_path / 'optimization/candidates.json')
 
 
 def test_ss2d_numeric_callback_is_opt_in_and_default_state_output_exact():

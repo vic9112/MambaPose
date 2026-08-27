@@ -1,5 +1,9 @@
 _base_ = ['../coco_s_v1_deterministic.py']
 
+custom_imports = dict(
+    imports=['mambapose_opt.numeric_conversion'], allow_failed_imports=False)
+custom_hooks = [dict(type='NumericRuntimeHook', priority='VERY_HIGH')]
+
 numeric_optimization = dict(
     schema_version=1, route='ssm-quant-pwl', candidate_kind='pwl',
     conditional_admission=True,

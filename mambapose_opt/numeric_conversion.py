@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -80,8 +81,14 @@ def verify_numeric_inputs(binding: NumericInputBinding) -> None:
 
 
 def numeric_stage_plan(
-        kind: str, *, conditional: bool) -> tuple[str, ...]:
+        kind: str, *, conditional: bool,
+        recovery: bool = False) -> tuple[str, ...]:
     """Return the immutable Route 3 order without admitting invasive work."""
+    if recovery:
+        if not conditional or kind not in {'w8a8', 'pwl', 'binary-qk'}:
+            raise ValueError(
+                'numeric recovery requires an explicit conditional candidate')
+        return ('train', 'profile', 'evaluate', 'latency')
     if kind == 'observer':
         return ('calibrate',)
     if kind == 'weight-only':
@@ -152,6 +159,10 @@ def quant_policy_from_config(
                 role_scale = record['scale']
                 if isinstance(role_scale, list):
                     role_scale = tuple(role_scale)
+                source_record = calibration_artifact['hooks']['records'][
+                    record['source_record']]
+                _validate_measured_activation_scale(
+                    role, record['granularity'], role_scale, source_record)
                 role_value = dict(spec_value)
                 role_value['activation_scale'] = role_scale
                 role_specs.append((role, QuantSpec(**role_value)))
@@ -172,6 +183,48 @@ def quant_policy_from_config(
             allow=tuple(value['allow']), deny=tuple(value['deny']), spec=spec)
     except (TypeError, ValueError) as error:
         raise NumericBindingError(f'invalid quant policy: {error}') from error
+
+
+def _validate_measured_activation_scale(
+        role: str, granularity: object, scale: object,
+        source_record: Mapping[str, Any]) -> None:
+    if granularity != source_record.get('granularity'):
+        raise NumericBindingError(
+            f'measured activation granularity disagrees for {role}')
+    if granularity == 'tensor':
+        numeric_range = source_record.get('range')
+        if (not isinstance(scale, (int, float)) or isinstance(scale, bool)
+                or not math.isfinite(float(scale)) or float(scale) <= 0
+                or not isinstance(numeric_range, list)
+                or len(numeric_range) != 2):
+            raise NumericBindingError(
+                f'measured activation scale is invalid for {role}')
+        maximum = max(abs(float(item)) for item in numeric_range)
+        expected = maximum / 127.0 if maximum else 1.0
+        if not math.isclose(float(scale), expected, rel_tol=1e-12, abs_tol=0.0):
+            raise NumericBindingError(
+                f'activation scale is not derived from measured range for {role}')
+        return
+    if granularity != 'channel' or not isinstance(scale, tuple):
+        raise NumericBindingError(
+            f'measured activation scale is invalid for {role}')
+    maximum = source_record.get('max_abs')
+    shape = source_record.get('observed_shape')
+    if (not isinstance(maximum, list) or not maximum
+            or not isinstance(shape, list) or shape != [len(maximum)]
+            or len(scale) != len(maximum)):
+        raise NumericBindingError(
+            f'measured activation scale width disagrees for {role}')
+    expected = tuple(float(item) / 127.0 if float(item) else 1.0
+                     for item in maximum)
+    if (any(not isinstance(item, (int, float)) or isinstance(item, bool)
+            or not math.isfinite(float(item)) or float(item) <= 0
+            for item in scale)
+            or any(not math.isclose(float(actual), wanted, rel_tol=1e-12,
+                                    abs_tol=0.0)
+                   for actual, wanted in zip(scale, expected))):
+        raise NumericBindingError(
+            f'activation scale is not derived from measured channels for {role}')
 
 
 def apply_numeric_runtime(
@@ -328,10 +381,15 @@ class NumericRuntimeHook(Hook):
     priority = 'VERY_HIGH'
 
     @staticmethod
+    def apply_to_model(model: nn.Module, config: Mapping[str, Any]):
+        """Run the same registered hook operation outside an MMEngine Runner."""
+        return apply_numeric_runtime(model, config)
+
+    @staticmethod
     def _apply(runner) -> None:
         model = getattr(runner.model, 'module', runner.model)
         config = runner.cfg.get('numeric_optimization')
-        apply_numeric_runtime(model, config)
+        NumericRuntimeHook.apply_to_model(model, config)
 
     def before_train(self, runner) -> None:
         self._apply(runner)

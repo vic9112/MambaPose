@@ -24,7 +24,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from mambapose_opt.inventory import collect_module_inventory, count_parameters
-from mambapose_opt.numeric_conversion import apply_numeric_runtime
+from mambapose_opt.numeric_conversion import NumericRuntimeHook
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 from mambapose_opt.numeric_runtime import resolve_numeric_runtime
@@ -116,7 +116,7 @@ def profile(
                        str(checkpoint), device='cpu')
     numeric = config.get('numeric_optimization')
     if numeric is not None:
-        apply_numeric_runtime(model, numeric)
+        NumericRuntimeHook.apply_to_model(model, numeric)
     input_tensor = torch.zeros(input_shape, device='cpu')
     with torch.inference_mode():
         outputs = model(input_tensor, data_samples=None, mode='tensor')

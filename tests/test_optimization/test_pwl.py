@@ -1,6 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from mmengine.config import Config
 from torch import nn
 
 
@@ -183,6 +184,35 @@ def test_pwl_runtime_rejects_ambiguous_function_or_role_source():
     base['pwl']['source'] = 'ss2d-transition'
     with pytest.raises(NumericBindingError, match='functional'):
         apply_numeric_runtime(model, base)
+
+
+@pytest.mark.parametrize('name', ['silu', 'gelu', 'softplus', 'exp'])
+def test_pwl_stage_config_installs_real_numeric_runtime_hook(name):
+    config = Config.fromfile(f'configs/optimization/numeric/pwl_{name}.py')
+
+    assert 'mambapose_opt.numeric_conversion' in config.custom_imports.imports
+    assert any(
+        hook.get('type') == 'NumericRuntimeHook'
+        for hook in config.custom_hooks)
+
+
+def test_numeric_runtime_hook_public_entrypoint_installs_pwl():
+    from mambapose_opt.numeric_conversion import NumericRuntimeHook
+    from mmpose.models.utils.hardware_friendly import PiecewiseLinearApproximation
+
+    model = nn.ModuleDict({'selected': nn.SiLU()})
+    report = NumericRuntimeHook.apply_to_model(model, {
+        'candidate_kind': 'pwl',
+        'pwl': {
+            'enabled_function': 'silu', 'source': 'module',
+            'roles': ('selected',), 'domain': (-4.0, 4.0),
+            'segments': 4, 'grid_points': 129, 'saturation': 'clamp',
+            'qat_form': 'differentiable',
+        },
+    })
+
+    assert report.function_name == 'silu'
+    assert isinstance(model['selected'], PiecewiseLinearApproximation)
 
 
 @pytest.mark.parametrize('function_name', ['softplus', 'exp'])

@@ -37,7 +37,7 @@ from mambapose_opt.latency import (
     LEASE_MAX_AGE_SECONDS, LEASE_MAX_FUTURE_SKEW_SECONDS,
     build_latency_result, measure_latency_samples, validate_gpu_lease)
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
-from mambapose_opt.numeric_conversion import apply_numeric_runtime
+from mambapose_opt.numeric_conversion import NumericRuntimeHook
 from mambapose_opt.source import clean_git_commit
 from mambapose_opt.numeric_runtime import resolve_numeric_runtime
 
@@ -197,7 +197,7 @@ def measure_candidate(
     model = init_model(config, str(checkpoint), device='cuda:0')
     numeric = config.get('numeric_optimization')
     if numeric is not None:
-        apply_numeric_runtime(model, numeric)
+        NumericRuntimeHook.apply_to_model(model, numeric)
     frame = np.zeros((256, 192, 3), dtype=np.uint8)
     box = np.array([[0., 0., 192., 256.]], dtype=np.float32)
     samples: dict[str, tuple[float, ...]] = {}

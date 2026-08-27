@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import math
@@ -42,11 +43,39 @@ def _sha256(path: Path) -> str:
 def _inside(root: Path, relative: Path, label: str) -> Path:
     if relative.is_absolute():
         raise CalibrationContractError(f'{label} must be repository-relative')
-    path = (root / relative).resolve()
+    if any(part in {'.', '..'} for part in relative.parts):
+        raise CalibrationContractError(f'{label} path is unsafe')
+    lexical = root / relative
+    cursor = root
+    for index, part in enumerate(relative.parts):
+        cursor = cursor / part
+        if cursor.is_symlink() and not _approved_asset_link(
+                root, relative, cursor, index):
+            raise CalibrationContractError(
+                f'{label} path uses an unapproved symlink')
+    path = lexical.resolve()
     try:
         path.relative_to(root.resolve())
-    except ValueError as error:
-        raise CalibrationContractError(f'{label} escapes repository root') from error
+    except ValueError:
+        from .evaluation import MetricError, resolve_project_asset_root
+        try:
+            asset_root = resolve_project_asset_root(root)
+        except MetricError as error:
+            raise CalibrationContractError(
+                f'{label} escapes approved shared assets') from error
+        if relative.parts[:1] == ('data',):
+            expected = asset_root / relative
+        elif relative.parts[:2] == ('work_dirs', 'reproduction'):
+            expected = asset_root / relative
+        else:
+            raise CalibrationContractError(
+                f'{label} escapes repository root')
+        try:
+            if path != expected.resolve(strict=True):
+                raise CalibrationContractError(
+                    f'{label} does not use the approved shared asset root')
+        except OSError as error:
+            raise CalibrationContractError(f'{label} is missing') from error
     if not path.is_file() and label != 'image prefix':
         raise CalibrationContractError(f'{label} is missing: {relative}')
     if label == 'image prefix' and not path.is_dir():
@@ -54,8 +83,28 @@ def _inside(root: Path, relative: Path, label: str) -> Path:
     return path
 
 
+def _approved_asset_link(
+        root: Path, relative: Path, link: Path, index: int) -> bool:
+    prefix = tuple(relative.parts[:index + 1])
+    if prefix not in {('data',), ('work_dirs', 'reproduction')}:
+        return False
+    from .evaluation import MetricError, resolve_project_asset_root
+    try:
+        asset_root = resolve_project_asset_root(root)
+        expected = asset_root.joinpath(*prefix)
+        raw_target = Path(os.readlink(link))
+        lexical_target = (
+            raw_target if raw_target.is_absolute() else link.parent / raw_target)
+        return (
+            lexical_target.absolute() == expected.absolute()
+            and link.resolve(strict=True) == expected.resolve(strict=True))
+    except (MetricError, OSError):
+        return False
+
+
 def _verified_archive(
-        root: Path, inventory: Mapping[str, Any], asset_id: str) -> tuple[Path, str]:
+        root: Path, inventory: Mapping[str, Any], asset_id: str
+        ) -> tuple[Path, str, str]:
     assets = inventory.get('assets')
     if not isinstance(assets, list):
         raise CalibrationContractError('dataset inventory assets are invalid')
@@ -76,7 +125,7 @@ def _verified_archive(
     if actual != expected:
         raise CalibrationContractError(
             f'{asset_id} archive content disagrees with inventory sha256')
-    return archive, actual
+    return archive, actual, relative
 
 
 def _compare_zip_member(
@@ -106,9 +155,9 @@ def _verified_dataset_authority(
         raise CalibrationContractError('dataset inventory is not valid JSON') from error
     if not isinstance(inventory, Mapping):
         raise CalibrationContractError('dataset inventory root is invalid')
-    train_archive, train_archive_sha256 = _verified_archive(
+    train_archive, train_archive_sha256, train_archive_relative = _verified_archive(
         root, inventory, 'coco-train2017')
-    annotation_archive, annotation_archive_sha256 = _verified_archive(
+    annotation_archive, annotation_archive_sha256, annotation_archive_relative = _verified_archive(
         root, inventory, 'coco-annotations')
 
     extracted = {
@@ -171,14 +220,14 @@ def _verified_dataset_authority(
     return {
         'inventory': 'data/inventory.json',
         'inventory_sha256': _sha256(inventory_path),
-        'train_archive': train_archive.relative_to(root).as_posix(),
+        'train_archive': train_archive_relative,
         'train_archive_sha256': train_archive_sha256,
         'image_count': len(extracted),
         'image_content_algorithm': 'sha256-zip-member-bytes-v1',
         'image_content_aggregate_sha256': content_aggregate.hexdigest(),
         'image_order_algorithm': 'sha256-zip-central-directory-order-v1',
         'image_order_sha256': order_aggregate.hexdigest(),
-        'annotation_archive': annotation_archive.relative_to(root).as_posix(),
+        'annotation_archive': annotation_archive_relative,
         'annotation_archive_sha256': annotation_archive_sha256,
         'annotation_member': annotation_member_name,
         'annotation_member_sha256': annotation_member_sha256,
@@ -367,7 +416,9 @@ def validate_calibration_artifact(
         raise CalibrationContractError(
             'calibration dataset authority is incomplete')
     protocol = value['protocol']
-    if not isinstance(protocol, Mapping):
+    if (not isinstance(protocol, Mapping) or set(protocol) != {
+            'model_mode', 'grad_enabled', 'shuffle', 'worker_count',
+            'sample_count', 'sample_order_sha256'}):
         raise CalibrationContractError('calibration protocol is invalid')
     expected = {
         'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
@@ -436,6 +487,7 @@ def validate_calibration_artifact(
                        for item in numeric)
                 or record.get('algorithm') != 'fixed-log2-histogram-v1'
                 or record.get('histogram_bins') != 256
+                or record.get('histogram_domain') != [2 ** -32, 2 ** 32]
                 or not isinstance(record.get('percentile_bound_valid'), bool)):
             raise CalibrationContractError(
                 f'calibration hook record schema is invalid: {name}')
@@ -444,6 +496,51 @@ def validate_calibration_artifact(
                 record['underflow_count'] == 0 and record['overflow_count'] == 0):
             raise CalibrationContractError(
                 f'calibration hook percentile bound is inconsistent: {name}')
+        if (numeric[0] > numeric[1]
+                or record['zero_count'] + record['underflow_count']
+                + record['overflow_count'] > record['sample_count']):
+            raise CalibrationContractError(
+                f'calibration hook count/range is inconsistent: {name}')
+        max_abs = record.get('max_abs')
+        flat_max = _finite_values(max_abs)
+        observed_shape = record.get('observed_shape')
+        if (not flat_max or any(item < 0 for item in flat_max)
+                or not isinstance(observed_shape, list)):
+            raise CalibrationContractError(
+                f'calibration hook max_abs/shape is invalid: {name}')
+        if record['granularity'] == 'tensor' and (
+                observed_shape != [] or len(flat_max) != 1
+                or not math.isclose(
+                    flat_max[0], max(abs(numeric[0]), abs(numeric[1])),
+                    rel_tol=1e-6, abs_tol=0.0)):
+            raise CalibrationContractError(
+                f'calibration tensor range is inconsistent: {name}')
+        percentiles = record.get('percentiles')
+        expected_percentiles = {'0.5', '0.9', '0.99', '0.999'}
+        if not isinstance(percentiles, Mapping) \
+                or set(percentiles) != expected_percentiles:
+            raise CalibrationContractError(
+                f'calibration percentiles are invalid: {name}')
+        percentile_values = tuple(percentiles[key]
+                                  for key in ('0.5', '0.9', '0.99', '0.999'))
+        relative_bound = record.get('relative_error_bound')
+        outlier = record.get('outlier_ratio_above_p99_bin')
+        if bounded:
+            if (any(not isinstance(item, (int, float))
+                    or isinstance(item, bool) or not math.isfinite(item)
+                    for item in percentile_values)
+                    or list(percentile_values) != sorted(percentile_values)
+                    or not math.isclose(
+                        float(relative_bound), 2 ** 0.25 - 1,
+                        rel_tol=1e-12, abs_tol=0.0)
+                    or not isinstance(outlier, (int, float))
+                    or isinstance(outlier, bool) or not 0 <= outlier <= 1):
+                raise CalibrationContractError(
+                    f'calibration bounded statistics are invalid: {name}')
+        elif (any(item is not None for item in percentile_values)
+              or relative_bound is not None or outlier is not None):
+            raise CalibrationContractError(
+                f'calibration unbounded statistics must be invalidated: {name}')
     if not isinstance(hooks.get('unsupported_internals'), list):
         raise CalibrationContractError(
             'calibration unsupported internals must be explicit')
@@ -461,4 +558,150 @@ def validate_calibration_artifact(
                     or record.get('source_record') not in hooks['records']):
                 raise CalibrationContractError(
                     f'calibration activation scale is invalid for {role!r}')
+            validate_activation_scale_record(
+                role, record, hooks['records'][record['source_record']])
     return value
+
+
+def validate_calibration_provenance(
+        value: Mapping[str, Any], *, expected_candidate,
+        repository_root: Path, manifest_path: Path) -> Mapping[str, Any]:
+    """Reconstruct the manifest/source/dataset contract for production use."""
+    validate_calibration_artifact(
+        value, expected_candidate_id=expected_candidate.id)
+    from .numeric_source import validate_numeric_source_binding
+    try:
+        source = validate_numeric_source_binding(
+            value['source'], repository_root=repository_root,
+            candidate=expected_candidate, manifest_path=manifest_path)
+    except ValueError as error:
+        raise CalibrationContractError(
+            f'calibration source binding is invalid: {error}') from error
+    identity = value['identity']
+    if identity['git_commit'] != source['git_commit']:
+        raise CalibrationContractError(
+            'calibration identity commit disagrees with source binding')
+    if (identity['policy'] != source['policy_path']
+            or identity['policy_sha256'] != source['policy_sha256']):
+        raise CalibrationContractError(
+            'calibration policy identity disagrees with source binding')
+    try:
+        authority = json.loads((
+            repository_root / source['authority_path']).read_text(
+                encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise CalibrationContractError(
+            'calibration train authority is unreadable') from error
+    authority_fields = {
+        'schema_version', 'dataset', 'split', 'image_count', 'image_prefix',
+        'annotation_path', 'annotation_archive_member',
+        'image_archive_asset_id', 'image_archive_sha256',
+        'annotation_archive_asset_id', 'annotation_archive_sha256'}
+    dataset = identity['dataset']
+    if (not isinstance(authority, Mapping) or set(authority) != authority_fields
+            or authority.get('schema_version') != 1
+            or authority.get('dataset') != 'coco'
+            or authority.get('split') != 'train2017'
+            or authority.get('image_count') != dataset['image_count']
+            or authority.get('image_prefix') != dataset['image_prefix']
+            or authority.get('annotation_path') != dataset['annotation']
+            or authority.get('annotation_archive_member') !=
+            dataset['annotation_member']
+            or authority.get('image_archive_asset_id') != 'coco-train2017'
+            or authority.get('image_archive_sha256') !=
+            dataset['train_archive_sha256']
+            or authority.get('annotation_archive_asset_id') !=
+            'coco-annotations'
+            or authority.get('annotation_archive_sha256') !=
+            dataset['annotation_archive_sha256']):
+        raise CalibrationContractError(
+            'calibration identity disagrees with tracked train authority')
+    from .schema import load_candidate_manifest
+    baselines = tuple(
+        item for item in load_candidate_manifest(manifest_path)
+        if item.id == 'full-s-v1')
+    if len(baselines) != 1:
+        raise CalibrationContractError(
+            'calibration requires one manifest full-s-v1 source')
+    baseline = baselines[0]
+    expected_identity = calibration_identity(
+        repository_root=repository_root, candidate_id=baseline.id,
+        config=baseline.config, checkpoint=baseline.checkpoint,
+        expected_checkpoint_sha256=baseline.checkpoint_sha256,
+        policy=Path(source['policy_path']), split='train2017',
+        annotation=Path(
+            'data/coco/annotations/person_keypoints_train2017.json'),
+        image_prefix=Path('data/coco/train2017'))
+    expected_identity['git_commit'] = source['git_commit']
+    if identity != expected_identity:
+        raise CalibrationContractError(
+            'calibration identity disagrees with canonical production inputs')
+    from mmengine.config import Config
+    config = Config.fromfile(repository_root / source['policy_path'])
+    numeric = config.get('numeric_optimization', {})
+    policy = numeric.get('quant_policy', {})
+    observers = policy.get('activation_observers', {})
+    if expected_candidate.features.get('numeric_kind') == 'w8a8':
+        scales = value['hooks'].get('activation_scales')
+        if (not isinstance(observers, Mapping) or not observers
+                or not isinstance(scales, Mapping)
+                or set(scales) != set(observers)
+                or any(scales[role]['source_record'] != source_record
+                       for role, source_record in observers.items())):
+            raise CalibrationContractError(
+                'W8A8 calibration scales do not exactly cover policy roles')
+    elif value['hooks'].get('activation_scales'):
+        raise CalibrationContractError(
+            'non-W8A8 calibration must not publish activation scales')
+    return value
+
+
+def _finite_values(value: object) -> list[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) \
+            and math.isfinite(value):
+        return [float(value)]
+    if isinstance(value, list):
+        result: list[float] = []
+        for item in value:
+            child = _finite_values(item)
+            if not child:
+                return []
+            result.extend(child)
+        return result
+    return []
+
+
+def validate_activation_scale_record(
+        role: str, value: Mapping[str, Any],
+        source_record: Mapping[str, Any]) -> None:
+    granularity = value['granularity']
+    if granularity != source_record.get('granularity'):
+        raise CalibrationContractError(
+            f'activation scale granularity disagrees for {role}')
+    scale = value['scale']
+    if granularity == 'tensor':
+        numeric_range = source_record['range']
+        maximum = max(abs(float(item)) for item in numeric_range)
+        expected = maximum / 127.0 if maximum else 1.0
+        if (not isinstance(scale, (int, float)) or isinstance(scale, bool)
+                or not math.isfinite(scale) or scale <= 0
+                or not math.isclose(scale, expected, rel_tol=1e-12,
+                                    abs_tol=0.0)):
+            raise CalibrationContractError(
+                f'activation scale is not derived from measured range for {role}')
+        return
+    maximum = source_record.get('max_abs')
+    shape = source_record.get('observed_shape')
+    if (not isinstance(scale, list) or not isinstance(maximum, list)
+            or not maximum or shape != [len(maximum)]
+            or len(scale) != len(maximum)):
+        raise CalibrationContractError(
+            f'activation scale width disagrees for {role}')
+    expected = [float(item) / 127.0 if float(item) else 1.0
+                for item in maximum]
+    if any(not isinstance(item, (int, float)) or isinstance(item, bool)
+           or not math.isfinite(item) or item <= 0
+           or not math.isclose(item, wanted, rel_tol=1e-12, abs_tol=0.0)
+           for item, wanted in zip(scale, expected)):
+        raise CalibrationContractError(
+            f'activation scale is not derived from measured channels for {role}')

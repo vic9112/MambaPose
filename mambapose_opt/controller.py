@@ -313,10 +313,12 @@ class OptimizationController:
                 f'{stage} artifact root must be an object: {path}')
         if stage == 'calibrate' and self.candidate.route == 'ssm-quant-pwl':
             try:
-                from .numeric_calibration import validate_calibration_artifact
+                from .numeric_calibration import validate_calibration_provenance
                 from .numeric_source import validate_numeric_source_binding
-                validate_calibration_artifact(
-                    value, expected_candidate_id=self.candidate.id)
+                validate_calibration_provenance(
+                    value, expected_candidate=self.candidate,
+                    repository_root=self.repository_root,
+                    manifest_path=self.manifest_path)
                 validate_numeric_source_binding(
                     value['source'], repository_root=self.repository_root,
                     candidate=self.candidate,
@@ -446,14 +448,14 @@ class OptimizationController:
                 'convert', 'export'}:
             result = value['result']
             try:
-                from .numeric_source import validate_numeric_source_binding
-                validate_numeric_source_binding(
-                    result.get('source'), repository_root=self.repository_root,
-                    candidate=self.candidate,
-                    manifest_path=self.manifest_path)
+                from .numeric_runtime import validate_numeric_convert_artifact
+                validate_numeric_convert_artifact(
+                    value, repository_root=self.repository_root,
+                    candidate=self.candidate, manifest_path=self.manifest_path,
+                    artifact_path=path)
             except ValueError as error:
                 raise ArtifactValidationError(
-                    f'numeric stage source binding is invalid: {error}') from error
+                    f'numeric stage canonical output is invalid: {error}') from error
             bindings = result.get('runtime_bindings')
             expected_bindings = {'config', 'checkpoint', 'policy'}
             if self.candidate.features.get('numeric_kind') == 'w8a8':

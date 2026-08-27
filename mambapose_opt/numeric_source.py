@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -54,11 +55,40 @@ def _relative(root: Path, path: Path, label: str) -> str:
     if any(part in {'.', '..'} for part in relative.parts):
         raise NumericSourceError(f'{label} path is unsafe')
     cursor = root
-    for part in relative.parts:
+    for index, part in enumerate(relative.parts):
         cursor = cursor / part
         if cursor.is_symlink():
-            raise NumericSourceError(f'{label} path must not use symlinks')
+            if not _approved_reproduction_link(
+                    root, relative, cursor, index):
+                raise NumericSourceError(
+                    f'{label} path must not use unapproved symlinks')
     return relative.as_posix()
+
+
+def _approved_reproduction_link(
+        root: Path, relative: Path, link: Path, index: int) -> bool:
+    if tuple(relative.parts[:index + 1]) != ('work_dirs', 'reproduction'):
+        return False
+    try:
+        common_value = subprocess.check_output(
+            ['git', 'rev-parse', '--git-common-dir'], cwd=root,
+            text=True).strip()
+        common = Path(common_value)
+        if not common.is_absolute():
+            common = root / common
+        common = common.resolve(strict=True)
+        checkout = common.parent.resolve(strict=True)
+        raw_target = Path(os.readlink(link))
+        lexical_target = raw_target if raw_target.is_absolute() else link.parent / raw_target
+        expected = checkout / 'work_dirs/reproduction'
+        return (
+            common.name == '.git'
+            and root != checkout
+            and lexical_target.absolute() == expected.absolute()
+            and link.resolve(strict=True) == expected.resolve(strict=True)
+            and expected.is_dir())
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return False
 
 
 def _candidate_row(blob: bytes, identifier: str) -> tuple[CandidateSpec, str]:
@@ -75,6 +105,17 @@ def _candidate_row(blob: bytes, identifier: str) -> tuple[CandidateSpec, str]:
         raw[0], sort_keys=True, separators=(',', ':'),
         ensure_ascii=True).encode('utf-8')
     return selected[0], hashlib.sha256(encoded).hexdigest()
+
+
+def resolve_numeric_file(
+        repository_root: Path, path: Path, label: str) -> Path:
+    """Resolve a safe lexical file, admitting only the canonical asset link."""
+    root = Path(repository_root).resolve(strict=True)
+    relative = _relative(root, path, label)
+    selected = root / relative
+    if not selected.is_file():
+        raise NumericSourceError(f'{label} is missing: {relative}')
+    return selected
 
 
 def build_numeric_source_binding(
@@ -151,4 +192,4 @@ def validate_numeric_source_binding(
 
 __all__ = [
     'NumericSourceError', 'build_numeric_source_binding', 'file_sha256',
-    'validate_numeric_source_binding']
+    'resolve_numeric_file', 'validate_numeric_source_binding']

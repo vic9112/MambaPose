@@ -243,7 +243,8 @@ def _stages_for_candidate(candidate: CandidateSpec) -> tuple[str, ...]:
         raise CandidateManifestError(
             f'numeric candidate {candidate.id} has no numeric_kind')
     return numeric_stage_plan(
-        kind, conditional=candidate.features.get('conditional') is True)
+        kind, conditional=candidate.features.get('conditional') is True,
+        recovery=candidate.features.get('recovery_candidate') is True)
 
 
 def _canonical_checkout_root() -> Path:
