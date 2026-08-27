@@ -6,6 +6,69 @@ from pathlib import Path
 import pytest
 
 
+def _commit_fixture(repository: Path, message: str) -> str:
+    if not (repository / '.git').exists():
+        subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
+        subprocess.run(
+            ['git', 'config', 'user.email', 'test@example.com'],
+            cwd=repository, check=True)
+        subprocess.run(
+            ['git', 'config', 'user.name', 'Test'], cwd=repository, check=True)
+    subprocess.run(['git', 'add', '.'], cwd=repository, check=True)
+    subprocess.run(
+        ['git', 'commit', '-qm', message], cwd=repository, check=True)
+    return subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=repository, text=True).strip()
+
+
+def _tensor_calibration_record():
+    return {
+        'granularity': 'tensor', 'sample_count': 2, 'zero_count': 0,
+        'underflow_count': 0, 'overflow_count': 0, 'max_abs': 2.0,
+        'range': [-2.0, 1.0],
+        'percentiles': {'0.5': 1.0, '0.9': 2.0, '0.99': 2.0,
+                        '0.999': 2.0},
+        'algorithm': 'fixed-log2-histogram-v1', 'histogram_bins': 256,
+        'histogram_domain': [2 ** -32, 2 ** 32],
+        'percentile_bound_valid': True,
+        'relative_error_bound': 2 ** 0.25 - 1,
+        'outlier_ratio_above_p99_bin': 0.0, 'token_ids': None,
+        'observed_shape': [],
+    }
+
+
+def _calibration_identity(source, *, checkpoint_sha):
+    sha = 'a' * 64
+    return {
+        'candidate_id': 'full-s-v1',
+        'config': 'configs/reproduction/coco_s_v1.py',
+        'config_sha256': sha, 'checkpoint': 'checkpoint.pth',
+        'checkpoint_sha256': checkpoint_sha,
+        'policy': source['policy_path'],
+        'policy_sha256': source['policy_sha256'], 'split': 'train2017',
+        'git_commit': source['git_commit'],
+        'dataset': {
+            'annotation':
+                'data/coco/annotations/person_keypoints_train2017.json',
+            'annotation_sha256': sha,
+            'image_prefix': 'data/coco/train2017',
+            'inventory': 'data/inventory.json', 'inventory_sha256': sha,
+            'train_archive': 'downloads/train2017.zip',
+            'train_archive_sha256': sha, 'image_count': 118287,
+            'image_content_algorithm': 'sha256-zip-member-bytes-v1',
+            'image_content_aggregate_sha256': sha,
+            'image_order_algorithm':
+                'sha256-zip-central-directory-order-v1',
+            'image_order_sha256': sha,
+            'annotation_archive': 'downloads/annotations.zip',
+            'annotation_archive_sha256': sha,
+            'annotation_member':
+                'annotations/person_keypoints_train2017.json',
+            'annotation_member_sha256': sha,
+        },
+    }
+
+
 def _candidate(identifier, kind, features):
     from mambapose_opt.schema import CandidateSpec
 
@@ -172,6 +235,134 @@ def test_numeric_source_accepts_only_common_checkout_reproduction_link(tmp_path)
             policy_path=linked / 'configs/candidate.py')
 
 
+@pytest.mark.parametrize(
+    ('numeric_kind', 'stage'),
+    (('weight-only', 'convert'), ('weight-only', 'export'),
+     ('w8a8', 'convert')),
+)
+def test_real_numeric_producer_round_trips_public_and_controller_validation(
+        tmp_path, monkeypatch, numeric_kind, stage):
+    from torch import nn
+
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, validate_numeric_convert_artifact)
+    from mambapose_opt.schema import load_candidate_manifest
+    from tools.optimization import convert_numeric
+
+    (tmp_path / 'configs').mkdir()
+    (tmp_path / 'optimization').mkdir()
+    (tmp_path / 'work_dirs/optimization').mkdir(parents=True)
+    (tmp_path / '.gitignore').write_text('work_dirs/\n')
+    checkpoint = tmp_path / 'checkpoint.pth'
+    checkpoint.write_bytes(b'checkpoint')
+    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    activation = (
+        "        activation_observers={'layer': 'layer.input'},\n"
+        if numeric_kind == 'w8a8' else '')
+    activation_bits = (
+        "activation_bits=8, activation_scale="
+        "'runtime-calibration-artifact'"
+        if numeric_kind == 'w8a8' else 'activation_bits=None')
+    config = tmp_path / 'configs/candidate.py'
+    config.write_text(
+        'numeric_optimization = dict(\n'
+        f'    candidate_kind={numeric_kind!r},\n'
+        '    quant_policy=dict(\n'
+        "        allow=('layer',), deny=(),\n"
+        f'{activation}'
+        '        spec=dict(enabled=True, weight_bits=8, '
+        f'{activation_bits}, per_output_channel=True, symmetric=True)),\n'
+        '    precision_invariants=dict(\n'
+        "        selective_scan_state_accumulation='fp32',\n"
+        "        attention_softmax='floating', norms='floating'))\n")
+    candidate_id = f'{numeric_kind}-{stage}'
+    manifest = tmp_path / 'optimization/candidates.json'
+    manifest.write_text(json.dumps({
+        'schema_version': 1,
+        'candidates': [{
+            'id': candidate_id, 'route': 'ssm-quant-pwl',
+            'kind': 'fake-quant', 'config': 'configs/candidate.py',
+            'checkpoint': 'checkpoint.pth',
+            'checkpoint_sha256': checkpoint_sha, 'seed': 0,
+            'features': {'numeric_kind': numeric_kind, 'auto_run': False},
+        }],
+    }))
+    (tmp_path / 'optimization/coco_train2017_authority.json').write_text('{}\n')
+    _commit_fixture(tmp_path, 'producer fixture')
+    candidate = load_candidate_manifest(manifest)[0]
+    stage_dir = (
+        tmp_path / 'work_dirs/optimization' / candidate.route /
+        candidate.id / str(candidate.seed) / stage)
+    stage_dir.mkdir(parents=True)
+    output = stage_dir / f'{stage}.json'
+    calibration_path = None
+    if numeric_kind == 'w8a8':
+        calibration_path = stage_dir.parent / 'calibrate/calibrate.json'
+        calibration_path.parent.mkdir()
+        identity = _calibration_identity(
+            {'policy_path': candidate.config.as_posix(),
+             'policy_sha256': hashlib.sha256(config.read_bytes()).hexdigest(),
+             'git_commit': subprocess.check_output(
+                 ['git', 'rev-parse', 'HEAD'], cwd=tmp_path,
+                 text=True).strip()},
+            checkpoint_sha=checkpoint_sha)
+        calibration_path.write_text(json.dumps({
+            'schema_version': 1, 'candidate_id': candidate.id,
+            'stage': 'calibrate', 'source': {}, 'identity': identity,
+            'protocol': {
+                'model_mode': 'eval', 'grad_enabled': False,
+                'shuffle': False, 'worker_count': 0, 'sample_count': 2,
+                'sample_order_sha256': 'b' * 64},
+            'hooks': {
+                'records': {'layer.input': _tensor_calibration_record()},
+                'required_records': ['layer.input'],
+                'unsupported_internals': [],
+                'activation_scales': {
+                    'layer': {'source_record': 'layer.input',
+                              'granularity': 'tensor', 'scale': 2 / 127}},
+            },
+        }))
+
+    model = nn.Module()
+    model.layer = nn.Linear(2, 2)
+    monkeypatch.setattr(convert_numeric, 'REPOSITORY_ROOT', tmp_path)
+    monkeypatch.setattr('mmpose.apis.init_model', lambda *_args, **_kwargs: model)
+    if numeric_kind == 'w8a8':
+        monkeypatch.setattr(
+            convert_numeric, 'validate_calibration_provenance',
+            lambda value, **_kwargs: value)
+        monkeypatch.setattr(
+            'mambapose_opt.numeric_calibration.validate_calibration_provenance',
+            lambda value, **_kwargs: value)
+
+    produced = convert_numeric.convert(
+        candidate, stage=stage, output=output, manifest_path=manifest,
+        calibration_artifact=calibration_path)
+    output.write_text(json.dumps(produced, allow_nan=False))
+    round_tripped = json.loads(output.read_text())
+    assert round_tripped['result']['conversion']['simulation_only'] is True
+    assert round_tripped['result']['conversion'][
+        'integer_kernel_latency_claimed'] is False
+    assert validate_numeric_convert_artifact(
+        round_tripped, candidate=candidate, repository_root=tmp_path,
+        manifest_path=manifest, artifact_path=output) == round_tripped
+
+    controller = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate,
+        lambda *_args: None, repository_root=tmp_path,
+        manifest_path=manifest, stages=(stage,))
+    assert controller._artifact_schema(stage, output) == (
+        'optimization-stage-envelope-v1')
+
+    if numeric_kind == 'weight-only' and stage == 'convert':
+        round_tripped['result']['conversion']['simulation_only'] = False
+        with pytest.raises(NumericRuntimeError, match='conversion report'):
+            validate_numeric_convert_artifact(
+                round_tripped, candidate=candidate, repository_root=tmp_path,
+                manifest_path=manifest, artifact_path=output)
+
+
 def test_controller_rehashes_numeric_nested_bindings_and_export(
         tmp_path, monkeypatch):
     from mambapose_opt.controller import (
@@ -304,13 +495,13 @@ def test_train_artifact_rejects_hash_matching_empty_recovery_admission(
     digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     candidate = _candidate(
         'recovery', 'fake-quant', {
-            'numeric_kind': 'w8a8', 'recovery_candidate': True,
+            'numeric_kind': 'pwl', 'recovery_candidate': True,
             'runtime_checkpoint': runtime_checkpoint.relative_to(
                 tmp_path).as_posix(),
         })
     metadata.write_text(json.dumps({
         'schema_version': 1, 'candidate_id': candidate.id,
-        'route': candidate.route, 'numeric_kind': 'w8a8',
+        'route': candidate.route, 'numeric_kind': 'pwl',
         'parent_checkpoint_sha256': candidate.checkpoint_sha256,
         'runtime_checkpoint_sha256': digest(runtime_checkpoint),
         'recovery_admission_sha256': digest(admission),
@@ -345,6 +536,215 @@ def test_train_artifact_rejects_hash_matching_empty_recovery_admission(
         validate_numeric_train_artifact(
             artifact, candidate=candidate, repository_root=tmp_path,
             manifest_path=tmp_path / 'optimization/candidates.json')
+
+
+def test_w8a8_recovery_uses_screen_manifest_calibration_and_trained_checkpoint(
+        tmp_path, monkeypatch):
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_opt.numeric_runtime import (
+        resolve_numeric_runtime, validate_numeric_train_artifact,
+        validate_recovery_calibration_dependency)
+    from mambapose_opt.numeric_source import (
+        build_numeric_source_binding, file_sha256)
+    from mambapose_opt.schema import load_candidate_manifest
+
+    (tmp_path / 'configs/reproduction').mkdir(parents=True)
+    (tmp_path / 'configs/numeric').mkdir()
+    (tmp_path / 'optimization').mkdir()
+    (tmp_path / 'work_dirs/optimization').mkdir(parents=True)
+    (tmp_path / '.gitignore').write_text('work_dirs/\n')
+    checkpoint = tmp_path / 'checkpoint.pth'
+    checkpoint.write_bytes(b'parent')
+    checkpoint_sha = file_sha256(checkpoint)
+    (tmp_path / 'configs/reproduction/coco_s_v1.py').write_text(
+        'model = dict(type="baseline")\n')
+    policy = tmp_path / 'configs/numeric/w8a8.py'
+    policy.write_text(
+        'numeric_optimization = dict(\n'
+        "    candidate_kind='w8a8',\n"
+        '    quant_policy=dict(\n'
+        "        allow=('layer',), deny=(),\n"
+        "        activation_observers={'layer': 'layer.input'},\n"
+        '        spec=dict(enabled=True, weight_bits=8, activation_bits=8,\n'
+        "                  activation_scale='runtime-calibration-artifact',\n"
+        '                  per_output_channel=True, symmetric=True)),\n'
+        '    precision_invariants=dict(\n'
+        "        selective_scan_state_accumulation='fp32',\n"
+        "        attention_softmax='floating', norms='floating'))\n")
+    screen_manifest = tmp_path / 'optimization/candidates.json'
+    baseline_row = {
+        'id': 'full-s-v1', 'route': 'baseline', 'kind': 'float',
+        'config': 'configs/reproduction/coco_s_v1.py',
+        'checkpoint': 'checkpoint.pth', 'checkpoint_sha256': checkpoint_sha,
+        'seed': 0, 'features': {},
+    }
+    screen_row = {
+        'id': 'w8a8-screen', 'route': 'ssm-quant-pwl',
+        'kind': 'fake-quant', 'config': 'configs/numeric/w8a8.py',
+        'checkpoint': 'checkpoint.pth', 'checkpoint_sha256': checkpoint_sha,
+        'seed': 0, 'features': {'numeric_kind': 'w8a8'},
+    }
+    screen_manifest.write_text(json.dumps({
+        'schema_version': 1, 'candidates': [baseline_row, screen_row]}))
+    sha = 'a' * 64
+    (tmp_path / 'optimization/coco_train2017_authority.json').write_text(
+        json.dumps({
+            'schema_version': 1, 'dataset': 'coco', 'split': 'train2017',
+            'image_count': 118287, 'image_prefix': 'data/coco/train2017',
+            'annotation_path':
+                'data/coco/annotations/person_keypoints_train2017.json',
+            'annotation_archive_member':
+                'annotations/person_keypoints_train2017.json',
+            'image_archive_asset_id': 'coco-train2017',
+            'image_archive_sha256': sha,
+            'annotation_archive_asset_id': 'coco-annotations',
+            'annotation_archive_sha256': sha,
+        }))
+    screen_commit = _commit_fixture(tmp_path, 'screen manifest')
+    screen = load_candidate_manifest(screen_manifest)[1]
+    screen_source = build_numeric_source_binding(
+        repository_root=tmp_path, candidate=screen,
+        manifest_path=screen_manifest, policy_path=policy,
+        git_commit=screen_commit)
+    identity = _calibration_identity(
+        screen_source, checkpoint_sha=checkpoint_sha)
+    calibration_path = (
+        tmp_path / 'work_dirs/optimization/ssm-quant-pwl' /
+        screen.id / str(screen.seed) / 'calibrate/calibrate.json')
+    calibration_path.parent.mkdir(parents=True)
+    calibration = {
+        'schema_version': 1, 'candidate_id': screen.id,
+        'stage': 'calibrate', 'source': screen_source, 'identity': identity,
+        'protocol': {
+            'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
+            'worker_count': 0, 'sample_count': 2,
+            'sample_order_sha256': 'b' * 64},
+        'hooks': {
+            'records': {'layer.input': _tensor_calibration_record()},
+            'required_records': ['layer.input'],
+            'unsupported_internals': [],
+            'activation_scales': {
+                'layer': {'source_record': 'layer.input',
+                          'granularity': 'tensor', 'scale': 2 / 127}},
+        },
+    }
+    calibration_path.write_text(json.dumps(calibration))
+    calibration_sha = file_sha256(calibration_path)
+
+    recovery_stage = (
+        tmp_path / 'work_dirs/optimization/ssm-quant-pwl' /
+        'w8a8-recovery/0/train')
+    recovery_runtime = recovery_stage / 'best_numeric.pth'
+    recovery_manifest = tmp_path / 'optimization/recovery-candidates.json'
+    recovery_row = {
+        'id': 'w8a8-recovery', 'route': 'ssm-quant-pwl',
+        'kind': 'fake-quant', 'config': screen_row['config'],
+        'checkpoint': screen_row['checkpoint'],
+        'checkpoint_sha256': checkpoint_sha, 'seed': 0,
+        'features': {
+            'numeric_kind': 'w8a8', 'conditional': True,
+            'recovery_candidate': True,
+            'recovery_screen_candidate': screen.id,
+            'recovery_calibration_artifact':
+                calibration_path.relative_to(tmp_path).as_posix(),
+            'recovery_calibration_sha256': calibration_sha,
+            'runtime_checkpoint':
+                recovery_runtime.relative_to(tmp_path).as_posix(),
+        },
+    }
+    recovery_manifest.write_text(json.dumps({
+        'schema_version': 1, 'candidates': [recovery_row]}))
+    recovery_commit = _commit_fixture(tmp_path, 'recovery manifest')
+    recovery = load_candidate_manifest(recovery_manifest)[0]
+    monkeypatch.setattr(
+        'mambapose_opt.numeric_calibration.calibration_identity',
+        lambda **_kwargs: identity)
+
+    selected, reference, validated = validate_recovery_calibration_dependency(
+        recovery, repository_root=tmp_path,
+        recovery_manifest_path=recovery_manifest,
+        recovery_stage_dir=recovery_stage)
+    assert selected == screen
+    assert reference == {
+        'path': calibration_path.relative_to(tmp_path).as_posix(),
+        'sha256': calibration_sha}
+    assert validated == calibration
+
+    recovery_stage.mkdir(parents=True)
+    admission = recovery_stage / 'recovery-admission.json'
+    admission.write_text('{"admitted":true}\n')
+    runtime_config = recovery_stage / 'resolved-train.py'
+    runtime_config.write_text('runtime = True\n')
+    recovery_runtime.write_bytes(b'trained')
+    metadata = recovery_stage / 'runtime-metadata.json'
+    recovery_source = build_numeric_source_binding(
+        repository_root=tmp_path, candidate=recovery,
+        manifest_path=recovery_manifest, policy_path=policy,
+        git_commit=recovery_commit)
+    ref = lambda path: {
+        'path': path.relative_to(tmp_path).as_posix(),
+        'sha256': file_sha256(path)}
+    metadata.write_text(json.dumps({
+        'schema_version': 1, 'candidate_id': recovery.id,
+        'route': recovery.route, 'numeric_kind': 'w8a8',
+        'parent_checkpoint_sha256': checkpoint_sha,
+        'runtime_checkpoint_sha256': file_sha256(recovery_runtime),
+        'recovery_admission_sha256': file_sha256(admission),
+        'screen_calibration_candidate_id': screen.id,
+        'screen_calibration_sha256': calibration_sha,
+    }))
+    train = {
+        'schema_version': 1, 'candidate_id': recovery.id, 'stage': 'train',
+        'result': {
+            'route': recovery.route, 'source': recovery_source,
+            'parent': {
+                'config': recovery.config.as_posix(),
+                'checkpoint': recovery.checkpoint.as_posix(),
+                'checkpoint_sha256': recovery.checkpoint_sha256},
+            'dependency': {
+                'recovery_admission': ref(admission),
+                'screen_calibration': reference},
+            'protocol': {
+                'seed': 0, 'operation': 'one-bounded-numeric-recovery',
+                'attributed_error': 'activation quantization',
+                'preliminary_ap_drop': 0.31},
+            'runtime': {
+                'config': ref(runtime_config),
+                'checkpoint': ref(recovery_runtime),
+                'metadata': ref(metadata),
+                'transform': 'bounded-numeric-recovery-v1'},
+        },
+    }
+    train_path = recovery_stage / 'train.json'
+    train_path.write_text(json.dumps(train))
+    monkeypatch.setattr(
+        'mambapose_opt.numeric_runtime.validate_recovery_admission',
+        lambda *_args, **_kwargs: {
+            'attributed_error': 'activation quantization',
+            'preliminary_ap_drop': 0.31})
+
+    validated_runtime = validate_numeric_train_artifact(
+        train, candidate=recovery, repository_root=tmp_path,
+        manifest_path=recovery_manifest)
+    assert validated_runtime['checkpoint_path'] == recovery_runtime
+    controller = OptimizationController(
+        tmp_path / 'work_dirs/optimization', recovery, lambda *_args: None,
+        repository_root=tmp_path, manifest_path=recovery_manifest,
+        stages=('train',))
+    assert controller._artifact_schema('train', train_path) == 'numeric-train-v1'
+    downstream = recovery_stage.parent / 'profile/profile.json'
+    downstream.parent.mkdir()
+    assert resolve_numeric_runtime(
+        recovery, repository_root=tmp_path,
+        manifest_path=recovery_manifest,
+        downstream_output=downstream)['checkpoint_path'] == recovery_runtime
+
+    calibration_path.write_text('{"forged":true}\n')
+    with pytest.raises(ValueError, match='calibration.*hash'):
+        validate_recovery_calibration_dependency(
+            recovery, repository_root=tmp_path,
+            recovery_manifest_path=recovery_manifest,
+            recovery_stage_dir=recovery_stage)
 
 
 def test_campaign_does_not_auto_select_opt_in_numeric_candidates():

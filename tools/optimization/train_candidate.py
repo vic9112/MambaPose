@@ -24,7 +24,8 @@ if str(REPO_ROOT) not in sys.path:
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.numeric_source import (
     build_numeric_source_binding, file_sha256)
-from mambapose_opt.numeric_runtime import validate_recovery_admission
+from mambapose_opt.numeric_runtime import (
+    validate_recovery_admission, validate_recovery_calibration_dependency)
 from mambapose_opt.schema import load_candidate_manifest
 from mambapose_opt.source import clean_git_commit
 
@@ -50,25 +51,6 @@ def _atomic_json(path: Path, value: object) -> None:
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
-
-
-def _safe_reference(record: object, *, label: str) -> Path:
-    if not isinstance(record, dict) or set(record) != {'path', 'sha256'}:
-        raise ValueError(f'{label} reference is invalid')
-    relative = Path(record['path'])
-    if (relative.is_absolute() or any(part in {'.', '..'} for part in relative.parts)
-            or not str(record['sha256']).isalnum()
-            or len(str(record['sha256'])) != 64):
-        raise ValueError(f'{label} reference is unsafe')
-    path = REPO_ROOT / relative
-    cursor = REPO_ROOT
-    for part in relative.parts:
-        cursor = cursor / part
-        if cursor.is_symlink():
-            raise ValueError(f'{label} path must not use symlinks')
-    if not path.is_file() or file_sha256(path) != record['sha256']:
-        raise ValueError(f'{label} reference hash changed')
-    return path
 
 
 def _recovery_admission(
@@ -108,17 +90,16 @@ def main() -> int:
         dependency = {'recovery_admission': {
             'path': admission_path.relative_to(REPO_ROOT).as_posix(),
             'sha256': file_sha256(admission_path)}}
+        screen = None
         if kind == 'w8a8':
-            calibration_path = stage_dir.parent / 'calibrate/calibrate.json'
-            _safe_reference({
-                'path': calibration_path.relative_to(REPO_ROOT).as_posix(),
-                'sha256': file_sha256(calibration_path)},
-                label='W8A8 calibration')
-            config.numeric_optimization.quant_policy.calibration_artifact = {
-                'path': calibration_path.relative_to(REPO_ROOT).as_posix(),
-                'sha256': file_sha256(calibration_path)}
-            dependency['calibration'] = dict(
-                config.numeric_optimization.quant_policy.calibration_artifact)
+            screen, calibration_reference, _calibration = (
+                validate_recovery_calibration_dependency(
+                    candidate, repository_root=REPO_ROOT,
+                    recovery_manifest_path=args.manifest,
+                    recovery_stage_dir=stage_dir))
+            config.numeric_optimization.quant_policy.calibration_artifact = (
+                calibration_reference)
+            dependency['screen_calibration'] = dict(calibration_reference)
         work_dir = stage_dir / 'mmpose'
         resolved = stage_dir / 'resolved-train.py'
         config.work_dir = str(work_dir)
@@ -154,13 +135,20 @@ def main() -> int:
             raise ValueError('runtime_checkpoint feature disagrees with stage layout')
         metadata_path = stage_dir / 'runtime-metadata.json'
         runtime_sha = file_sha256(runtime_checkpoint)
-        _atomic_json(metadata_path, {
+        metadata = {
             'schema_version': 1, 'candidate_id': candidate.id,
             'route': candidate.route, 'numeric_kind': kind,
             'parent_checkpoint_sha256': candidate.checkpoint_sha256,
             'runtime_checkpoint_sha256': runtime_sha,
             'recovery_admission_sha256': file_sha256(admission_path),
-        })
+        }
+        if kind == 'w8a8':
+            metadata.update({
+                'screen_calibration_candidate_id': screen.id,
+                'screen_calibration_sha256':
+                    dependency['screen_calibration']['sha256'],
+            })
+        _atomic_json(metadata_path, metadata)
         source = build_numeric_source_binding(
             repository_root=REPO_ROOT, candidate=candidate,
             manifest_path=args.manifest, policy_path=REPO_ROOT / candidate.config,

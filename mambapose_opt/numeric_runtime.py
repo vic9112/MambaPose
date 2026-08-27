@@ -65,7 +65,8 @@ def validate_numeric_convert_artifact(
     conversion = result['conversion']
     conversion_fields = {
         'converted', 'skipped', 'original_weight_bytes',
-        'simulated_weight_bytes', 'simulated_coverage'}
+        'simulated_weight_bytes', 'simulated_coverage', 'simulation_only',
+        'integer_kernel_latency_claimed'}
     if (not isinstance(conversion, Mapping)
             or set(conversion) != conversion_fields
             or not isinstance(conversion.get('converted'), list)
@@ -80,7 +81,9 @@ def validate_numeric_convert_artifact(
                        'original_weight_bytes', 'simulated_weight_bytes'))
             or isinstance(conversion.get('simulated_coverage'), bool)
             or not isinstance(conversion.get('simulated_coverage'), (int, float))
-            or not 0 <= conversion['simulated_coverage'] <= 1):
+            or not 0 <= conversion['simulated_coverage'] <= 1
+            or conversion.get('simulation_only') is not True
+            or conversion.get('integer_kernel_latency_claimed') is not False):
         raise NumericRuntimeError('numeric conversion report is invalid')
     from mmengine.config import Config
     policy_config = Config.fromfile(repository_root / candidate.config)
@@ -269,6 +272,120 @@ def validate_recovery_admission(
     return dict(value)
 
 
+def validate_recovery_calibration_dependency(
+        candidate: CandidateSpec, *, repository_root: Path,
+        recovery_manifest_path: Path,
+        recovery_stage_dir: Path) -> tuple[
+            CandidateSpec, dict[str, str], dict[str, Any]]:
+    """Authenticate a W8A8 recovery's already-screened calibration.
+
+    The calibration remains bound to the immutable manifest that produced the
+    initial screen.  A later commit-addressed recovery manifest can therefore
+    record the artifact hash without creating a manifest/artifact hash cycle.
+    """
+    if (candidate.route != 'ssm-quant-pwl'
+            or candidate.features.get('numeric_kind') != 'w8a8'
+            or candidate.features.get('recovery_candidate') is not True):
+        raise NumericRuntimeError(
+            'screen calibration dependency requires a W8A8 recovery candidate')
+    screen_id = candidate.features.get('recovery_screen_candidate')
+    path_value = candidate.features.get('recovery_calibration_artifact')
+    sha256 = candidate.features.get('recovery_calibration_sha256')
+    if (not isinstance(screen_id, str) or not screen_id
+            or not isinstance(path_value, str) or not path_value
+            or not isinstance(sha256, str)):
+        raise NumericRuntimeError(
+            'W8A8 recovery calibration manifest features are incomplete')
+    reference = {'path': path_value, 'sha256': sha256}
+    calibration_path = _file(
+        repository_root, reference, 'W8A8 recovery calibration')
+    try:
+        calibration = json.loads(calibration_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise NumericRuntimeError(
+            'W8A8 recovery calibration is invalid JSON') from error
+    source = calibration.get('source') if isinstance(calibration, Mapping) else None
+    source_manifest = source.get('manifest_path') \
+        if isinstance(source, Mapping) else None
+    source_manifest_sha = source.get('manifest_sha256') \
+        if isinstance(source, Mapping) else None
+    if (not isinstance(source_manifest, str) or not source_manifest
+            or not isinstance(source_manifest_sha, str)):
+        raise NumericRuntimeError(
+            'W8A8 recovery calibration source manifest is missing')
+    try:
+        screen_manifest_path = resolve_numeric_file(
+            repository_root, Path(source_manifest),
+            'W8A8 screen source manifest')
+    except ValueError as error:
+        raise NumericRuntimeError(str(error)) from error
+    if file_sha256(screen_manifest_path) != source_manifest_sha:
+        raise NumericRuntimeError(
+            'W8A8 screen source manifest hash changed')
+    from .schema import load_candidate_manifest
+    screens = tuple(
+        item for item in load_candidate_manifest(screen_manifest_path)
+        if item.id == screen_id)
+    if len(screens) != 1:
+        raise NumericRuntimeError(
+            'W8A8 recovery screen candidate is not canonical')
+    screen = screens[0]
+    if (screen.id == candidate.id
+            or screen.route != 'ssm-quant-pwl'
+            or screen.features.get('numeric_kind') != 'w8a8'
+            or screen.features.get('recovery_candidate') is True
+            or candidate.config != screen.config
+            or candidate.checkpoint != screen.checkpoint
+            or candidate.checkpoint_sha256 != screen.checkpoint_sha256
+            or candidate.seed != screen.seed):
+        raise NumericRuntimeError(
+            'W8A8 recovery runtime lineage disagrees with screen candidate')
+    root = Path(repository_root).resolve()
+    expected_stage = (
+        root / 'work_dirs/optimization' / candidate.route / candidate.id /
+        str(candidate.seed) / 'train')
+    if Path(recovery_stage_dir).absolute() != expected_stage.absolute():
+        raise NumericRuntimeError(
+            'W8A8 recovery train stage path is not canonical')
+    expected_calibration = (
+        root / 'work_dirs/optimization' / screen.route / screen.id /
+        str(screen.seed) / 'calibrate/calibrate.json')
+    if calibration_path.absolute() != expected_calibration.absolute():
+        raise NumericRuntimeError(
+            'W8A8 recovery calibration path is not the screen stage output')
+    try:
+        from .numeric_calibration import (
+            CalibrationContractError, validate_calibration_provenance)
+        validate_calibration_provenance(
+            calibration, expected_candidate=screen,
+            repository_root=root, manifest_path=screen_manifest_path)
+    except CalibrationContractError as error:
+        raise NumericRuntimeError(
+            f'W8A8 recovery calibration contract is invalid: {error}') from error
+    if file_sha256(calibration_path) != sha256:
+        raise NumericRuntimeError(
+            'W8A8 recovery calibration hash changed during validation')
+    # The recovery manifest is validated separately by the train source
+    # binding.  Resolve it here so a caller cannot silently supply a missing or
+    # unsafe alternate manifest path.
+    try:
+        resolved_recovery_manifest = resolve_numeric_file(
+            root, Path(recovery_manifest_path), 'W8A8 recovery manifest')
+    except ValueError as error:
+        raise NumericRuntimeError(str(error)) from error
+    recoveries = tuple(
+        item for item in load_candidate_manifest(resolved_recovery_manifest)
+        if item.id == candidate.id)
+    if len(recoveries) != 1 or recoveries[0] != candidate:
+        raise NumericRuntimeError(
+            'W8A8 recovery candidate differs from recovery manifest')
+    if resolved_recovery_manifest == screen_manifest_path:
+        raise NumericRuntimeError(
+            'W8A8 recovery requires a follow-on manifest to avoid cyclic '
+            'artifact authority')
+    return screen, reference, dict(calibration)
+
+
 def validate_numeric_train_artifact(
         value: Mapping[str, Any], *, candidate: CandidateSpec,
         repository_root: Path, manifest_path: Path) -> dict[str, Any]:
@@ -309,10 +426,12 @@ def validate_numeric_train_artifact(
             or protocol['preliminary_ap_drop'] <= 0.3):
         raise NumericRuntimeError('numeric train protocol is invalid')
     dependency = result['dependency']
+    kind = candidate.features.get('numeric_kind')
+    expected_dependencies = (
+        {'recovery_admission', 'screen_calibration'}
+        if kind == 'w8a8' else {'recovery_admission'})
     if (not isinstance(dependency, Mapping)
-            or set(dependency) not in (
-                {'recovery_admission'},
-                {'recovery_admission', 'calibration'})):
+            or set(dependency) != expected_dependencies):
         raise NumericRuntimeError('numeric train dependency is invalid')
     dependency_paths = {
         name: _file(repository_root, reference, f'numeric train {name}')
@@ -344,6 +463,21 @@ def validate_numeric_train_artifact(
             stage_dir / 'recovery-admission.json'):
         raise NumericRuntimeError(
             'numeric train runtime files are not canonical stage outputs')
+    screen = None
+    if kind == 'w8a8':
+        screen, expected_calibration, _calibration = (
+            validate_recovery_calibration_dependency(
+                candidate, repository_root=repository_root,
+                recovery_manifest_path=manifest_path,
+                recovery_stage_dir=stage_dir))
+        if (dependency['screen_calibration'] != expected_calibration
+                or dependency_paths['screen_calibration'] !=
+                repository_root / expected_calibration['path']):
+            raise NumericRuntimeError(
+                'numeric train screen calibration dependency is not canonical')
+        validate_numeric_source_binding(
+            result['source'], repository_root=repository_root,
+            candidate=candidate, manifest_path=manifest_path)
     expected = candidate.features.get('runtime_checkpoint')
     if not isinstance(expected, str) or runtime['checkpoint']['path'] != expected:
         raise NumericRuntimeError('runtime checkpoint path disagrees with manifest')
@@ -351,11 +485,16 @@ def validate_numeric_train_artifact(
         metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as error:
         raise NumericRuntimeError('runtime metadata is invalid JSON') from error
+    metadata_fields = {
+        'schema_version', 'candidate_id', 'route', 'numeric_kind',
+        'parent_checkpoint_sha256', 'runtime_checkpoint_sha256',
+        'recovery_admission_sha256'}
+    if kind == 'w8a8':
+        metadata_fields.update({
+            'screen_calibration_candidate_id',
+            'screen_calibration_sha256'})
     if (not isinstance(metadata, Mapping)
-            or set(metadata) != {
-                'schema_version', 'candidate_id', 'route', 'numeric_kind',
-                'parent_checkpoint_sha256', 'runtime_checkpoint_sha256',
-                'recovery_admission_sha256'}
+            or set(metadata) != metadata_fields
             or metadata.get('schema_version') != 1
             or metadata.get('candidate_id') != candidate.id
             or metadata.get('route') != candidate.route
@@ -365,7 +504,11 @@ def validate_numeric_train_artifact(
             or metadata.get('runtime_checkpoint_sha256') !=
                 runtime['checkpoint']['sha256']
             or metadata.get('recovery_admission_sha256') !=
-                dependency['recovery_admission']['sha256']):
+                dependency['recovery_admission']['sha256']
+            or (kind == 'w8a8' and (
+                metadata.get('screen_calibration_candidate_id') != screen.id
+                or metadata.get('screen_calibration_sha256') !=
+                dependency['screen_calibration']['sha256']))):
         raise NumericRuntimeError('runtime metadata identity is invalid')
     return {
         'config_path': config,
@@ -445,4 +588,5 @@ def resolve_numeric_runtime(
 __all__ = [
     'NumericRuntimeError', 'resolve_numeric_runtime',
     'validate_numeric_convert_artifact', 'validate_numeric_train_artifact',
-    'validate_recovery_admission']
+    'validate_recovery_admission',
+    'validate_recovery_calibration_dependency']
