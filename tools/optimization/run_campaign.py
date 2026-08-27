@@ -14,6 +14,8 @@ import sys
 import time
 from typing import Sequence
 
+sys.dont_write_bytecode = True
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -69,6 +71,7 @@ class SubprocessStageRunner:
         environment = os.environ.copy()
         environment.update({
             'PYTHONNOUSERSITE': '1',
+            'PYTHONDONTWRITEBYTECODE': '1',
             'CUDA_VISIBLE_DEVICES': str(self.device_index),
             'MAMBAPOSE_PHYSICAL_DEVICE_INDEX': str(self.device_index),
             'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1',

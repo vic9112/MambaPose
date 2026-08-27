@@ -104,6 +104,7 @@ def _latency(candidate_id='full-s-v1'):
                     'authority_image_count': 5000,
                     'authority_annotation_count': 11004,
                     'authority_detection_count': 104125,
+                    'inventory_authority_sha256': 'c' * 64,
                     'annotation_authority_sha256': '1' * 64,
                     'detection_authority_sha256': '2' * 64,
                     'image_corpus_digest_algorithm': (
@@ -165,6 +166,7 @@ def _evaluation(candidate_id='full-s-v1'):
                 'authority_image_count': 5000,
                 'authority_annotation_count': 11004,
                 'authority_detection_count': 104125,
+                'inventory_authority_sha256': 'c' * 64,
                 'annotation_authority_sha256': '1' * 64,
                 'detection_authority_sha256': '2' * 64,
                 'image_corpus_digest_algorithm': (
@@ -262,6 +264,12 @@ def _bound_artifacts(
             {'id': 'coco-val-detections', 'sha256': '2' * 64},
         ],
     })
+    authority_value = json.loads(authority.read_text())
+    authority_value['inventory'] = {
+        'path': 'data/inventory.json',
+        'sha256': hashlib.sha256(inventory.read_bytes()).hexdigest(),
+    }
+    _write_json(authority, authority_value)
     subprocess.run(['git', 'init', '-q'], cwd=repo, check=True)
     subprocess.run(
         ['git', 'add', 'configs/reproduction/coco_s_v1.py',
@@ -290,6 +298,7 @@ def _bound_artifacts(
         row['provenance']['data_inventory_sha256'] = digest(inventory)
         row['determinism']['provenance'] = dict(row['provenance'])
         row['protocol']['authority_sha256'] = digest(authority)
+        row['protocol']['inventory_authority_sha256'] = digest(inventory)
         row['protocol']['inventory_projection']['inventory_sha256'] = digest(
             inventory)
     profile = _profile()
@@ -302,6 +311,8 @@ def _bound_artifacts(
         'data_inventory_sha256': digest(inventory),
     })
     latency['result']['protocol']['data']['authority_sha256'] = digest(authority)
+    latency['result']['protocol']['data'][
+        'inventory_authority_sha256'] = digest(inventory)
     latency['result']['protocol']['data']['inventory_projection'][
         'inventory_sha256'] = digest(inventory)
     root = repo / 'work_dirs/optimization/candidates/full-s-v1'
@@ -489,6 +500,29 @@ def test_historical_candidate_result_does_not_reopen_mutable_inventory(
     assert CandidateResult.from_artifacts(root).candidate_id == 'full-s-v1'
 
 
+def test_historical_candidate_result_rejects_counterfeit_full_inventory_hash(
+        tmp_path, monkeypatch):
+    from mambapose_opt.evaluation import CandidateResult, MetricError
+
+    root = _bound_artifacts(tmp_path, monkeypatch)
+    evaluation_path = root / 'evaluate/evaluate.json'
+    evaluation = json.loads(evaluation_path.read_text())
+    for row in evaluation['result']['modes'].values():
+        row['provenance']['data_inventory_sha256'] = 'f' * 64
+        row['determinism']['provenance']['data_inventory_sha256'] = 'f' * 64
+        row['protocol']['inventory_projection']['inventory_sha256'] = 'f' * 64
+    _write_json(evaluation_path, evaluation)
+    latency_path = root / 'latency/latency.json'
+    latency = json.loads(latency_path.read_text())
+    latency['result']['provenance']['data_inventory_sha256'] = 'f' * 64
+    latency['result']['protocol']['data']['inventory_projection'][
+        'inventory_sha256'] = 'f' * 64
+    _write_json(latency_path, latency)
+
+    with pytest.raises(MetricError, match='inventory.*authority'):
+        CandidateResult.from_artifacts(root)
+
+
 def test_project_asset_root_accepts_only_common_checkout_shared_layout(
         tmp_path):
     from mambapose_opt.evaluation import resolve_project_asset_root
@@ -569,6 +603,8 @@ def test_candidate_result_requires_strict_profile_latency_and_lease(
     })
     latency['result']['protocol']['data']['inventory_projection'][
         'inventory_sha256'] = inventory_hash
+    latency['result']['protocol']['data'][
+        'inventory_authority_sha256'] = inventory_hash
     latency['result']['protocol']['data']['authority_sha256'] = (
         source['authority_sha256'])
     _write_json(root / 'latency/latency.json', latency)
@@ -710,6 +746,11 @@ def _coco_fixture(tmp_path):
     image_corpus.update(b'\0image\0')
     _write_json(tmp_path / 'optimization/coco_val2017_authority.json', {
         'schema_version': 1, 'dataset': 'coco', 'split': 'val2017',
+        'inventory': {
+            'path': 'data/inventory.json',
+            'sha256': hashlib.sha256(
+                (tmp_path / 'data/inventory.json').read_bytes()).hexdigest(),
+        },
         'annotation': {
             'path': 'data/coco/annotations/person_keypoints_val2017.json',
             'sha256': annotation_hash, 'image_count': 1,

@@ -52,6 +52,7 @@ class StageOutcome:
     attempt: int = 0
     message: str = ''
     gpu_lease: GpuLease | None = None
+    lease_validated_at: str | None = None
     artifact_evidence: tuple[Mapping[str, str], ...] = ()
     retry_not_before: str | None = None
     retry_remaining_seconds: float | None = None
@@ -300,7 +301,7 @@ class OptimizationController:
     def _artifact_schema(
             self, stage: str, path: Path, *,
             expected_gpu_lease: GpuLease | None = None,
-            require_fresh_lease: bool = False) -> str:
+            lease_validated_at: datetime | None = None) -> str:
         try:
             value = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError) as error:
@@ -462,7 +463,7 @@ class OptimizationController:
                         'latency artifact requires controller lease evidence')
                 self._match_latency_lease(
                     validated_latency['gpu_lease'], expected_gpu_lease,
-                    require_fresh=require_fresh_lease)
+                    validated_at=lease_validated_at)
                 from mmengine.config import Config
                 validate_live_coco_observation(
                     validated_latency['protocol']['data'],
@@ -476,7 +477,7 @@ class OptimizationController:
 
     def _match_latency_lease(
             self, actual: Mapping[str, object], expected: GpuLease, *,
-            require_fresh: bool) -> None:
+            validated_at: datetime | None) -> None:
         expected_identity = {
             'stage_id': expected.stage_id,
             'pid': expected.pid,
@@ -493,24 +494,23 @@ class OptimizationController:
                 'latency GPU lease does not match controller acquisition: '
                 + ', '.join(mismatched))
         try:
+            if validated_at is None or validated_at.tzinfo is None:
+                raise ValueError('lease validation time is missing')
             acquired_at = datetime.fromisoformat(expected.timestamp)
             observed_at = datetime.fromisoformat(str(actual['timestamp']))
             if (
                     acquired_at.tzinfo is None or observed_at.tzinfo is None
-                    or observed_at < acquired_at):
+                    or acquired_at > validated_at
+                    or observed_at < acquired_at
+                    or validated_at - observed_at > timedelta(seconds=300)
+                    or observed_at - validated_at > timedelta(seconds=30)):
                 raise ValueError('lease timestamp order is invalid')
         except (KeyError, TypeError, ValueError) as error:
             raise MetricError('latency GPU lease timestamp is invalid') from error
-        if require_fresh:
-            current = self.now()
-            if (
-                    current - observed_at > timedelta(seconds=300)
-                    or observed_at - current > timedelta(seconds=30)):
-                raise MetricError(
-                    'latency GPU lease timestamp is outside freshness bounds')
 
     def _validate_artifacts(
-            self, stage: str, outcome: StageOutcome
+            self, stage: str, outcome: StageOutcome, *,
+            lease_validated_at: datetime | None = None,
             ) -> tuple[Mapping[str, str], ...]:
         if not outcome.artifacts_valid or not outcome.artifacts:
             raise ArtifactValidationError(
@@ -533,7 +533,7 @@ class OptimizationController:
                     f'{stage} artifact sha256 mismatch: {path}')
             schema = self._artifact_schema(
                 stage, path, expected_gpu_lease=outcome.gpu_lease,
-                require_fresh_lease=stage == 'latency')
+                lease_validated_at=lease_validated_at)
             evidence.append({
                 'path': path.relative_to(self.root.resolve()).as_posix(),
                 'sha256': actual,
@@ -556,6 +556,9 @@ class OptimizationController:
         try:
             stored_lease = (
                 self._stored_gpu_lease(run) if stage == 'latency' else None)
+            lease_validated_at = (
+                self._stored_lease_validated_at(run)
+                if stage == 'latency' else None)
             for record in evidence:
                 if not isinstance(record, dict):
                     return False
@@ -569,7 +572,8 @@ class OptimizationController:
                     return False
                 if self._artifact_schema(
                         stage, path,
-                        expected_gpu_lease=stored_lease) != record['schema']:
+                        expected_gpu_lease=stored_lease,
+                        lease_validated_at=lease_validated_at) != record['schema']:
                     return False
                 artifacts.append(path)
                 hashes[str(path)] = record['sha256']
@@ -583,6 +587,9 @@ class OptimizationController:
                 artifacts=tuple(artifacts),
                 artifact_sha256=hashes,
                 gpu_lease=stored_lease,
+                lease_validated_at=(
+                    lease_validated_at.isoformat()
+                    if lease_validated_at is not None else None),
             )
             return (
                 self.artifact_validator(stage, outcome)
@@ -617,6 +624,20 @@ class OptimizationController:
         })
         return lease
 
+    @staticmethod
+    def _stored_lease_validated_at(
+            run: Mapping[str, object]) -> datetime:
+        value = run.get('lease_validated_at')
+        if not isinstance(value, str):
+            raise MetricError('stored lease validation time is invalid')
+        try:
+            validated_at = datetime.fromisoformat(value)
+        except ValueError as error:
+            raise MetricError('stored lease validation time is invalid') from error
+        if validated_at.tzinfo is None or validated_at.utcoffset() is None:
+            raise MetricError('stored lease validation time requires timezone')
+        return validated_at
+
     def _record(
             self, outcome: StageOutcome, status: str,
             **status_details: object) -> None:
@@ -650,6 +671,8 @@ class OptimizationController:
                 'allowed_pids': list(outcome.gpu_lease.allowed_pids),
                 'lease_id': outcome.gpu_lease.lease_id,
             }
+            if outcome.lease_validated_at is not None:
+                details['lease_validated_at'] = outcome.lease_validated_at
         self.store.transition(
             outcome.stage_id, status, attempt=outcome.attempt, **details)
 
@@ -838,14 +861,20 @@ class OptimizationController:
             self._record(normalized, 'blocked')
             return normalized
         try:
-            evidence = self._validate_artifacts(stage, outcome)
+            lease_validated_at = self.now() if stage == 'latency' else None
+            evidence = self._validate_artifacts(
+                stage, outcome, lease_validated_at=lease_validated_at)
         except Exception as error:
             invalid = self._failure(
                 stage, attempt, PERMANENT_EXIT,
                 f'{stage_id} artifact validation failed: {error}')
             self._record(invalid, 'blocked')
             return invalid
-        outcome = replace(outcome, artifact_evidence=evidence)
+        outcome = replace(
+            outcome, artifact_evidence=evidence,
+            lease_validated_at=(
+                lease_validated_at.isoformat()
+                if lease_validated_at is not None else None))
 
         if stage == 'train':
             checkpoint_dir = stage_dir / 'checkpoints'

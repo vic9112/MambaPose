@@ -16,6 +16,8 @@ import sys
 import time
 from typing import Any
 
+sys.dont_write_bytecode = True
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -140,6 +142,7 @@ def _run_command(
     environment = os.environ.copy()
     environment.update({
         'PYTHONNOUSERSITE': '1',
+        'PYTHONDONTWRITEBYTECODE': '1',
         'CUDA_VISIBLE_DEVICES': '0',
         'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1',
     })
