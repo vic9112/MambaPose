@@ -840,6 +840,49 @@ def test_existing_profile_schema_is_accepted(tmp_path, monkeypatch):
     assert result.exit_code == 0
 
 
+def test_formal_profile_v2_binds_runtime_and_controller_cuda_device(tmp_path):
+    from mambapose_opt.controller import (
+        ArtifactValidationError, OptimizationController)
+
+    candidate = _candidate(tmp_path)
+    campaign = tmp_path / 'work_dirs/optimization'
+    controller = OptimizationController(
+        campaign, candidate, lambda *_args: None,
+        repository_root=tmp_path, device_index=3)
+    path = campaign / 'accuracy-first/fixture/0/profile/profile.json'
+    path.parent.mkdir(parents=True)
+    value = _profile_artifact_value(candidate)
+    value.update({
+        'schema_version': 2,
+        'device': {
+            'logical': 'cuda:0', 'physical_index': 3, 'kind': 'cuda'},
+        'parent': {
+            'config': candidate.config.as_posix(),
+            'checkpoint': candidate.checkpoint.as_posix(),
+            'checkpoint_sha256': candidate.checkpoint_sha256,
+        },
+        'runtime': {
+            'config': {
+                'path': candidate.config.as_posix(),
+                'sha256': _sha256(tmp_path / candidate.config),
+            },
+            'checkpoint': {
+                'path': candidate.checkpoint.as_posix(),
+                'sha256': candidate.checkpoint_sha256,
+            },
+        },
+    })
+    path.write_text(json.dumps(value))
+
+    assert controller._artifact_schema('profile', path) == (
+        'optimization-profile-v2')
+
+    value['device']['physical_index'] = 2
+    path.write_text(json.dumps(value))
+    with pytest.raises(ArtifactValidationError, match='device'):
+        controller._artifact_schema('profile', path)
+
+
 @pytest.mark.parametrize(
     'mutate',
     [

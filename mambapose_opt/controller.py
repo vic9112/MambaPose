@@ -323,19 +323,26 @@ class OptimizationController:
                     f'numeric calibration artifact is invalid: {error}') from error
             return 'numeric-calibration-v1'
         if stage == 'profile':
-            required = {
+            base_required = {
                 'schema_version', 'git_commit', 'candidate', 'config',
                 'checkpoint', 'checkpoint_sha256', 'input_shapes',
                 'output_shapes', 'parameters', 'modules',
             }
+            version = value.get('schema_version')
+            required = (
+                base_required if version == 1 else
+                base_required | {'device', 'parent', 'runtime'})
             if self.candidate.route == 'ssm-quant-pwl':
                 required.add('source')
             if set(value) != required:
                 raise ArtifactValidationError(
-                    'profile artifact fields do not match profile schema v1')
-            if value.get('schema_version') != 1:
+                    'profile artifact fields do not match its schema version')
+            if version not in {1, 2}:
                 raise ArtifactValidationError(
-                    'profile artifact schema_version must be 1')
+                    'profile artifact schema_version must be 1 or 2')
+            if self.candidate.route == 'ssm-quant-pwl' and version != 2:
+                raise ArtifactValidationError(
+                    'formal numeric profile artifact must use schema v2')
             if not (
                     isinstance(value.get('git_commit'), str)
                     and re.fullmatch(r'[0-9a-f]{40}', value['git_commit'])):
@@ -345,6 +352,8 @@ class OptimizationController:
                 raise ArtifactValidationError(
                     'profile artifact candidate identity mismatch')
             expected_config = self.candidate.config.as_posix()
+            expected_config_sha = _sha256(
+                self.repository_root / self.candidate.config)
             expected_checkpoint = self.candidate.checkpoint.as_posix()
             expected_checkpoint_sha = self.candidate.checkpoint_sha256
             if self.candidate.route == 'ssm-quant-pwl':
@@ -357,6 +366,7 @@ class OptimizationController:
                         downstream_output=path)
                     expected_config = runtime['config_path'].relative_to(
                         self.repository_root).as_posix()
+                    expected_config_sha = runtime['config_sha256']
                     expected_checkpoint = runtime['checkpoint_name']
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
                     validate_numeric_source_binding(
@@ -375,6 +385,34 @@ class OptimizationController:
             if value.get('checkpoint_sha256') != expected_checkpoint_sha:
                 raise ArtifactValidationError(
                     'profile artifact checkpoint hash mismatch')
+            if version == 2:
+                if value.get('parent') != {
+                        'config': self.candidate.config.as_posix(),
+                        'checkpoint': self.candidate.checkpoint.as_posix(),
+                        'checkpoint_sha256': self.candidate.checkpoint_sha256}:
+                    raise ArtifactValidationError(
+                        'profile artifact parent identity mismatch')
+                if value.get('runtime') != {
+                        'config': {
+                            'path': expected_config,
+                            'sha256': expected_config_sha,
+                        },
+                        'checkpoint': {
+                            'path': expected_checkpoint,
+                            'sha256': expected_checkpoint_sha,
+                        }}:
+                    raise ArtifactValidationError(
+                        'profile artifact runtime identity mismatch')
+                device = value.get('device')
+                if (
+                        not isinstance(device, dict)
+                        or set(device) != {
+                            'logical', 'physical_index', 'kind'}
+                        or device.get('logical') != 'cuda:0'
+                        or device.get('kind') != 'cuda'
+                        or device.get('physical_index') != self.device_index):
+                    raise ArtifactValidationError(
+                        'formal profile artifact CUDA device identity is invalid')
             input_shape = value.get('input_shapes')
             if not (
                     isinstance(input_shape, list)
@@ -420,7 +458,7 @@ class OptimizationController:
                         for record in modules)):
                 raise ArtifactValidationError(
                     'profile artifact modules list is invalid')
-            return 'optimization-profile-v1'
+            return f'optimization-profile-v{version}'
 
         required = {'schema_version', 'candidate_id', 'stage', 'result'}
         if set(value) != required:

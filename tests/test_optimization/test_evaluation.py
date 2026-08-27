@@ -74,6 +74,55 @@ def _profile(candidate_id='full-s-v1'):
     }
 
 
+def test_profile_loader_accepts_bound_v2_cuda_runtime_and_rejects_cpu(tmp_path):
+    from mambapose_opt.evaluation import MetricError, _load_profile
+
+    path = tmp_path / 'profile.json'
+    value = _profile('numeric-fixture')
+    source = {'numeric': 'source'}
+    parent = {
+        'config': 'configs/optimization/numeric/w8.py',
+        'checkpoint': 'work_dirs/reproduction/model.pth',
+        'checkpoint_sha256': 'a' * 64,
+    }
+    runtime = {
+        'config': {
+            'path': 'configs/optimization/numeric/w8.py',
+            'sha256': 'b' * 64,
+        },
+        'checkpoint': {
+            'path': 'work_dirs/reproduction/model.pth',
+            'sha256': 'a' * 64,
+        },
+    }
+    value.update({
+        'schema_version': 2,
+        'config': runtime['config']['path'],
+        'checkpoint': runtime['checkpoint']['path'],
+        'device': {
+            'logical': 'cuda:0', 'physical_index': 3, 'kind': 'cuda'},
+        'parent': parent,
+        'runtime': runtime,
+        'source': source,
+    })
+    _write_json(path, value)
+
+    loaded = _load_profile(
+        path, candidate_id='numeric-fixture', provenance=_provenance(),
+        expected_runtime=runtime, expected_parent=parent,
+        expected_source=source)
+
+    assert loaded['device']['physical_index'] == 3
+    value['device'] = {
+        'logical': 'cpu', 'physical_index': None, 'kind': 'cpu'}
+    _write_json(path, value)
+    with pytest.raises(MetricError, match='CUDA device'):
+        _load_profile(
+            path, candidate_id='numeric-fixture', provenance=_provenance(),
+            expected_runtime=runtime, expected_parent=parent,
+            expected_source=source)
+
+
 def _latency(candidate_id='full-s-v1'):
     summary = {
         'median_ms': 1.0, 'p90_ms': 1.2, 'p95_ms': 1.3,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a CPU-only, reproducible inventory for a frozen candidate."""
+"""Create a reproducible inventory for a frozen candidate."""
 
 from __future__ import annotations
 
@@ -89,11 +89,34 @@ def _candidate(manifest: Path, identifier: str) -> CandidateSpec:
     raise ValueError(f'candidate not found: {identifier}')
 
 
+def _profile_device(value: str) -> dict[str, Any]:
+    if value == 'cuda:0':
+        if not torch.cuda.is_available():
+            raise ValueError('CUDA is unavailable for formal VMamba profiling')
+        try:
+            physical = int(os.environ['MAMBAPOSE_PHYSICAL_DEVICE_INDEX'])
+        except (KeyError, ValueError) as error:
+            raise ValueError(
+                'formal CUDA profile requires controller physical device index') \
+                from error
+        if physical < 0:
+            raise ValueError('physical CUDA device index must be nonnegative')
+        return {'logical': 'cuda:0', 'physical_index': physical, 'kind': 'cuda'}
+    if value == 'cpu':
+        return {'logical': 'cpu', 'physical_index': None, 'kind': 'cpu'}
+    raise ValueError('profile device must be logical cuda:0 or cpu')
+
+
 def profile(
         candidate: CandidateSpec, input_shape: tuple[int, ...], *,
         manifest_path: Path | None = None,
-        output: Path | None = None) -> dict[str, Any]:
-    """Load one candidate on CPU, validate its checkpoint, and inventory it."""
+        output: Path | None = None,
+        device: str = 'cuda:0') -> dict[str, Any]:
+    """Execute and inventory one candidate on its explicitly admitted device."""
+    device_record = _profile_device(device)
+    if device == 'cpu' and candidate.features.get(
+            'cpu_profile_supported') is not True:
+        raise ValueError('candidate is not proven CPU-capable for profiling')
     manifest_path = manifest_path or REPOSITORY_ROOT / 'optimization/candidates.json'
     commit = clean_git_commit(REPOSITORY_ROOT)
     runtime = resolve_numeric_runtime(
@@ -113,24 +136,44 @@ def profile(
     config_path = runtime['config_path']
     config = Config.fromfile(config_path)
     model = init_model(str(config_path),
-                       str(checkpoint), device='cpu')
+                       str(checkpoint), device=device)
     numeric = config.get('numeric_optimization')
     if numeric is not None:
         NumericRuntimeHook.apply_to_model(model, numeric)
-    input_tensor = torch.zeros(input_shape, device='cpu')
+    input_tensor = torch.zeros(input_shape, device=device)
+    if device_record['kind'] == 'cuda':
+        torch.cuda.synchronize()
     with torch.inference_mode():
         outputs = model(input_tensor, data_samples=None, mode='tensor')
+    if device_record['kind'] == 'cuda':
+        torch.cuda.synchronize()
     parameters = count_parameters(model)
     if (_sha256(config_path) != runtime['config_sha256']
             or _sha256(checkpoint) != runtime['checkpoint_sha256']):
         raise ValueError('profile runtime inputs changed during execution')
     result = {
-        'schema_version': 1,
+        'schema_version': 2,
         'git_commit': commit,
         'candidate': candidate.id,
         'config': config_path.relative_to(REPOSITORY_ROOT).as_posix(),
         'checkpoint': runtime['checkpoint_name'],
         'checkpoint_sha256': actual_checksum,
+        'device': device_record,
+        'parent': {
+            'config': candidate.config.as_posix(),
+            'checkpoint': candidate.checkpoint.as_posix(),
+            'checkpoint_sha256': candidate.checkpoint_sha256,
+        },
+        'runtime': {
+            'config': {
+                'path': config_path.relative_to(REPOSITORY_ROOT).as_posix(),
+                'sha256': runtime['config_sha256'],
+            },
+            'checkpoint': {
+                'path': runtime['checkpoint_name'],
+                'sha256': runtime['checkpoint_sha256'],
+            },
+        },
         'input_shapes': _shape_tree(input_tensor),
         'output_shapes': _shape_tree(outputs),
         'parameters': {
@@ -165,12 +208,13 @@ def main() -> None:
                         default=REPOSITORY_ROOT / 'optimization/candidates.json')
     parser.add_argument('--output', type=_output_path, required=True)
     parser.add_argument('--input-shape', type=_parse_shape, default=(1, 3, 256, 192))
+    parser.add_argument('--device', choices=('cuda:0', 'cpu'), default='cuda:0')
     args = parser.parse_args()
 
     candidate = _candidate(args.manifest, args.candidate_id)
     _atomic_json(args.output, profile(
         candidate, args.input_shape, manifest_path=args.manifest,
-        output=args.output))
+        output=args.output, device=args.device))
 
 
 if __name__ == '__main__':

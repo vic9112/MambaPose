@@ -1244,6 +1244,46 @@ class CandidateResult:
         repository_root = _repository_root_from_artifacts(root)
         source, candidate, authority = resolve_artifact_source(
             envelope, repository_root=repository_root)
+        profile_path = root / 'profile/profile.json'
+        expected_profile_runtime: Mapping[str, Any] | None = None
+        expected_profile_parent: Mapping[str, str] | None = None
+        expected_profile_source: Mapping[str, Any] | None = None
+        if candidate.route == 'ssm-quant-pwl':
+            try:
+                from .numeric_runtime import resolve_numeric_runtime
+                from .numeric_source import validate_numeric_source_binding
+
+                raw_profile = json.loads(
+                    profile_path.read_text(encoding='utf-8'))
+                if not isinstance(raw_profile, Mapping):
+                    raise ValueError('numeric profile root must be an object')
+                expected_profile_source = validate_numeric_source_binding(
+                    raw_profile.get('source'), repository_root=repository_root,
+                    candidate=candidate,
+                    manifest_path=repository_root / source['manifest_path'])
+                numeric_runtime = resolve_numeric_runtime(
+                    candidate, repository_root=repository_root,
+                    manifest_path=repository_root / source['manifest_path'],
+                    downstream_output=profile_path)
+                expected_profile_runtime = MappingProxyType({
+                    'config': MappingProxyType({
+                        'path': numeric_runtime['config_path'].relative_to(
+                            repository_root).as_posix(),
+                        'sha256': numeric_runtime['config_sha256'],
+                    }),
+                    'checkpoint': MappingProxyType({
+                        'path': numeric_runtime['checkpoint_name'],
+                        'sha256': numeric_runtime['checkpoint_sha256'],
+                    }),
+                })
+                expected_profile_parent = MappingProxyType({
+                    'config': candidate.config.as_posix(),
+                    'checkpoint': candidate.checkpoint.as_posix(),
+                    'checkpoint_sha256': candidate.checkpoint_sha256,
+                })
+            except (OSError, json.JSONDecodeError, ValueError) as error:
+                raise MetricError(
+                    f'numeric profile authority is invalid: {error}') from error
         validated = validate_evaluation_envelope(
             envelope,
             expected_candidate_id=candidate.id,
@@ -1270,11 +1310,13 @@ class CandidateResult:
         latency: Mapping[str, Any] | None = None
         gpu_lease: Mapping[str, Any] | None = None
         artifact_paths: dict[str, Path] = {'evaluation': path.resolve()}
-        profile_path = root / 'profile/profile.json'
         latency_path = root / 'latency/latency.json'
         profile = _load_profile(
             profile_path, candidate_id=candidate_id,
-            provenance=provenance)
+            provenance=provenance,
+            expected_runtime=expected_profile_runtime,
+            expected_parent=expected_profile_parent,
+            expected_source=expected_profile_source)
         latency, gpu_lease = _load_latency(
             latency_path, candidate_id=candidate_id, route=route,
             provenance=provenance, source=source, candidate=candidate,
@@ -1329,20 +1371,57 @@ class CandidateResult:
 
 def _load_profile(
         path: Path, *, candidate_id: str,
-        provenance: Mapping[str, str]) -> Mapping[str, Any]:
+        provenance: Mapping[str, str],
+        expected_runtime: Mapping[str, Any] | None = None,
+        expected_parent: Mapping[str, str] | None = None,
+        expected_source: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
     try:
         value = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as error:
         raise MetricError(f'cannot load profile artifact: {error}') from error
-    fields = {
+    legacy_fields = {
         'schema_version', 'git_commit', 'candidate', 'config', 'checkpoint',
         'checkpoint_sha256', 'input_shapes', 'output_shapes', 'parameters',
         'modules',
     }
-    if not isinstance(value, Mapping) or set(value) != fields:
+    runtime_fields = legacy_fields | {'device', 'parent', 'runtime'}
+    if expected_source is not None:
+        runtime_fields.add('source')
+    if (
+            not isinstance(value, Mapping)
+            or set(value) not in (legacy_fields, runtime_fields)):
         raise MetricError('profile artifact has invalid fields')
-    if value['schema_version'] != 1 or value['candidate'] != candidate_id:
+    expected_schema = 2 if set(value) == runtime_fields else 1
+    if (
+            value['schema_version'] != expected_schema
+            or value['candidate'] != candidate_id):
         raise MetricError('profile artifact identity mismatch')
+    if expected_runtime is not None:
+        if expected_schema != 2 or value['runtime'] != expected_runtime:
+            raise MetricError('profile runtime deployment binding mismatch')
+    if expected_parent is not None and value.get('parent') != expected_parent:
+        raise MetricError('profile parent binding mismatch')
+    if expected_source is not None and value.get('source') != expected_source:
+        raise MetricError('profile source binding mismatch')
+    if expected_schema == 2:
+        device = value['device']
+        if (
+                not isinstance(device, Mapping)
+                or set(device) != {'logical', 'physical_index', 'kind'}
+                or device.get('logical') != 'cuda:0'
+                or device.get('kind') != 'cuda'
+                or isinstance(device.get('physical_index'), bool)
+                or not isinstance(device.get('physical_index'), int)
+                or device['physical_index'] < 0):
+            raise MetricError('profile CUDA device provenance is invalid')
+        parent = value['parent']
+        if (
+                not isinstance(parent, Mapping)
+                or set(parent) != {
+                    'config', 'checkpoint', 'checkpoint_sha256'}
+                or any(not isinstance(parent[name], str) or not parent[name]
+                       for name in parent)):
+            raise MetricError('profile parent provenance is invalid')
     if (
             value['git_commit'] != provenance['git_commit']
             or value['checkpoint_sha256'] != provenance['checkpoint_sha256']):

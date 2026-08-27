@@ -649,8 +649,18 @@ def test_numeric_profile_consumes_canonical_checkpoint_and_records_logical_name(
             config=Path(config), checkpoint=Path(checkpoint), device=device)
         return FixtureModel()
 
+    original_zeros = torch.zeros
+
+    def zeros(shape, *, device):
+        captured['input_device'] = device
+        return original_zeros(shape)
+
     monkeypatch.setattr(profile_model, 'REPOSITORY_ROOT', fixture['linked'])
     monkeypatch.setattr('mmpose.apis.init_model', initialize)
+    monkeypatch.setattr(profile_model.torch, 'zeros', zeros)
+    monkeypatch.setattr(profile_model.torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(profile_model.torch.cuda, 'synchronize', lambda: None)
+    monkeypatch.setenv('MAMBAPOSE_PHYSICAL_DEVICE_INDEX', '3')
 
     result = profile_model.profile(
         fixture['candidate'], (1, 3, 4, 4),
@@ -660,7 +670,10 @@ def test_numeric_profile_consumes_canonical_checkpoint_and_records_logical_name(
                 'profile/profile.json'))
 
     assert captured['checkpoint'] == fixture['checkpoint'].resolve(strict=True)
-    assert captured['device'] == 'cpu'
+    assert captured['device'] == 'cuda:0'
+    assert captured['input_device'] == 'cuda:0'
+    assert result['device'] == {
+        'logical': 'cuda:0', 'physical_index': 3, 'kind': 'cuda'}
     assert result['checkpoint'] == fixture['candidate'].checkpoint.as_posix()
     assert result['checkpoint_sha256'] == (
         fixture['candidate'].checkpoint_sha256)
