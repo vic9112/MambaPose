@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import os
 import subprocess
 
@@ -54,3 +55,43 @@ def clean_git_commit(repository_root: Path) -> str:
             + ', '.join(unsafe_ignored))
     return subprocess.check_output(
         ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
+
+
+def sha256_file(path: Path | str) -> str:
+    """Hash one regular file without deserializing it."""
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f'hash input must be a regular non-symlink file: {source}')
+    digest = hashlib.sha256()
+    with source.open('rb') as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def tracked_file_binding(
+        repository_root: Path, path: Path | str, *, git_commit: str,
+        ) -> dict[str, str]:
+    """Bind a clean worktree file to the exact blob at ``git_commit``."""
+    root = Path(repository_root).resolve(strict=True)
+    candidate = Path(path)
+    if candidate.is_absolute():
+        raise ValueError('tracked source path must be repository-relative')
+    if not candidate.parts or any(part in {'.', '..'} for part in candidate.parts):
+        raise ValueError('tracked source path must be safe and repository-relative')
+    effective = root / candidate
+    if effective.is_symlink() or not effective.is_file():
+        raise ValueError('tracked source path must name a regular source file')
+    try:
+        blob = subprocess.run(
+            ['git', 'show', f'{git_commit}:{candidate.as_posix()}'], cwd=root,
+            check=True, capture_output=True).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError('source path is not tracked at the clean commit') from error
+    actual = effective.read_bytes()
+    if actual != blob:
+        raise ValueError('source file differs from its clean commit blob')
+    return {
+        'path': candidate.as_posix(),
+        'sha256': hashlib.sha256(blob).hexdigest(),
+    }

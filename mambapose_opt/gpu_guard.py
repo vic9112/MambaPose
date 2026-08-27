@@ -138,6 +138,24 @@ def controller_process_tree(roots: Collection[int]) -> tuple[int, ...]:
     return tuple(sorted(allowed))
 
 
+def canonical_gpu_lock_path(repository_root: Path) -> Path:
+    """Return the one GPU lock shared by every worktree of a checkout."""
+    root = Path(repository_root).resolve(strict=True)
+    try:
+        common_value = subprocess.check_output(
+            ['git', 'rev-parse', '--git-common-dir'], cwd=root,
+            text=True).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError('canonical GPU lock requires a Git worktree') from error
+    common = Path(common_value)
+    if not common.is_absolute():
+        common = root / common
+    common = common.resolve(strict=True)
+    if common.name != '.git' or not common.is_dir():
+        raise ValueError('Git common directory is not a checkout .git directory')
+    return common.parent / 'work_dirs/optimization/gpu.lock'
+
+
 @contextmanager
 def exclusive_cuda_stage(
         lock_path: Path, device_index: int, allowed_pids: Collection[int],
