@@ -32,21 +32,23 @@ def _provenance():
     }
 
 
-def _determinism():
+def _determinism(provenance=None):
     return {
         'python_seed': 0,
         'numpy_seed': 0,
         'torch_seed': 0,
         'worker_count': 2,
         'workers': [
-            {'worker_id': 0, 'python_seed': 0, 'numpy_seed': 0,
-             'torch_seed': 0},
-            {'worker_id': 1, 'python_seed': 1, 'numpy_seed': 1,
-             'torch_seed': 1},
+            {'worker_id': 0, 'torch_seed_source': 'torch.initial_seed()',
+             'python_seed_derivation': 'torch_seed % 2**32',
+             'numpy_seed_derivation': 'torch_seed % 2**32'},
+            {'worker_id': 1, 'torch_seed_source': 'torch.initial_seed()',
+             'python_seed_derivation': 'torch_seed % 2**32',
+             'numpy_seed_derivation': 'torch_seed % 2**32'},
         ],
         'persistent_workers': False,
         'order_hashes': {'0': 'e' * 64},
-        'provenance': _provenance(),
+        'provenance': dict(provenance or _provenance()),
     }
 
 
@@ -87,14 +89,67 @@ def _latency(candidate_id='full-s-v1'):
                 'batch_size': 1, 'warmup': 50, 'iterations': 200,
                 'timer': 'torch.cuda.Event', 'synchronize': True,
                 'scope': 'full_topdown_model',
+                'source_config': 'configs/reproduction/coco_s_v1.py',
+                'checkpoint': (
+                    'work_dirs/reproduction/runs/coco-s-v1/best.pth'),
+                'data_inventory': 'data/inventory.json',
+                'data': {
+                    'dataset': 'coco', 'split': 'val2017',
+                    'complete_split': True,
+                    'annotation_sha256': '1' * 64,
+                    'detection_sha256': '2' * 64,
+                    'inventory_detection_sha256': '2' * 64,
+                    'annotation_image_count': 5000,
+                    'annotation_record_count': 100,
+                    'detection_record_count': 200,
+                    'verified_image_count': 5000,
+                },
             },
             'modes': {'flip': summary, 'no_flip': summary},
             'gpu_lease': {
                 'stage_id': 'full-s-v1:latency', 'pid': 123,
-                'boot_id': 'boot',
+                'boot_id': '11111111-1111-1111-1111-111111111111',
                 'timestamp': '2026-08-27T00:00:00+00:00',
                 'device_index': 0, 'allowed_pids': [123],
             },
+        },
+    }
+
+
+def _evaluation(candidate_id='full-s-v1'):
+    metrics = {
+        'unit': 'percentage_points', 'AP': 72.8, 'AP50': 89.7,
+        'AP75': 80.5, 'APM': 69.4, 'APL': 79.2, 'AR': 78.2,
+    }
+    def mode(config_hash):
+        provenance = {**_provenance(), 'config_sha256': config_hash}
+        return {
+            'metrics': metrics,
+            'provenance': provenance,
+            'determinism': _determinism(provenance),
+            'protocol': {
+                'dataset': 'coco', 'split': 'val2017',
+                'batch_size': 1, 'complete_split': True,
+                'annotation_sha256': '1' * 64,
+                'detection_sha256': '2' * 64,
+                'inventory_detection_sha256': '2' * 64,
+                'annotation_image_count': 5000,
+                'annotation_record_count': 100,
+                'detection_record_count': 200,
+                'verified_image_count': 5000,
+                'source_config': 'configs/reproduction/coco_s_v1.py',
+                'checkpoint': (
+                    'work_dirs/reproduction/runs/coco-s-v1/best.pth'),
+                'data_inventory': 'data/inventory.json',
+            },
+        }
+    return {
+        'schema_version': 1,
+        'candidate_id': candidate_id,
+        'stage': 'evaluate',
+        'result': {
+            'route': 'baseline', 'calibration_split': None,
+            'modes': {'flip': mode('b' * 64), 'no_flip': mode('9' * 64)},
         },
     }
 
@@ -159,24 +214,7 @@ def test_candidate_result_validates_nested_evaluation_and_artifact_identity(
         tmp_path):
     from mambapose_opt.evaluation import CandidateResult, CocoMetrics
 
-    metrics = CocoMetrics(72.8, 89.7, 80.5, 69.4, 79.2, 78.2)
-    evaluation = {
-        'schema_version': 1,
-        'candidate_id': 'full-s-v1',
-        'stage': 'evaluate',
-        'result': {
-            'route': 'baseline',
-            'flip_test': True,
-            'metrics': metrics.to_dict(),
-            'provenance': _provenance(),
-            'determinism': _determinism(),
-            'calibration_split': None,
-            'protocol': {
-                'dataset': 'coco', 'split': 'val2017',
-                'batch_size': 1, 'complete_split': True,
-            },
-        },
-    }
+    evaluation = _evaluation()
     _write_json(tmp_path / 'evaluate' / 'evaluate.json', evaluation)
     _write_json(tmp_path / 'profile' / 'profile.json', _profile())
     _write_json(tmp_path / 'latency' / 'latency.json', _latency())
@@ -196,31 +234,168 @@ def test_candidate_result_validates_nested_evaluation_and_artifact_identity(
     with pytest.raises(TypeError):
         result.provenance['checkpoint_sha256'] = 'f' * 64
 
+    no_flip = CandidateResult.from_artifacts(tmp_path, mode='no_flip')
+    assert no_flip.flip_test is False
+    assert no_flip.provenance['config_sha256'] == '9' * 64
+
+
+def test_candidate_result_requires_directory_and_both_evaluation_modes(tmp_path):
+    from mambapose_opt.evaluation import CandidateResult, MetricError
+
+    evaluation = _evaluation()
+    path = _write_json(tmp_path / 'evaluate' / 'evaluate.json', evaluation)
+    with pytest.raises(MetricError, match='directory'):
+        CandidateResult.from_artifacts(path)
+
+    del evaluation['result']['modes']['no_flip']
+    _write_json(path, evaluation)
+    with pytest.raises(MetricError, match='both|modes'):
+        CandidateResult.from_artifacts(tmp_path)
+
+
+def test_candidate_result_requires_strict_profile_latency_and_lease(tmp_path):
+    from mambapose_opt.evaluation import CandidateResult, MetricError
+
+    _write_json(tmp_path / 'evaluate/evaluate.json', _evaluation())
+    with pytest.raises(MetricError, match='profile artifact'):
+        CandidateResult.from_artifacts(tmp_path)
+
+    profile = _profile()
+    profile['modules'][0]['parameters'] = -1
+    _write_json(tmp_path / 'profile/profile.json', profile)
+    _write_json(tmp_path / 'latency/latency.json', _latency())
+    with pytest.raises(MetricError, match='module inventory'):
+        CandidateResult.from_artifacts(tmp_path)
+
+    _write_json(tmp_path / 'profile/profile.json', _profile())
+    latency = _latency()
+    latency['result']['gpu_lease']['allowed_pids'] = [999]
+    _write_json(tmp_path / 'latency/latency.json', latency)
+    with pytest.raises(MetricError, match='lease provenance'):
+        CandidateResult.from_artifacts(tmp_path)
+
+
+def test_formal_evaluation_runs_flip_and_no_flip_before_envelope(
+        tmp_path, monkeypatch):
+    import tools.optimization.evaluate_candidate as tool
+    from mambapose_opt.schema import CandidateSpec
+
+    checkpoint = tmp_path / 'model.pth'
+    checkpoint.write_bytes(b'checkpoint')
+    import hashlib
+    candidate = CandidateSpec.from_dict({
+        'id': 'fixture', 'route': 'accuracy-first', 'kind': 'float',
+        'config': 'config.py', 'checkpoint': 'model.pth',
+        'checkpoint_sha256': hashlib.sha256(b'checkpoint').hexdigest(),
+        'seed': 0, 'features': {},
+    })
+    monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(tool, '_git_commit', lambda: 'd' * 40)
+    seen = []
+
+    def fake_mode(candidate, output, *, flip_test, **unused):
+        seen.append(flip_test)
+        return _evaluation()['result']['modes'][
+            'flip' if flip_test else 'no_flip']
+
+    monkeypatch.setattr(tool, '_evaluate_mode', fake_mode)
+    envelope = tool.evaluate(candidate, tmp_path / 'evaluate.json')
+
+    assert seen == [True, False]
+    assert set(envelope['result']['modes']) == {'flip', 'no_flip'}
+
+
+def _coco_fixture(tmp_path):
+    annotation = tmp_path / 'data/coco/annotations/person_keypoints_val2017.json'
+    detection = tmp_path / (
+        'data/coco/person_detection_results/'
+        'COCO_val2017_detections_AP_H_56_person.json')
+    image = tmp_path / 'data/coco/val2017/0001.jpg'
+    annotation.parent.mkdir(parents=True)
+    detection.parent.mkdir(parents=True)
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b'image')
+    _write_json(annotation, {
+        'images': [{'id': 1, 'file_name': '0001.jpg'}],
+        'annotations': [{'id': 7, 'image_id': 1}], 'categories': [],
+    })
+    _write_json(detection, [{'image_id': 1, 'bbox': [0, 0, 1, 1]}])
+    import hashlib
+    detection_hash = hashlib.sha256(detection.read_bytes()).hexdigest()
+    _write_json(tmp_path / 'data/inventory.json', {
+        'schema_version': 1, 'assets': [{
+            'id': 'coco-val-detections',
+            'path': ('data/coco/person_detection_results/'
+                     'COCO_val2017_detections_AP_H_56_person.json'),
+            'sha256': detection_hash,
+        }],
+    })
+    config = {
+        'test_dataloader': {
+            'batch_size': 1, 'drop_last': False,
+            'sampler': {'type': 'DefaultSampler', 'shuffle': False,
+                        'round_up': False},
+            'dataset': {
+                'type': 'CocoDataset', 'data_root': 'data/coco/',
+                'data_mode': 'topdown',
+                'ann_file': 'annotations/person_keypoints_val2017.json',
+                'bbox_file': ('data/coco/person_detection_results/'
+                              'COCO_val2017_detections_AP_H_56_person.json'),
+                'data_prefix': {'img': 'val2017/'}, 'test_mode': True,
+            },
+        },
+        'test_evaluator': {
+            'type': 'CocoMetric',
+            'ann_file': 'data/coco/annotations/person_keypoints_val2017.json',
+        },
+    }
+    return config, detection
+
+
+def test_coco_protocol_preflight_verifies_config_assets_and_inventory(tmp_path):
+    from mambapose_opt.evaluation import validate_coco_val_protocol
+
+    config, detection = _coco_fixture(tmp_path)
+    protocol = validate_coco_val_protocol(
+        config, repository_root=tmp_path, expected_image_count=1)
+
+    assert protocol['annotation_image_count'] == 1
+    assert protocol['annotation_record_count'] == 1
+    assert protocol['detection_record_count'] == 1
+    assert protocol['verified_image_count'] == 1
+    assert protocol['annotation_sha256'] != protocol['detection_sha256']
+    assert protocol['complete_split'] is True
+
+    detection.write_text(json.dumps([
+        {'image_id': 1, 'bbox': [0, 0, 2, 2]}]))
+    with pytest.raises(ValueError, match='inventory.*hash'):
+        validate_coco_val_protocol(
+            config, repository_root=tmp_path, expected_image_count=1)
+
+
+def test_coco_protocol_preflight_rejects_altered_dataset_before_claim(tmp_path):
+    from mambapose_opt.evaluation import validate_coco_val_protocol
+
+    config, _ = _coco_fixture(tmp_path)
+    config['test_dataloader']['dataset']['type'] = 'CrowdPoseDataset'
+    with pytest.raises(ValueError, match='CocoDataset'):
+        validate_coco_val_protocol(
+            config, repository_root=tmp_path, expected_image_count=1)
+
 
 def test_candidate_result_rejects_envelope_identity_and_provenance_disagreement(
         tmp_path):
     from mambapose_opt.evaluation import CandidateResult, MetricError
 
-    metrics = {
-        'unit': 'percentage_points', 'AP': 72.8, 'AP50': 89.7,
-        'AP75': 80.5, 'APM': 69.4, 'APL': 79.2, 'AR': 78.2,
-    }
-    payload = {
-        'schema_version': 1, 'candidate_id': 'full-s-v1', 'stage': 'latency',
-        'result': {
-            'route': 'baseline', 'flip_test': True, 'metrics': metrics,
-            'provenance': _provenance(), 'determinism': _determinism(),
-            'calibration_split': None,
-            'protocol': {'dataset': 'coco', 'split': 'val2017',
-                         'batch_size': 1, 'complete_split': True},
-        },
-    }
+    payload = _evaluation()
+    payload['stage'] = 'latency'
     _write_json(tmp_path / 'evaluate' / 'evaluate.json', payload)
     with pytest.raises(MetricError, match='stage'):
         CandidateResult.from_artifacts(tmp_path)
 
     payload['stage'] = 'evaluate'
-    payload['result']['determinism']['provenance']['config_sha256'] = 'f' * 64
+    payload['result']['modes']['flip']['determinism']['provenance'][
+        'config_sha256'] = 'f' * 64
     _write_json(tmp_path / 'evaluate' / 'evaluate.json', payload)
     with pytest.raises(MetricError, match='provenance'):
         CandidateResult.from_artifacts(tmp_path)

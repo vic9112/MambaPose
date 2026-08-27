@@ -21,26 +21,21 @@ class DeterminismError(ValueError):
     """Raised when a repeatability record is incomplete or inconsistent."""
 
 
-def seed_worker(worker_id: int, *, base_seed: int | None = None) -> None:
+def seed_worker(worker_id: int) -> None:
     """Seed Python, NumPy, and Torch for one data-loader worker.
 
-    A supplied base seed gives the campaign an auditable ``base + worker_id``
-    rule. Without one, PyTorch's worker-specific initial seed is used.
+    PyTorch owns the per-worker seed. Python and NumPy receive its low 32 bits
+    while Torch retains the complete worker seed.
     """
     if isinstance(worker_id, bool) or not isinstance(worker_id, int):
         raise TypeError('worker_id must be an integer')
     if worker_id < 0:
         raise ValueError('worker_id must be non-negative')
-    if base_seed is None:
-        value = int(torch.initial_seed())
-    else:
-        if isinstance(base_seed, bool) or not isinstance(base_seed, int):
-            raise TypeError('base_seed must be an integer')
-        value = base_seed + worker_id
-    seed = value % (2**32)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    torch_seed = int(torch.initial_seed())
+    library_seed = torch_seed % (2**32)
+    random.seed(library_seed)
+    np.random.seed(library_seed)
+    torch.manual_seed(torch_seed)
 
 
 try:
@@ -99,8 +94,7 @@ def deterministic_dataloader_config(
     config = copy.deepcopy(value)
     config['num_workers'] = worker_count
     config['persistent_workers'] = False
-    config['worker_init_fn'] = {
-        'type': 'mambapose_seed_worker', 'base_seed': seed}
+    config['worker_init_fn'] = {'type': 'mambapose_seed_worker'}
     return config
 
 
@@ -110,17 +104,13 @@ def _require_sha256(value: object, field: str) -> str:
     return value
 
 
-def _worker_records(seed: int, worker_count: int) -> list[dict[str, int]]:
-    records = []
-    for worker_id in range(worker_count):
-        worker_seed = (seed + worker_id) % (2**32)
-        records.append({
-            'worker_id': worker_id,
-            'python_seed': worker_seed,
-            'numpy_seed': worker_seed,
-            'torch_seed': worker_seed,
-        })
-    return records
+def _worker_records(worker_count: int) -> list[dict[str, int | str]]:
+    return [{
+        'worker_id': worker_id,
+        'torch_seed_source': 'torch.initial_seed()',
+        'python_seed_derivation': 'torch_seed % 2**32',
+        'numpy_seed_derivation': 'torch_seed % 2**32',
+    } for worker_id in range(worker_count)]
 
 
 def build_determinism_record(
@@ -162,7 +152,7 @@ def build_determinism_record(
         'numpy_seed': root_seed,
         'torch_seed': root_seed,
         'worker_count': worker_count,
-        'workers': _worker_records(root_seed, worker_count),
+        'workers': _worker_records(worker_count),
         'persistent_workers': False,
         'order_hashes': dict(sorted(normalized_hashes.items())),
         'provenance': provenance,

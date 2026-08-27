@@ -1,4 +1,5 @@
 import pytest
+from pathlib import Path
 
 
 class FakeTimer:
@@ -59,7 +60,8 @@ def test_latency_protocol_requires_batch_one_both_flip_modes_and_lease():
         repeats=3,
         gpu_lease={
             'stage_id': 'full-s-v1:latency', 'pid': 123,
-            'boot_id': 'boot', 'timestamp': '2026-08-27T00:00:00+00:00',
+            'boot_id': '11111111-1111-1111-1111-111111111111',
+            'timestamp': '2026-08-27T00:00:00+00:00',
             'device_index': 0, 'allowed_pids': [123],
         },
     )
@@ -73,3 +75,86 @@ def test_latency_protocol_requires_batch_one_both_flip_modes_and_lease():
     }
     assert set(result['modes']) == {'flip', 'no_flip'}
     assert result['gpu_lease']['stage_id'] == 'full-s-v1:latency'
+
+
+@pytest.mark.parametrize('change', [
+    {'boot_id': 'not-a-uuid'},
+    {'timestamp': '2026-08-27T00:00:00'},
+    {'device_index': True},
+    {'allowed_pids': [999]},
+])
+def test_gpu_lease_validation_rejects_malformed_provenance(change):
+    from mambapose_opt.latency import LatencyError, validate_gpu_lease
+
+    lease = {
+        'stage_id': 'fixture:latency', 'pid': 123,
+        'boot_id': '11111111-1111-1111-1111-111111111111',
+        'timestamp': '2026-08-27T00:00:00+00:00',
+        'device_index': 0, 'allowed_pids': [123],
+    }
+    with pytest.raises(LatencyError):
+        validate_gpu_lease({**lease, **change})
+
+
+def test_latency_admission_rejects_unlocked_lease_before_model_or_cuda(
+        tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import tools.optimization.measure_latency as tool
+    from mambapose_opt.schema import CandidateSpec
+
+    (tmp_path / 'config.py').write_text('model = dict()')
+    checkpoint = tmp_path / 'model.pth'
+    checkpoint.write_bytes(b'checkpoint')
+    (tmp_path / 'data').mkdir()
+    (tmp_path / 'data/inventory.json').write_text('{}')
+    lock = tmp_path / 'gpu.lock'
+    lock.write_text(json.dumps({
+        'stage_id': 'fixture:latency', 'pid': 123,
+        'boot_id': '11111111-1111-1111-1111-111111111111',
+        'timestamp': '2026-08-27T00:00:00+00:00',
+        'device_index': 0, 'allowed_pids': [123],
+    }))
+    candidate = CandidateSpec.from_dict({
+        'id': 'fixture', 'route': 'accuracy-first', 'kind': 'float',
+        'config': 'config.py', 'checkpoint': 'model.pth',
+        'checkpoint_sha256': hashlib.sha256(b'checkpoint').hexdigest(),
+        'seed': 0, 'features': {},
+    })
+    monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(tool, '_git_commit', lambda: 'd' * 40)
+    monkeypatch.setattr(tool, '_canonical_gpu_lock', lambda: lock)
+    monkeypatch.setenv('MAMBAPOSE_PHYSICAL_DEVICE_INDEX', '0')
+    monkeypatch.setattr(
+        tool.Config, 'fromfile', lambda *args: (_ for _ in ()).throw(
+            AssertionError('model/config initialization happened too early')))
+
+    with pytest.raises(ValueError, match='actively held'):
+        tool.measure_candidate(candidate, warmup=50, repeats=200)
+
+
+def test_active_gpu_lease_checks_boot_device_and_live_descendant(
+        tmp_path, monkeypatch):
+    import fcntl
+    import json
+    import os
+    import tools.optimization.measure_latency as tool
+
+    boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    lock = tmp_path / 'gpu.lock'
+    lease = {
+        'stage_id': 'fixture:latency', 'pid': os.getpid(),
+        'boot_id': boot_id, 'timestamp': '2026-08-27T00:00:00+00:00',
+        'device_index': 2, 'allowed_pids': [os.getpid()],
+    }
+    lock.write_text(json.dumps(lease))
+    monkeypatch.setattr(tool, '_canonical_gpu_lock', lambda: lock)
+    with lock.open('r+') as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert tool._active_gpu_lease('fixture', 2) == lease
+        owner.seek(0)
+        owner.truncate()
+        json.dump({**lease, 'boot_id': '11111111-1111-1111-1111-111111111111'}, owner)
+        owner.flush()
+        with pytest.raises(ValueError, match='different boot'):
+            tool._active_gpu_lease('fixture', 2)

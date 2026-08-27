@@ -4,7 +4,7 @@ custom_imports = dict(
     imports=['mambapose_opt.determinism'], allow_failed_imports=False)
 randomness = dict(seed=0, deterministic=True)
 
-_worker = dict(type='mambapose_seed_worker', base_seed=0)
+_worker = dict(type='mambapose_seed_worker')
 train_dataloader = dict(
     num_workers=2, persistent_workers=False, worker_init_fn=_worker)
 val_dataloader = dict(

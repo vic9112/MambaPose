@@ -88,3 +88,25 @@ def test_yolo_adapter_requires_exactly_one_finite_in_frame_pose_per_box():
         infer_tracked_poses(
             object(), frame, [box],
             inference_fn=lambda *args, **kwargs: [_pose([(21., 3.)])])
+    with pytest.raises(YoloAdapterError, match='frame'):
+        infer_tracked_poses(
+            object(), frame, [box],
+            inference_fn=lambda *args, **kwargs: [_pose([(20., 3.)])])
+
+
+@pytest.mark.parametrize('scores', [
+    np.empty((1, 0), dtype=np.float32),
+    np.ones((1, 2), dtype=np.float32),
+    np.array([[float('nan')]], dtype=np.float32),
+])
+def test_yolo_adapter_requires_finite_score_per_keypoint(scores):
+    from mambapose_opt.yolo_adapter import (
+        TrackedBox, YoloAdapterError, infer_tracked_poses)
+
+    pose = _pose([(2., 3.)])
+    pose.pred_instances.keypoint_scores = scores
+    with pytest.raises(YoloAdapterError, match='score'):
+        infer_tracked_poses(
+            object(), np.zeros((16, 20, 3), dtype=np.uint8),
+            [TrackedBox(track_id=1, xyxy=(1., 2., 10., 12.), score=0.8)],
+            inference_fn=lambda *args, **kwargs: [pose])

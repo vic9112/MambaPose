@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import math
+import uuid
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
@@ -116,7 +118,7 @@ def measure_latency_samples(
     return samples
 
 
-def _lease(value: object) -> dict[str, Any]:
+def validate_gpu_lease(value: object) -> dict[str, Any]:
     required = {
         'stage_id', 'pid', 'boot_id', 'timestamp', 'device_index',
         'allowed_pids',
@@ -129,11 +131,30 @@ def _lease(value: object) -> dict[str, Any]:
             isinstance(value['pid'], bool) or not isinstance(value['pid'], int)
             or value['pid'] <= 0):
         raise LatencyError('GPU lease PID is invalid')
-    if not isinstance(value['allowed_pids'], (list, tuple)) or not all(
+    allowed = value['allowed_pids']
+    if not isinstance(allowed, (list, tuple)) or not allowed or not all(
             isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
-            for pid in value['allowed_pids']):
+            for pid in allowed):
         raise LatencyError('GPU lease allowed_pids are invalid')
+    if len(set(allowed)) != len(allowed) or value['pid'] not in allowed:
+        raise LatencyError('GPU lease owner must be included once in allowed_pids')
+    try:
+        uuid.UUID(value['boot_id'])
+    except (AttributeError, TypeError, ValueError) as error:
+        raise LatencyError('GPU lease boot_id must be a UUID string') from error
+    try:
+        timestamp = datetime.fromisoformat(value['timestamp'])
+    except (TypeError, ValueError) as error:
+        raise LatencyError('GPU lease timestamp must be ISO-8601') from error
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise LatencyError('GPU lease timestamp must include a timezone')
+    device = value['device_index']
+    if isinstance(device, bool) or not isinstance(device, int) or device < 0:
+        raise LatencyError('GPU lease device_index is invalid')
     return dict(value)
+
+
+_lease = validate_gpu_lease
 
 
 def build_latency_result(
@@ -155,5 +176,5 @@ def build_latency_result(
             'flip': LatencySummary.from_samples_ms(flip).to_dict(),
             'no_flip': LatencySummary.from_samples_ms(no_flip).to_dict(),
         },
-        'gpu_lease': _lease(gpu_lease),
+        'gpu_lease': validate_gpu_lease(gpu_lease),
     }
