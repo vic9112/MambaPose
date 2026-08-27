@@ -200,8 +200,14 @@ def profile(
             git_commit=commit)
     if candidate.kind == 'binary-qk':
         from mambapose_opt.binary_operation import (
+            binary_smoke_binding_for_profile,
             build_binary_operation_manifest)
-        result['binary_qk_operation'] = build_binary_operation_manifest(model)
+        operation = build_binary_operation_manifest(model)
+        result['binary_qk_operation'] = operation
+        result['binary_qk_smoke'] = binary_smoke_binding_for_profile(
+            output.relative_to(REPOSITORY_ROOT),
+            repository_root=REPOSITORY_ROOT, candidate_id=candidate.id,
+            operation=operation)
     return result
 
 

@@ -36,7 +36,9 @@ from .schema import CandidateSpec
 
 
 STAGES = ('profile', 'calibrate', 'train', 'evaluate', 'latency', 'compare')
-_KNOWN_STAGES = frozenset(STAGES) | {'convert', 'export'}
+_KNOWN_STAGES = frozenset(STAGES) | {'convert', 'export', 'smoke-stage-a'}
+# The smoke producer owns and records its canonical GPU lease.  Acquiring the
+# controller lease as well would deadlock the child on the same shared lock.
 CUDA_STAGES = frozenset(STAGES) - {'compare'}
 StageRunner = Callable[[CandidateSpec, str, Path, int], 'StageOutcome']
 ArtifactValidator = Callable[[str, 'StageOutcome'], bool]
@@ -306,6 +308,19 @@ class OptimizationController:
         if not isinstance(value, dict):
             raise ArtifactValidationError(
                 f'{stage} artifact root must be an object: {path}')
+        if stage == 'smoke-stage-a':
+            if self.candidate.kind != 'binary-qk':
+                raise ArtifactValidationError(
+                    'Stage-A smoke is only valid for Binary Q/K')
+            try:
+                from .binary_smoke import validate_binary_stage_a_artifact
+                validate_binary_stage_a_artifact(
+                    path.relative_to(self.repository_root),
+                    repository_root=self.repository_root)
+            except ValueError as error:
+                raise ArtifactValidationError(
+                    f'binary Stage-A smoke artifact is invalid: {error}') from error
+            return 'binary-qk-stage-a-full-model-smoke-v1'
         if stage == 'calibrate' and self.candidate.route == 'ssm-quant-pwl':
             try:
                 from .numeric_calibration import validate_calibration_provenance
@@ -335,7 +350,7 @@ class OptimizationController:
             if self.candidate.route == 'ssm-quant-pwl':
                 required.add('source')
             if self.candidate.kind == 'binary-qk':
-                required.add('binary_qk_operation')
+                required.update({'binary_qk_operation', 'binary_qk_smoke'})
             if set(value) != required:
                 raise ArtifactValidationError(
                     'profile artifact fields do not match its schema version')
@@ -463,9 +478,18 @@ class OptimizationController:
             if self.candidate.kind == 'binary-qk':
                 try:
                     from .binary_operation import (
+                        binary_smoke_binding_for_profile,
                         validate_binary_operation_manifest)
-                    validate_binary_operation_manifest(
+                    operation = validate_binary_operation_manifest(
                         value.get('binary_qk_operation'))
+                    expected_smoke = binary_smoke_binding_for_profile(
+                        path.relative_to(self.repository_root),
+                        repository_root=self.repository_root,
+                        candidate_id=self.candidate.id,
+                        operation=operation)
+                    if value.get('binary_qk_smoke') != expected_smoke:
+                        raise ValueError(
+                            'binary profile Stage-A smoke binding mismatch')
                 except ValueError as error:
                     raise ArtifactValidationError(
                         f'binary profile operation is invalid: {error}') from error
@@ -627,9 +651,10 @@ class OptimizationController:
                 if self.candidate.kind == 'binary-qk':
                     from .binary_operation import validate_binary_stage_binding
                     validate_binary_stage_binding(
-                        profile_path=(
-                            path.parent.parent / 'profile/profile.json'),
-                        stage_path=path,
+                        profile_path=(path.parent.parent /
+                                      'profile/profile.json').relative_to(
+                                          self.repository_root),
+                        stage_path=path.relative_to(self.repository_root),
                         repository_root=self.repository_root,
                         candidate_id=self.candidate.id,
                         stage='evaluate')
@@ -691,9 +716,10 @@ class OptimizationController:
                 if self.candidate.kind == 'binary-qk':
                     from .binary_operation import validate_binary_stage_binding
                     validate_binary_stage_binding(
-                        profile_path=(
-                            path.parent.parent / 'profile/profile.json'),
-                        stage_path=path,
+                        profile_path=(path.parent.parent /
+                                      'profile/profile.json').relative_to(
+                                          self.repository_root),
+                        stage_path=path.relative_to(self.repository_root),
                         repository_root=self.repository_root,
                         candidate_id=self.candidate.id,
                         stage='latency')

@@ -195,7 +195,7 @@ def evaluate(
         from mambapose_opt.binary_operation import (
             binary_profile_binding_for_stage)
         result['binary_qk_profile'] = binary_profile_binding_for_stage(
-            output, repository_root=REPO_ROOT)
+            output.relative_to(REPO_ROOT), repository_root=REPO_ROOT)
     return stage_envelope(candidate.id, 'evaluate', result)
 
 

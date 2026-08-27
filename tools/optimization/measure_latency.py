@@ -214,7 +214,7 @@ def measure_candidate(
         from mambapose_opt.binary_operation import (
             binary_profile_binding_for_stage)
         binary_profile = binary_profile_binding_for_stage(
-            output, repository_root=REPO_ROOT)
+            output.relative_to(REPO_ROOT), repository_root=REPO_ROOT)
     config = Config.fromfile(config_path)
     data_protocol = validate_coco_val_protocol(
         config, repository_root=REPO_ROOT)

@@ -31,7 +31,7 @@ def _output_root(value: str) -> Path:
     path = Path(value)
     if (
             path.is_absolute()
-            or any(part in {'.', '..'} for part in path.parts)
+            or any(part in {'', '.', '..'} for part in value.split('/'))
             or path.parts[:2] != ('work_dirs', 'optimization')
             or path.name != 'smoke-stage-a'):
         raise argparse.ArgumentTypeError(

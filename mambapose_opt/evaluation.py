@@ -1227,7 +1227,9 @@ class CandidateResult:
     """Immutable, validated normalized row from an evaluation artifact."""
 
     candidate_id: str
+    candidate_kind: str
     route: str
+    seed: int
     metrics: CocoMetrics
     flip_test: bool
     provenance: Mapping[str, str]
@@ -1237,6 +1239,9 @@ class CandidateResult:
     profile: Mapping[str, Any] | None
     latency: Mapping[str, Any] | None
     binary_operation: Mapping[str, Any] | None
+    source: Mapping[str, Any]
+    numeric_source: Mapping[str, Any] | None
+    pwl_authority: Mapping[str, Any] | None
     gpu_lease: Mapping[str, Any] | None
     artifact_paths: Mapping[str, Path]
     evaluation_artifact: Path
@@ -1271,6 +1276,7 @@ class CandidateResult:
         })
         expected_profile_parent: Mapping[str, str] | None = None
         expected_profile_source: Mapping[str, Any] | None = None
+        pwl_authority: Mapping[str, Any] | None = None
         if candidate.route == 'ssm-quant-pwl':
             try:
                 from .numeric_runtime import resolve_numeric_runtime
@@ -1304,6 +1310,72 @@ class CandidateResult:
                     'checkpoint': candidate.checkpoint.as_posix(),
                     'checkpoint_sha256': candidate.checkpoint_sha256,
                 })
+                if candidate.kind == 'pwl':
+                    from .numeric_source import validate_numeric_config_closure
+
+                    installation_reference = numeric_runtime.get(
+                        'pwl_installation')
+                    if not isinstance(installation_reference, Mapping):
+                        raise ValueError(
+                            'PWL runtime installation reference is missing')
+                    installation_path = repository_root / str(
+                        installation_reference.get('path'))
+                    installation = json.loads(
+                        installation_path.read_text(encoding='utf-8'))
+                    fit_reference = installation.get('fit_artifact') \
+                        if isinstance(installation, Mapping) else None
+                    if not isinstance(fit_reference, Mapping):
+                        raise ValueError('PWL runtime fit reference is missing')
+                    calibration_path = repository_root / str(
+                        fit_reference.get('path'))
+                    calibration = json.loads(
+                        calibration_path.read_text(encoding='utf-8'))
+                    fit = calibration.get('pwl_fit') \
+                        if isinstance(calibration, Mapping) else None
+                    protocol = calibration.get('protocol') \
+                        if isinstance(calibration, Mapping) else None
+                    if (
+                            not isinstance(calibration, Mapping)
+                            or calibration.get('schema_version') != 3
+                            or not isinstance(fit, Mapping)
+                            or fit.get('selection_policy') !=
+                            'observed-range-max-then-mean-v1'
+                            or not isinstance(protocol, Mapping)
+                            or not isinstance(
+                                protocol.get('sample_order_sha256'), str)
+                            or not re.fullmatch(
+                                r'[0-9a-f]{64}',
+                                protocol['sample_order_sha256'])):
+                        raise ValueError(
+                            'PWL schema-v3 fit selection/order is invalid')
+                    operation_manifest = installation.get(
+                        'operation_manifest')
+                    if not isinstance(operation_manifest, Mapping):
+                        raise ValueError(
+                            'PWL installation operation manifest is invalid')
+                    pwl_authority = MappingProxyType({
+                        **dict(expected_profile_source),
+                        'seed': candidate.seed,
+                        'config_closure': tuple(
+                            validate_numeric_config_closure(
+                                repository_root, candidate.config,
+                                git_commit=expected_profile_source[
+                                    'git_commit'])),
+                        'calibration': MappingProxyType({
+                            **dict(fit_reference),
+                            'schema_version': 3,
+                            'sample_order_sha256': protocol[
+                                'sample_order_sha256'],
+                        }),
+                        'selection_policy': fit['selection_policy'],
+                        'installation': MappingProxyType(
+                            dict(installation_reference)),
+                        'operation_manifest_sha256': _bytes_sha256(
+                            json.dumps(
+                                operation_manifest, sort_keys=True,
+                                separators=(',', ':'), allow_nan=False,
+                            ).encode('utf-8')),
+                    })
             except (OSError, json.JSONDecodeError, ValueError) as error:
                 raise MetricError(
                     f'numeric profile authority is invalid: {error}') from error
@@ -1352,8 +1424,9 @@ class CandidateResult:
             try:
                 from .binary_operation import validate_binary_artifact_bundle
                 binary_operation = _freeze(validate_binary_artifact_bundle(
-                    profile_path=profile_path, evaluation_path=path,
-                    latency_path=latency_path,
+                    profile_path=profile_path.relative_to(repository_root),
+                    evaluation_path=path.relative_to(repository_root),
+                    latency_path=latency_path.relative_to(repository_root),
                     repository_root=repository_root,
                     candidate_id=candidate_id))
             except ValueError as error:
@@ -1361,6 +1434,7 @@ class CandidateResult:
                     f'binary CandidateResult binding is invalid: {error}') from error
         elif (
                 profile.get('binary_qk_operation') is not None
+                or profile.get('binary_qk_smoke') is not None
                 or validated.get('binary_qk_profile') is not None
                 or latency.get('binary_qk_profile') is not None):
             raise MetricError(
@@ -1397,6 +1471,10 @@ class CandidateResult:
             'profile': profile_path.resolve(),
             'latency': latency_path.resolve(),
         })
+        if candidate.kind == 'binary-qk':
+            smoke_binding = profile.get('binary_qk_smoke')
+            smoke_path = repository_root / str(smoke_binding['path'])
+            artifact_paths['smoke'] = smoke_path.resolve()
         try:
             for artifact in artifact_paths.values():
                 artifact.relative_to(root.resolve())
@@ -1404,7 +1482,9 @@ class CandidateResult:
             raise MetricError('candidate artifact path escapes its directory') from error
         return cls(
             candidate_id=candidate_id,
+            candidate_kind=candidate.kind,
             route=route,
+            seed=candidate.seed,
             metrics=metrics,
             flip_test=mode == 'flip',
             provenance=MappingProxyType(provenance),
@@ -1414,6 +1494,12 @@ class CandidateResult:
             profile=profile,
             latency=latency,
             binary_operation=binary_operation,
+            source=_freeze(source),
+            numeric_source=(
+                _freeze(expected_profile_source)
+                if expected_profile_source is not None else None),
+            pwl_authority=(
+                _freeze(pwl_authority) if pwl_authority is not None else None),
             gpu_lease=gpu_lease,
             artifact_paths=MappingProxyType(artifact_paths),
             evaluation_artifact=path.resolve(),
@@ -1438,8 +1524,10 @@ def _load_profile(
     runtime_fields = legacy_fields | {'device', 'parent', 'runtime'}
     if expected_source is not None:
         runtime_fields.add('source')
-    binary_legacy_fields = legacy_fields | {'binary_qk_operation'}
-    binary_runtime_fields = runtime_fields | {'binary_qk_operation'}
+    binary_legacy_fields = legacy_fields | {
+        'binary_qk_operation', 'binary_qk_smoke'}
+    binary_runtime_fields = runtime_fields | {
+        'binary_qk_operation', 'binary_qk_smoke'}
     if (
             not isinstance(value, Mapping)
             or set(value) not in (

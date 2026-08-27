@@ -12,7 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Sequence
+from typing import Sequence
 
 sys.dont_write_bytecode = True
 
@@ -103,6 +103,15 @@ class SubprocessStageRunner:
             artifact: Path) -> list[str]:
         python = str(REPO_ROOT / '.venv/bin/python')
         common = [candidate.id, '--output', self._relative(artifact)]
+        if stage == 'smoke-stage-a':
+            return [
+                python,
+                str(REPO_ROOT / 'tools/optimization/smoke_binary_qk.py'),
+                '--candidate', candidate.id,
+                '--manifest', str(self.manifest_path),
+                '--output-root', self._relative(artifact.parent),
+                '--device-index', str(self.device_index),
+            ]
         if stage in {'convert', 'export'}:
             command = [
                 python, str(REPO_ROOT / 'tools/optimization/convert_numeric.py'),
@@ -146,7 +155,8 @@ class SubprocessStageRunner:
     def __call__(
             self, candidate: CandidateSpec, stage: str,
             stage_dir: Path, attempt: int) -> StageOutcome:
-        artifact = stage_dir / f'{stage}.json'
+        artifact = stage_dir / (
+            'smoke.json' if stage == 'smoke-stage-a' else f'{stage}.json')
         command = self._command(candidate, stage, artifact)
         missing_tool = Path(command[1])
         if not missing_tool.is_file():
@@ -217,7 +227,6 @@ def _select(
         admit_conditional: bool = False,
         repository_root: Path = REPO_ROOT,
         manifest_path: Path = MANIFEST_PATH,
-        candidate_result_loader: Callable[..., Any] | None = None,
         ) -> tuple[CandidateSpec, ...]:
     if not identifiers:
         return tuple(
@@ -245,8 +254,7 @@ def _select(
                 validate_binary_qk_admission)
             validate_binary_qk_admission(
                 item, repository_root=repository_root,
-                manifest_path=manifest_path,
-                candidate_result_loader=candidate_result_loader)
+                manifest_path=manifest_path)
         except (OSError, RuntimeError, ValueError) as error:
             invalid_pwl_dependency.append(item.id)
             invalid_detail = str(error)

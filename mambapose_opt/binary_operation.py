@@ -20,6 +20,8 @@ from .artifacts import lexical_repository_root
 
 _FIELDS = {
     'schema_version', 'artifact_kind', 'implementation', 'qk_mode', 'layers',
+    'reference_scope', 'learnable_attention_bias',
+    'binaryattention_reproduction', 'recovery_policy',
     'module_names', 'heads', 'query_tokens', 'key_tokens', 'head_dim',
     'zero_sign', 'ste_gradient', 'scale', 'softmax', 'value',
     'attention_accumulation', 'output_projection',
@@ -28,6 +30,10 @@ _FIELDS = {
 }
 _SHA256 = re.compile(r'^[0-9a-f]{64}$')
 _PROFILE_BINDING_FIELDS = {'path', 'sha256', 'operation_sha256'}
+_SMOKE_BINDING_FIELDS = {'path', 'sha256', 'operation_sha256'}
+CANONICAL_BINARY_ATTENTION_MODULES = tuple(
+    f'head.tokenpose.transformer.layers.{index}.0.fn.fn'
+    for index in range(6))
 
 
 def canonical_json_sha256(value: object) -> str:
@@ -45,15 +51,16 @@ def _sha256_file(path: Path) -> str:
 
 
 def _safe_repository_file(
-        value: Path, *, repository_root: Path, label: str) -> Path:
+        value: Path | str, *, repository_root: Path, label: str) -> Path:
     root = lexical_repository_root(repository_root)
-    lexical = Path(value)
-    if not lexical.is_absolute():
-        lexical = root / lexical
-    try:
-        relative = lexical.absolute().relative_to(root)
-    except ValueError as error:
-        raise ValueError(f'{label} escapes the repository') from error
+    raw = str(value)
+    raw_parts = raw.split('/')
+    relative = Path(raw)
+    if (
+            relative.is_absolute()
+            or any(part in {'', '.', '..'} for part in raw_parts)):
+        raise ValueError(
+            f'{label} must be a safe repository-relative path')
     if relative.parts[:2] != ('work_dirs', 'optimization'):
         raise ValueError(f'{label} must stay under work_dirs/optimization')
     cursor = root
@@ -62,7 +69,7 @@ def _safe_repository_file(
         if cursor.is_symlink():
             raise ValueError(f'{label} path must not contain symlinks')
     try:
-        effective = lexical.resolve(strict=True)
+        effective = (root / relative).resolve(strict=True)
         effective.relative_to(root / 'work_dirs/optimization')
     except (OSError, ValueError) as error:
         raise ValueError(f'{label} is missing or escapes artifact authority') from error
@@ -102,6 +109,8 @@ def build_binary_operation_manifest(model: torch.nn.Module) -> dict[str, Any]:
     if len(rows) != 6:
         raise ValueError('Binary Q/K requires exactly six Attention layers')
     names = [name for name, _ in rows]
+    if names != list(CANONICAL_BINARY_ATTENTION_MODULES):
+        raise ValueError('Binary Q/K live module names are not canonical S-V1')
     if any(module.qk_mode != 'binary' for _, module in rows):
         raise ValueError('all six Attention layers must use binary qk_mode')
     heads = {module.heads for _, module in rows}
@@ -146,6 +155,11 @@ def build_binary_operation_manifest(model: torch.nn.Module) -> dict[str, Any]:
         'schema_version': 1,
         'artifact_kind': 'binary-qk-operation-manifest',
         'implementation': 'ste-sign-einsum-software-proxy',
+        'reference_scope': 'mechanism-inspired-sign-only-qk-preliminary',
+        'learnable_attention_bias': False,
+        'binaryattention_reproduction': False,
+        'recovery_policy': (
+            'bounded-qat-self-distillation-after-stage-b-only'),
         'qk_mode': 'binary',
         'layers': operation.layers,
         'module_names': names,
@@ -180,6 +194,11 @@ def validate_binary_operation_manifest(value: object) -> Mapping[str, Any]:
         'schema_version': 1,
         'artifact_kind': 'binary-qk-operation-manifest',
         'implementation': 'ste-sign-einsum-software-proxy',
+        'reference_scope': 'mechanism-inspired-sign-only-qk-preliminary',
+        'learnable_attention_bias': False,
+        'binaryattention_reproduction': False,
+        'recovery_policy': (
+            'bounded-qat-self-distillation-after-stage-b-only'),
         'qk_mode': 'binary',
         'layers': 6,
         'heads': 8,
@@ -206,27 +225,55 @@ def validate_binary_operation_manifest(value: object) -> Mapping[str, Any]:
         if value.get(name) != item:
             raise ValueError(f'binary operation manifest {name} is invalid')
     names = value['module_names']
-    if (
-            not isinstance(names, list) or len(names) != 6
-            or len(set(names)) != 6
-            or any(not isinstance(name, str) or not name for name in names)):
+    if names != list(CANONICAL_BINARY_ATTENTION_MODULES):
         raise ValueError('binary operation manifest module names are invalid')
     return value
 
 
+def binary_smoke_binding_for_profile(
+        profile_output: Path | str, *, repository_root: Path,
+        candidate_id: str, operation: Mapping[str, Any]) -> dict[str, str]:
+    """Bind a profile to its canonical, already-validated Stage-A smoke."""
+    root = lexical_repository_root(repository_root)
+    raw = str(profile_output)
+    relative = Path(raw)
+    if (
+            relative.is_absolute()
+            or any(part in {'', '.', '..'} for part in raw.split('/'))
+            or relative.parts[:2] != ('work_dirs', 'optimization')
+            or relative.name != 'profile.json'
+            or relative.parent.name != 'profile'):
+        raise ValueError('binary profile output must be a canonical relative path')
+    smoke_relative = relative.parent.parent / 'smoke-stage-a/smoke.json'
+    from .binary_smoke import validate_binary_stage_a_artifact
+    smoke = validate_binary_stage_a_artifact(
+        smoke_relative, repository_root=root)
+    if smoke['candidate_id'] != candidate_id:
+        raise ValueError('binary smoke candidate identity mismatch')
+    smoke_operation = validate_binary_operation_manifest(
+        smoke['execution']['operation'])
+    validated_operation = validate_binary_operation_manifest(operation)
+    if dict(smoke_operation) != dict(validated_operation):
+        raise ValueError('binary profile operation differs from Stage-A smoke')
+    smoke_path = _safe_repository_file(
+        smoke_relative, repository_root=root, label='binary Stage-A smoke')
+    return {
+        'path': smoke_relative.as_posix(),
+        'sha256': _sha256_file(smoke_path),
+        'operation_sha256': canonical_json_sha256(smoke_operation),
+    }
+
+
 def binary_profile_binding_for_stage(
-        stage_output: Path, *, repository_root: Path) -> dict[str, str]:
+        stage_output: Path | str, *, repository_root: Path) -> dict[str, str]:
     """Bind an evaluate/latency output to its canonical sibling profile."""
     root = lexical_repository_root(repository_root)
-    output = Path(stage_output)
-    if not output.is_absolute():
-        output = root / output
-    try:
-        relative = output.absolute().relative_to(root)
-    except ValueError as error:
-        raise ValueError('binary stage output escapes the repository') from error
+    raw = str(stage_output)
+    relative = Path(raw)
     if (
-            relative.parts[:2] != ('work_dirs', 'optimization')
+            relative.is_absolute()
+            or any(part in {'', '.', '..'} for part in raw.split('/'))
+            or relative.parts[:2] != ('work_dirs', 'optimization')
             or relative.name not in {'evaluate.json', 'latency.json'}
             or relative.parent.name not in {'evaluate', 'latency'}):
         raise ValueError('binary stage output has no canonical profile sibling')
@@ -241,6 +288,9 @@ def binary_profile_binding_for_stage(
         raise ValueError('binary profile root must be an object')
     operation = validate_binary_operation_manifest(
         value.get('binary_qk_operation'))
+    _validate_profile_smoke_binding(
+        value.get('binary_qk_smoke'), profile=profile, root=root,
+        candidate_id=value.get('candidate'), operation=operation)
     return {
         'path': profile.relative_to(root).as_posix(),
         'sha256': _sha256_file(profile),
@@ -262,10 +312,11 @@ def validate_binary_profile_binding(value: object) -> Mapping[str, str]:
     if not isinstance(value, Mapping) or set(value) != _PROFILE_BINDING_FIELDS:
         raise ValueError('binary profile binding is invalid')
     path = value.get('path')
+    raw_parts = path.split('/') if isinstance(path, str) else ()
     if (
             not isinstance(path, str) or not path
             or Path(path).is_absolute()
-            or any(part in {'.', '..'} for part in Path(path).parts)
+            or any(part in {'', '.', '..'} for part in raw_parts)
             or Path(path).parts[:2] != ('work_dirs', 'optimization')
             or Path(path).name != 'profile.json'
             or Path(path).parent.name != 'profile'):
@@ -275,6 +326,40 @@ def validate_binary_profile_binding(value: object) -> Mapping[str, str]:
                 not isinstance(value.get(name), str)
                 or not _SHA256.fullmatch(value[name])):
             raise ValueError(f'binary profile binding {name} is invalid')
+    return value
+
+
+def _validate_profile_smoke_binding(
+        value: object, *, profile: Path, root: Path,
+        candidate_id: object, operation: Mapping[str, Any]) -> Mapping[str, str]:
+    if not isinstance(value, Mapping) or set(value) != _SMOKE_BINDING_FIELDS:
+        raise ValueError('binary profile Stage-A smoke binding is invalid')
+    smoke = _safe_repository_file(
+        value.get('path'), repository_root=root, label='binary Stage-A smoke')
+    expected_smoke = profile.parent.parent / 'smoke-stage-a/smoke.json'
+    if smoke != expected_smoke:
+        raise ValueError('binary profile Stage-A smoke path is not canonical')
+    for name in ('sha256', 'operation_sha256'):
+        if (
+                not isinstance(value.get(name), str)
+                or not _SHA256.fullmatch(value[name])):
+            raise ValueError(f'binary Stage-A smoke {name} is invalid')
+    from .binary_smoke import validate_binary_stage_a_artifact
+    smoke_value = validate_binary_stage_a_artifact(
+        smoke.relative_to(root), repository_root=root)
+    smoke_operation = validate_binary_operation_manifest(
+        smoke_value['execution']['operation'])
+    expected = {
+        'path': smoke.relative_to(root).as_posix(),
+        'sha256': _sha256_file(smoke),
+        'operation_sha256': canonical_json_sha256(smoke_operation),
+    }
+    if (
+            dict(value) != expected
+            or not isinstance(candidate_id, str)
+            or smoke_value['candidate_id'] != candidate_id
+            or dict(smoke_operation) != dict(operation)):
+        raise ValueError('binary profile Stage-A smoke binding mismatch')
     return value
 
 
@@ -300,6 +385,9 @@ def validate_binary_stage_binding(
         raise ValueError('binary profile candidate identity mismatch')
     operation = validate_binary_operation_manifest(
         profile_value.get('binary_qk_operation'))
+    _validate_profile_smoke_binding(
+        profile_value.get('binary_qk_smoke'), profile=profile, root=root,
+        candidate_id=candidate_id, operation=operation)
     if (
             not isinstance(envelope, Mapping)
             or envelope.get('candidate_id') != candidate_id

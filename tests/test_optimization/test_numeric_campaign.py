@@ -232,7 +232,7 @@ def test_route3_stage_plans_follow_numeric_admission_order():
     with pytest.raises(ValueError, match='conditional admission'):
         numeric_stage_plan('binary-qk', conditional=False)
     assert numeric_stage_plan('binary-qk', conditional=True) == (
-        'profile', 'evaluate', 'latency')
+        'smoke-stage-a', 'profile', 'evaluate', 'latency')
     assert all(
         'compare' not in numeric_stage_plan(kind, conditional=conditional)
         for kind, conditional in (
