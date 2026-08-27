@@ -17,6 +17,7 @@ from mmengine.config import Config
 from mmengine.model import BaseModel
 from torch import Tensor, nn
 
+from mambapose_opt.evaluation import CandidateResult, MetricError
 from mmpose.models.builder import build_pose_estimator
 from mmpose.registry import MODELS
 from mmpose.utils.typing import ForwardResults, OptSampleList, SampleList
@@ -153,6 +154,33 @@ def validate_integration_features(spec: IntegrationSpec) -> None:
                 or value.get('candidate_id') != parent.candidate_id):
             raise ValueError(
                 f'parent result candidate mismatch for {parent.candidate_id}')
+        expected_suffix = Path('evaluate/evaluate.json')
+        try:
+            artifact_root = path.parent.parent
+            if path.relative_to(artifact_root) != expected_suffix:
+                raise ValueError
+        except ValueError as error:
+            raise ValueError(
+                f'parent result must be the canonical Stage B evaluation '
+                f'artifact for {parent.candidate_id}') from error
+        try:
+            validated = CandidateResult.from_artifacts(artifact_root)
+        except (MetricError, OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f'parent result is not canonical Stage B evidence for '
+                f'{parent.candidate_id}') from error
+        if (
+                validated.candidate_id != parent.candidate_id
+                or validated.evaluation_artifact != path.resolve()):
+            raise ValueError(
+                f'parent Stage B evidence identity mismatch for '
+                f'{parent.candidate_id}')
+        expected_route = (
+            'structural-pif' if parent.candidate_id in _STRUCTURAL_FEATURES
+            else 'ssm-quant-pwl')
+        if validated.route != expected_route:
+            raise ValueError(
+                f'parent Stage B route mismatch for {parent.candidate_id}')
 
 
 @MODELS.register_module()
@@ -208,23 +236,29 @@ class MambaPoseHeatmapDistiller(BaseModel):
             parameter.requires_grad_(False)
 
     def init_weights(self) -> None:
-        if hasattr(self.student, 'init_weights'):
-            self.student.init_weights()
-        if self.student_checkpoint is not None:
-            load_hash_validated_checkpoint(
-                self.student,
-                self.student_checkpoint,
-                expected_sha256=self.student_checkpoint_sha256,
-                strict=True)
-        if self.teacher_checkpoint is not None:
-            load_hash_validated_checkpoint(
-                self.teacher,
-                self.teacher_checkpoint,
-                expected_sha256=self.teacher_checkpoint_sha256,
-                strict=True)
-        elif hasattr(self.teacher, 'init_weights'):
-            self.teacher.init_weights()
-        self._freeze_teacher()
+        already_initialized = self.is_init
+        super().init_weights()
+        if already_initialized:
+            return
+        try:
+            if self.student_checkpoint is not None:
+                load_hash_validated_checkpoint(
+                    self.student,
+                    self.student_checkpoint,
+                    expected_sha256=self.student_checkpoint_sha256,
+                    strict=True)
+            if self.teacher_checkpoint is not None:
+                load_hash_validated_checkpoint(
+                    self.teacher,
+                    self.teacher_checkpoint,
+                    expected_sha256=self.teacher_checkpoint_sha256,
+                    strict=True)
+            self._freeze_teacher()
+        except Exception:
+            # Allow an operator to correct a failed checkpoint read and retry;
+            # never leave a partly loaded wrapper marked initialized.
+            self._is_init = False
+            raise
 
     def train(self, mode: bool = True):
         super().train(mode)

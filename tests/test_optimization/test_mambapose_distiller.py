@@ -27,12 +27,16 @@ class _ToyPoseEstimator(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.initializations = 0
         self.backbone = nn.Conv2d(3, 2, 1)
         self.head = _ToyHead()
         self.train_cfg = {'compute_acc': False}
         self.test_cfg = {}
         self.metainfo = None
         self.data_preprocessor = None
+
+    def init_weights(self):
+        self.initializations += 1
 
     def extract_feat(self, inputs):
         return (self.backbone(inputs), )
@@ -67,6 +71,24 @@ def test_teacher_is_frozen_and_stays_eval_only():
     assert all(not parameter.requires_grad
                for parameter in distiller.teacher.parameters())
     assert distiller.student.training is True
+
+
+def test_init_weights_uses_mmengine_one_shot_lifecycle():
+    from mmpose.models.distillers import MambaPoseHeatmapDistiller
+
+    distiller = MambaPoseHeatmapDistiller(
+        teacher=_ToyPoseEstimator(),
+        student=_ToyPoseEstimator(),
+        heatmap_loss_weight=0.5)
+
+    distiller.init_weights()
+    assert distiller.is_init is True
+    assert distiller.teacher.initializations == 1
+    assert distiller.student.initializations == 1
+
+    distiller.init_weights()
+    assert distiller.teacher.initializations == 1
+    assert distiller.student.initializations == 1
 
 
 def test_loss_uses_frozen_teacher_and_backpropagates_only_to_student():
