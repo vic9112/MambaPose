@@ -1650,6 +1650,101 @@ def test_candidate_result_accepts_generated_w8a8_and_recovery_runtimes(
             expected_checkpoint.relative_to(tmp_path).as_posix())
 
 
+def test_w8a8_public_validator_resolves_repository_relative_artifact_path(
+        tmp_path, monkeypatch):
+    from mambapose_opt.numeric_runtime import (
+        validate_numeric_convert_artifact)
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    convert_path = (
+        fixture['calibration_path'].parent.parent / 'convert/convert.json')
+    value = json.loads(convert_path.read_text())
+    unrelated_cwd = tmp_path / 'configs'
+    monkeypatch.chdir(unrelated_cwd)
+
+    assert validate_numeric_convert_artifact(
+        value, candidate=fixture['screen'], repository_root=tmp_path,
+        manifest_path=fixture['screen_manifest'],
+        artifact_path=convert_path.relative_to(tmp_path)) == value
+
+
+def test_w8a8_relative_artifact_normalization_rejects_escape_and_symlink(
+        tmp_path, monkeypatch):
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, validate_numeric_convert_artifact)
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    convert_path = (
+        fixture['calibration_path'].parent.parent / 'convert/convert.json')
+    value = json.loads(convert_path.read_text())
+    linked_root = tmp_path / 'artifact-link'
+    linked_root.symlink_to(convert_path.parent.parent, target_is_directory=True)
+
+    for artifact_path in (
+            Path('../outside/convert/convert.json'),
+            Path('artifact-link/convert/convert.json')):
+        with pytest.raises(NumericRuntimeError, match='unsafe|escape|symlink'):
+            validate_numeric_convert_artifact(
+                value, candidate=fixture['screen'], repository_root=tmp_path,
+                manifest_path=fixture['screen_manifest'],
+                artifact_path=artifact_path)
+
+
+@pytest.mark.parametrize('role', ['calibration', 'runtime_config'])
+def test_w8a8_relative_artifact_normalization_preserves_canonical_dependencies(
+        tmp_path, monkeypatch, role):
+    from mambapose_opt.numeric_runtime import (
+        NumericRuntimeError, validate_numeric_convert_artifact)
+    from mambapose_opt.numeric_source import file_sha256
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    convert_path = (
+        fixture['calibration_path'].parent.parent / 'convert/convert.json')
+    value = json.loads(convert_path.read_text())
+    source_path = (
+        fixture['calibration_path'] if role == 'calibration'
+        else fixture['screen_runtime_config'])
+    alternate = convert_path.parent.parent / f'alternate-{source_path.name}'
+    alternate.write_bytes(source_path.read_bytes())
+    reference = {
+        'path': alternate.relative_to(tmp_path).as_posix(),
+        'sha256': file_sha256(alternate),
+    }
+    if role == 'calibration':
+        value['result']['runtime_bindings']['calibration'] = reference
+    else:
+        value['result']['runtime_config'] = reference
+
+    with pytest.raises(NumericRuntimeError, match='canonical'):
+        validate_numeric_convert_artifact(
+            value, candidate=fixture['screen'], repository_root=tmp_path,
+            manifest_path=fixture['screen_manifest'],
+            artifact_path=convert_path.relative_to(tmp_path))
+
+
+def test_candidate_result_accepts_w8a8_artifact_root_relative_to_cwd(
+        tmp_path, monkeypatch):
+    from mambapose_opt.evaluation import CandidateResult
+
+    fixture = _w8a8_recovery_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        'mambapose_opt.evaluation._TRUSTED_REPOSITORY_ROOT', tmp_path)
+    artifacts = _write_route3_candidate_result_artifacts(
+        tmp_path, candidate=fixture['screen'],
+        manifest=fixture['screen_manifest'],
+        git_commit=fixture['screen_commit'],
+        inventory_sha=fixture['inventory_sha'],
+        evaluation_path=fixture['screen_evaluation_path'])
+    monkeypatch.chdir(tmp_path)
+
+    result = CandidateResult.from_artifacts(
+        artifacts['root'].relative_to(tmp_path))
+
+    assert result.candidate_id == fixture['screen'].id
+    assert result.evaluation_artifact == (
+        artifacts['root'] / 'evaluate/evaluate.json')
+
+
 @pytest.mark.parametrize('substitution', ['runtime', 'parent', 'source'])
 def test_candidate_result_rejects_route3_authority_substitution(
         tmp_path, monkeypatch, substitution):

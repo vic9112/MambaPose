@@ -18,6 +18,29 @@ class NumericRuntimeError(ValueError):
     """Raised when a trained numeric runtime reference is missing or stale."""
 
 
+def _repository_artifact_path(
+        repository_root: Path, artifact_path: Path) -> Path:
+    """Normalize a repository-relative artifact without following symlinks."""
+    root = Path(repository_root).resolve(strict=True)
+    supplied = Path(artifact_path)
+    if any(part in {'.', '..'} for part in supplied.parts):
+        raise NumericRuntimeError('numeric artifact path is unsafe')
+    lexical = supplied if supplied.is_absolute() else root / supplied
+    lexical = lexical.absolute()
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError as error:
+        raise NumericRuntimeError(
+            'numeric artifact path escapes repository') from error
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise NumericRuntimeError(
+                'numeric artifact path must not use symlinks')
+    return root / relative
+
+
 def validate_numeric_convert_artifact(
         value: Mapping[str, Any], *, candidate: CandidateSpec,
         repository_root: Path, manifest_path: Path,
@@ -32,6 +55,9 @@ def validate_numeric_convert_artifact(
     kind = candidate.features.get('numeric_kind')
     if kind not in {'weight-only', 'w8a8'}:
         raise NumericRuntimeError('numeric convert candidate kind is invalid')
+    if kind == 'w8a8':
+        artifact_path = _repository_artifact_path(
+            repository_root, artifact_path)
     result = value['result']
     expected_fields = {
         'source', 'runtime_bindings', 'conversion', 'precision_invariants',
