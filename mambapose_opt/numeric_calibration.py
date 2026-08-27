@@ -416,9 +416,13 @@ def validate_calibration_artifact(
         raise CalibrationContractError(
             'calibration dataset authority is incomplete')
     protocol = value['protocol']
-    if (not isinstance(protocol, Mapping) or set(protocol) != {
-            'model_mode', 'grad_enabled', 'shuffle', 'worker_count',
-            'sample_count', 'sample_order_sha256'}):
+    legacy_protocol_fields = {
+        'model_mode', 'grad_enabled', 'shuffle', 'worker_count',
+        'sample_count', 'sample_order_sha256'}
+    protocol_fields = set(protocol) if isinstance(protocol, Mapping) else set()
+    if (not isinstance(protocol, Mapping) or protocol_fields not in (
+            legacy_protocol_fields,
+            legacy_protocol_fields | {'root_determinism'})):
         raise CalibrationContractError('calibration protocol is invalid')
     expected = {
         'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
@@ -434,6 +438,28 @@ def validate_calibration_artifact(
     if not isinstance(protocol.get('sample_order_sha256'), str) or not re.fullmatch(
             r'[0-9a-f]{64}', protocol['sample_order_sha256']):
         raise CalibrationContractError('calibration sample order hash is invalid')
+    if 'root_determinism' in protocol:
+        root_determinism = protocol['root_determinism']
+        seed_fields = {
+            'seed', 'python_seed', 'numpy_seed', 'torch_seed',
+            'torch_cuda_seed'}
+        expected_root_fields = seed_fields | {
+            'torch_deterministic_algorithms', 'cudnn_benchmark',
+            'cudnn_deterministic'}
+        seed = root_determinism.get('seed') \
+            if isinstance(root_determinism, Mapping) else None
+        if (not isinstance(root_determinism, Mapping)
+                or set(root_determinism) != expected_root_fields
+                or isinstance(seed, bool) or not isinstance(seed, int)
+                or not 0 <= seed < 2**32
+                or any(root_determinism.get(field) != seed
+                       for field in seed_fields)
+                or root_determinism.get(
+                    'torch_deterministic_algorithms') is not True
+                or root_determinism.get('cudnn_benchmark') is not False
+                or root_determinism.get('cudnn_deterministic') is not True):
+            raise CalibrationContractError(
+                'calibration root determinism contract is invalid')
     hooks = value['hooks']
     if (not isinstance(hooks, Mapping)
             or set(hooks) not in (
@@ -578,6 +604,11 @@ def validate_calibration_provenance(
         raise CalibrationContractError(
             f'calibration source binding is invalid: {error}') from error
     identity = value['identity']
+    root_determinism = value['protocol'].get('root_determinism')
+    if (root_determinism is not None
+            and root_determinism['seed'] != expected_candidate.seed):
+        raise CalibrationContractError(
+            'calibration root determinism seed disagrees with candidate')
     if identity['git_commit'] != source['git_commit']:
         raise CalibrationContractError(
             'calibration identity commit disagrees with source binding')

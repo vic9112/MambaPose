@@ -11,6 +11,80 @@ import torch
 from mmengine.config import Config
 
 
+def test_calibration_root_seed_replays_all_rngs_and_backend_policy(
+        monkeypatch):
+    from mambapose_opt.determinism import seed_deterministic_root
+
+    cuda_seeds = []
+    monkeypatch.setattr(
+        torch.cuda, 'manual_seed_all', lambda seed: cuda_seeds.append(seed))
+    original_algorithms = torch.are_deterministic_algorithms_enabled()
+    original_benchmark = torch.backends.cudnn.benchmark
+    original_cudnn_deterministic = torch.backends.cudnn.deterministic
+    try:
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+
+        random.seed(101)
+        np.random.seed(101)
+        torch.manual_seed(101)
+        random.random()
+        np.random.random()
+        torch.rand(3)
+        cuda_seeds.clear()
+        first_contract = seed_deterministic_root(7)
+        first_cuda_seeds = tuple(cuda_seeds)
+        first = (
+            random.random(), np.random.random(), torch.rand(3),
+            torch.nn.Linear(3, 2).weight.detach().clone())
+
+        random.seed(999)
+        np.random.seed(999)
+        torch.manual_seed(999)
+        random.random()
+        np.random.random()
+        torch.rand(3)
+        cuda_seeds.clear()
+        second_contract = seed_deterministic_root(7)
+        second_cuda_seeds = tuple(cuda_seeds)
+        second = (
+            random.random(), np.random.random(), torch.rand(3),
+            torch.nn.Linear(3, 2).weight.detach().clone())
+
+        assert first[0] == second[0]
+        assert first[1] == second[1]
+        torch.testing.assert_close(first[2], second[2], rtol=0, atol=0)
+        torch.testing.assert_close(first[3], second[3], rtol=0, atol=0)
+        assert first_contract == second_contract == {
+            'seed': 7,
+            'python_seed': 7,
+            'numpy_seed': 7,
+            'torch_seed': 7,
+            'torch_cuda_seed': 7,
+            'torch_deterministic_algorithms': True,
+            'cudnn_benchmark': False,
+            'cudnn_deterministic': True,
+        }
+        assert first_cuda_seeds == second_cuda_seeds == (7, 7)
+        assert torch.are_deterministic_algorithms_enabled()
+        assert torch.backends.cudnn.benchmark is False
+        assert torch.backends.cudnn.deterministic is True
+    finally:
+        torch.use_deterministic_algorithms(original_algorithms)
+        torch.backends.cudnn.benchmark = original_benchmark
+        torch.backends.cudnn.deterministic = original_cudnn_deterministic
+
+
+@pytest.mark.parametrize('seed', [True, -1, 1.5, 2**32])
+def test_calibration_root_seed_rejects_values_not_shared_by_all_rngs(seed):
+    from mambapose_opt.determinism import (
+        DeterminismError, seed_deterministic_root)
+
+    with pytest.raises(DeterminismError, match='32-bit integer'):
+        seed_deterministic_root(seed)
+
+
 def test_seed_worker_uses_full_torch_initial_seed_and_32bit_library_seeds(
         monkeypatch):
     from mambapose_opt.determinism import seed_worker

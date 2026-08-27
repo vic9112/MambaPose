@@ -25,6 +25,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.checkpoints import authorize_manifest_candidate
+from mambapose_opt.determinism import seed_deterministic_root
 from mambapose_opt.numeric_calibration import (
     CalibrationTargets, calibration_identity, discover_calibration_targets,
     validate_calibration_artifact)
@@ -298,6 +299,7 @@ def calibrate(
     loader_config = dict(config.train_dataloader)
     loader_config.update(batch_size=1, num_workers=0, persistent_workers=False)
     loader_config['sampler'] = dict(type='DefaultSampler', shuffle=False)
+    root_determinism = seed_deterministic_root(candidate.seed)
     model = init_model(
         str(authorized.config_path),
         str(authorized.checkpoint_path),
@@ -306,7 +308,7 @@ def calibrate(
     if any(parameter.requires_grad for parameter in model.parameters()):
         model.requires_grad_(False)
     targets = discover_calibration_targets(model)
-    dataloader = Runner.build_dataloader(loader_config, seed=0,
+    dataloader = Runner.build_dataloader(loader_config, seed=candidate.seed,
                                          diff_rank_seed=False)
     order = hashlib.sha256()
     observed = 0
@@ -347,6 +349,7 @@ def calibrate(
             'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
             'worker_count': 0, 'sample_count': observed,
             'sample_order_sha256': order.hexdigest(),
+            'root_determinism': root_determinism,
         },
         'hooks': {
             'records': records,

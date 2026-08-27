@@ -21,6 +21,30 @@ class DeterminismError(ValueError):
     """Raised when a repeatability record is incomplete or inconsistent."""
 
 
+def seed_deterministic_root(seed: int) -> dict[str, int | bool]:
+    """Reset every calibration RNG and enforce deterministic Torch backends."""
+    if (isinstance(seed, bool) or not isinstance(seed, int)
+            or not 0 <= seed < 2**32):
+        raise DeterminismError('seed must be an unsigned 32-bit integer')
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    return {
+        'seed': seed,
+        'python_seed': seed,
+        'numpy_seed': seed,
+        'torch_seed': seed,
+        'torch_cuda_seed': seed,
+        'torch_deterministic_algorithms': True,
+        'cudnn_benchmark': False,
+        'cudnn_deterministic': True,
+    }
+
+
 def seed_worker(worker_id: int) -> None:
     """Seed Python, NumPy, and Torch for one data-loader worker.
 

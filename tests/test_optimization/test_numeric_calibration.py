@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -283,6 +284,16 @@ def test_calibration_artifact_requires_deterministic_order_and_exact_hooks():
             'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
             'worker_count': 0, 'sample_count': 2,
             'sample_order_sha256': 'a' * 64,
+            'root_determinism': {
+                'seed': 0,
+                'python_seed': 0,
+                'numpy_seed': 0,
+                'torch_seed': 0,
+                'torch_cuda_seed': 0,
+                'torch_deterministic_algorithms': True,
+                'cudnn_benchmark': False,
+                'cudnn_deterministic': True,
+            },
         },
         'hooks': {'records': {'attention.0.q': record},
                   'required_records': ['attention.0.q'],
@@ -297,6 +308,142 @@ def test_calibration_artifact_requires_deterministic_order_and_exact_hooks():
     artifact['hooks']['required_records'].append('attention.0.q')
     with pytest.raises(CalibrationContractError, match='duplicated'):
         validate_calibration_artifact(artifact)
+
+    artifact['hooks']['required_records'] = ['attention.0.q']
+    artifact['protocol']['root_determinism']['torch_seed'] = 1
+    with pytest.raises(CalibrationContractError, match='root determinism'):
+        validate_calibration_artifact(artifact)
+
+
+def test_calibration_artifact_keeps_legacy_protocol_compatible():
+    from mambapose_opt.numeric_calibration import validate_calibration_artifact
+
+    record = {
+        'granularity': 'tensor', 'sample_count': 1, 'zero_count': 0,
+        'underflow_count': 0, 'overflow_count': 0, 'max_abs': 1.0,
+        'range': [-1.0, 1.0],
+        'percentiles': {'0.5': 1.0, '0.9': 1.0, '0.99': 1.0,
+                        '0.999': 1.0},
+        'algorithm': 'fixed-log2-histogram-v1', 'histogram_bins': 256,
+        'histogram_domain': [2 ** -32, 2 ** 32],
+        'percentile_bound_valid': True,
+        'relative_error_bound': 2 ** 0.25 - 1,
+        'outlier_ratio_above_p99_bin': 0.0, 'token_ids': None,
+        'observed_shape': [],
+    }
+    artifact = {
+        'schema_version': 1, 'candidate_id': 'legacy', 'stage': 'calibrate',
+        'source': {}, 'identity': _valid_identity(),
+        'protocol': {
+            'model_mode': 'eval', 'grad_enabled': False, 'shuffle': False,
+            'worker_count': 0, 'sample_count': 1,
+            'sample_order_sha256': 'a' * 64,
+        },
+        'hooks': {
+            'records': {'layer.input': record},
+            'required_records': ['layer.input'],
+            'unsupported_internals': [],
+        },
+    }
+
+    assert validate_calibration_artifact(artifact) is artifact
+
+
+def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
+        tmp_path, monkeypatch):
+    import tools.optimization.calibrate_numeric as tool
+    from mambapose_opt.determinism import seed_deterministic_root
+
+    candidate = SimpleNamespace(id='w8a8', seed=7)
+    authorized = SimpleNamespace(
+        candidate=candidate, config_path=tmp_path / 'config.py',
+        checkpoint_path=tmp_path / 'checkpoint.pth')
+    config = SimpleNamespace(
+        train_dataloader={},
+        numeric_optimization={'quant_policy': {'activation_observers': {}}})
+    calls = []
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+        def test_step(self, _batch):
+            return None
+
+    class Session:
+        def __init__(self, _model, _targets):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def records(self):
+            return {
+                'layer.input': {
+                    'granularity': 'tensor', 'sample_count': 1,
+                    'zero_count': 0, 'underflow_count': 0,
+                    'overflow_count': 0, 'max_abs': 1.0,
+                    'range': [-1.0, 1.0],
+                    'percentiles': {
+                        '0.5': 1.0, '0.9': 1.0, '0.99': 1.0,
+                        '0.999': 1.0},
+                    'algorithm': 'fixed-log2-histogram-v1',
+                    'histogram_bins': 256,
+                    'histogram_domain': [2 ** -32, 2 ** 32],
+                    'percentile_bound_valid': True,
+                    'relative_error_bound': 2 ** 0.25 - 1,
+                    'outlier_ratio_above_p99_bin': 0.0,
+                    'token_ids': None, 'observed_shape': [],
+                },
+            }
+
+    def deterministic_root(seed):
+        calls.append(('seed', seed))
+        return seed_deterministic_root(seed)
+
+    def init_model(*_args, **_kwargs):
+        calls.append(('model', None))
+        return Model()
+
+    def build_dataloader(_config, *, seed, diff_rank_seed):
+        calls.append(('loader', seed, diff_rank_seed))
+        return [{'data_samples': [SimpleNamespace(img_id=11)]}]
+
+    monkeypatch.setattr(tool, 'authorize_manifest_candidate',
+                        lambda *_args: authorized)
+    monkeypatch.setattr(tool, '_identity',
+                        lambda *_args: _valid_identity())
+    monkeypatch.setattr(tool, 'seed_deterministic_root', deterministic_root)
+    monkeypatch.setattr(tool, 'discover_calibration_targets', lambda _model:
+                        SimpleNamespace(unsupported_internals=()))
+    monkeypatch.setattr(tool, '_required_records',
+                        lambda _targets: ('layer.input',))
+    monkeypatch.setattr(tool, '_HookSession', Session)
+    monkeypatch.setattr(tool, 'build_numeric_source_binding',
+                        lambda **_kwargs: {})
+    monkeypatch.setattr('mmengine.config.Config.fromfile',
+                        lambda _path: config)
+    monkeypatch.setattr('mmpose.apis.init_model', init_model)
+    monkeypatch.setattr('mmengine.runner.Runner.build_dataloader',
+                        build_dataloader)
+    original_algorithms = torch.are_deterministic_algorithms_enabled()
+    original_benchmark = torch.backends.cudnn.benchmark
+    original_cudnn_deterministic = torch.backends.cudnn.deterministic
+    try:
+        artifact = tool.calibrate(
+            candidate, tmp_path / 'policy.py', samples=1, device='cuda:0',
+            manifest_path=tmp_path / 'manifest.json')
+    finally:
+        torch.use_deterministic_algorithms(original_algorithms)
+        torch.backends.cudnn.benchmark = original_benchmark
+        torch.backends.cudnn.deterministic = original_cudnn_deterministic
+
+    assert calls == [('seed', 7), ('model', None), ('loader', 7, False)]
+    assert artifact['protocol']['root_determinism']['seed'] == 7
 
 
 def test_calibration_provenance_rejects_identity_commit_mismatch(
