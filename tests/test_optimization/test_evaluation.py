@@ -700,6 +700,51 @@ def test_formal_evaluation_runs_flip_and_no_flip_before_envelope(
     assert set(envelope['result']['modes']) == {'flip', 'no_flip'}
 
 
+def test_direct_evaluation_child_disables_bytecode_independent_of_parent(
+        tmp_path, monkeypatch):
+    import tools.optimization.evaluate_candidate as tool
+    from mambapose_opt.schema import CandidateSpec
+
+    candidate = CandidateSpec.from_dict({
+        'id': 'fixture', 'route': 'accuracy-first', 'kind': 'float',
+        'config': 'config.py', 'checkpoint': 'model.pth',
+        'checkpoint_sha256': 'a' * 64, 'seed': 0, 'features': {},
+    })
+    config = tool.Config(dict(
+        test_dataloader=dict(
+            batch_size=1, num_workers=2, persistent_workers=False)))
+    monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(tool, '_deterministic_config', lambda *args: config)
+    monkeypatch.setattr(
+        tool, 'validate_coco_val_protocol',
+        lambda *args, **kwargs: {
+            'inventory_projection': {'inventory_sha256': 'b' * 64}})
+    monkeypatch.setattr(
+        tool, 'repeated_order_hash', lambda *args, **kwargs: 'c' * 64)
+    monkeypatch.setattr(
+        tool, 'load_coco_metrics',
+        lambda *args, **kwargs: type(
+            'Metrics', (), {'to_dict': lambda self: {'AP': 1.0}})())
+    monkeypatch.setattr(
+        tool, 'build_determinism_record',
+        lambda **kwargs: {'provenance': kwargs})
+    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '0')
+    captured_environment = None
+
+    def capture_run(argv, **kwargs):
+        nonlocal captured_environment
+        captured_environment = kwargs['env']
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(tool.subprocess, 'run', capture_run)
+    tool._evaluate_mode(
+        candidate, tmp_path / 'evaluate.json', flip_test=True,
+        checkpoint_sha256='a' * 64, git_commit='d' * 40)
+
+    assert captured_environment is not None
+    assert captured_environment['PYTHONDONTWRITEBYTECODE'] == '1'
+
+
 def _coco_fixture(tmp_path):
     subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
     annotation = tmp_path / 'data/coco/annotations/person_keypoints_val2017.json'

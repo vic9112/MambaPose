@@ -9,9 +9,6 @@ import subprocess
 
 _ALLOWED_IGNORED_ROOTS = frozenset({
     '.pytest_cache', '.venv', 'data', 'pretrained', 'work_dirs'})
-_SOURCE_CAPABLE_SUFFIXES = frozenset({
-    '.bash', '.cfg', '.conf', '.ini', '.json', '.pth', '.py', '.pyc',
-    '.pyo', '.sh', '.so', '.toml', '.yaml', '.yml', '.zsh'})
 
 
 def _unsafe_ignored_paths(root: Path) -> tuple[str, ...]:
@@ -31,14 +28,7 @@ def _unsafe_ignored_paths(root: Path) -> tuple[str, ...]:
             continue
         if relative.parts[0] in _ALLOWED_IGNORED_ROOTS:
             continue
-        path = root / relative
-        source_capable = relative.suffix.lower() in _SOURCE_CAPABLE_SUFFIXES
-        try:
-            executable = path.is_file() and bool(path.stat().st_mode & 0o111)
-        except OSError:
-            executable = True
-        if source_capable or executable:
-            unsafe.append(relative.as_posix())
+        unsafe.append(relative.as_posix())
     return tuple(sorted(unsafe))
 
 
@@ -46,7 +36,7 @@ def clean_git_commit(repository_root: Path) -> str:
     """Return HEAD only when tracked and untracked source are both clean.
 
     Only exact approved ignored runtime/asset roots are exempted. Ignored
-    source-capable or executable files elsewhere fail closed.
+    Every ignored entry outside those component-exact roots fails closed.
     """
     root = Path(repository_root).resolve(strict=True)
     status = subprocess.run(
@@ -59,7 +49,8 @@ def clean_git_commit(repository_root: Path) -> str:
     unsafe_ignored = _unsafe_ignored_paths(root)
     if unsafe_ignored:
         raise RuntimeError(
-            'formal optimization rejects ignored source-capable files: '
+            'formal optimization rejects ignored entries outside approved '
+            'runtime/asset roots: '
             + ', '.join(unsafe_ignored))
     return subprocess.check_output(
         ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
