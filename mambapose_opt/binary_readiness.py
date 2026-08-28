@@ -18,7 +18,7 @@ _SHA256 = re.compile(r'^[0-9a-f]{64}$')
 _GATE_FIELDS = {
     'schema_version', 'artifact_kind', 'decision', 'ap_drop_limit_points',
     'baseline_candidate_id', 'pwl_candidate_id', 'pwl_policy',
-    'pwl_authority', 'modes',
+    'baseline_authority', 'pwl_authority', 'modes',
 }
 _MODE_FIELDS = {
     'baseline_root', 'baseline_evaluation_sha256', 'candidate_root',
@@ -30,6 +30,18 @@ _PWL_AUTHORITY_FIELDS = {
     'checkpoint_sha256', 'policy_path', 'policy_sha256', 'authority_path',
     'authority_sha256', 'seed', 'calibration', 'selection_policy',
     'installation', 'operation_manifest_sha256', 'config_closure',
+}
+_SOURCE_FIELDS = {
+    'git_commit', 'manifest_path', 'manifest_sha256', 'config_path',
+    'config_sha256', 'authority_path', 'authority_sha256',
+}
+_BASELINE_AUTHORITY_FIELDS = {
+    'candidate_id', 'candidate_row_sha256', 'seed', 'source', 'checkpoint',
+    'config_closure', 'modes',
+}
+_BASELINE_MODE_FIELDS = {
+    'artifact_root', 'evaluation_sha256', 'provenance_sha256',
+    'protocol_sha256', 'determinism_sha256',
 }
 
 
@@ -113,6 +125,28 @@ def _plain_json_value(value: Any) -> Any:
     return value
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        _plain_json_value(value), sort_keys=True, separators=(',', ':'),
+        ensure_ascii=True, allow_nan=False).encode('utf-8')
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _result_mapping(result: Any, name: str, *, label: str) -> Mapping[str, Any]:
+    value = getattr(result, name, None)
+    if not isinstance(value, Mapping):
+        raise ValueError(f'{label} CandidateResult {name} is invalid')
+    return value
+
+
+def _paired_projection(
+        value: Mapping[str, Any], *, excluded: set[str]) -> dict[str, Any]:
+    return {
+        name: _plain_json_value(item) for name, item in value.items()
+        if name not in excluded
+    }
+
+
 def _manifest_candidate_row_sha256(
         manifest_path: Path, candidate_id: str) -> str:
     try:
@@ -122,9 +156,9 @@ def _manifest_candidate_row_sha256(
             row for row in rows
             if isinstance(row, Mapping) and row.get('id') == candidate_id]
     except (KeyError, TypeError, json.JSONDecodeError, OSError) as error:
-        raise ValueError('PWL current manifest is invalid') from error
+        raise ValueError('current candidate manifest is invalid') from error
     if len(matches) != 1:
-        raise ValueError('PWL current candidate row is not unique')
+        raise ValueError('current candidate row is not unique')
     payload = json.dumps(
         matches[0], sort_keys=True, separators=(',', ':'),
         ensure_ascii=True).encode('utf-8')
@@ -159,13 +193,25 @@ def validate_binary_qk_admission(
         raise ValueError('PWL Stage-B artifact has invalid fields')
     limit = _finite(value['ap_drop_limit_points'], label='PWL AP-drop limit')
     if (
-            value['schema_version'] != 2
+            value['schema_version'] != 3
             or value['artifact_kind'] != 'pwl-stage-b-pass'
             or value['decision'] != 'passed'
             or limit != 0.3):
         raise ValueError('PWL Stage-B artifact is not a passed 0.3-point screen')
 
-    candidates = load_candidate_manifest(manifest_path)
+    raw_manifest = str(manifest_path)
+    manifest_input = Path(raw_manifest)
+    if manifest_input.is_absolute():
+        try:
+            manifest_relative = manifest_input.absolute().relative_to(root)
+        except ValueError as error:
+            raise ValueError('PWL current manifest escapes repository') from error
+    else:
+        manifest_relative = _relative(
+            raw_manifest, label='PWL current manifest')
+    manifest_file = _regular_file(
+        root, manifest_relative, label='PWL current manifest')
+    candidates = load_candidate_manifest(manifest_file)
     by_id = {item.id: item for item in candidates}
     baseline = by_id.get(value['baseline_candidate_id'])
     pwl = by_id.get(value['pwl_candidate_id'])
@@ -173,14 +219,6 @@ def validate_binary_qk_admission(
         raise ValueError('PWL Stage-B baseline authority is invalid')
     if pwl is None or pwl.kind != 'pwl' or pwl.route != 'ssm-quant-pwl':
         raise ValueError('PWL Stage-B candidate authority is invalid')
-    manifest_file = Path(manifest_path)
-    if not manifest_file.is_absolute():
-        manifest_file = root / manifest_file
-    try:
-        manifest_file = manifest_file.resolve(strict=True)
-        manifest_relative = manifest_file.relative_to(root)
-    except (OSError, ValueError) as error:
-        raise ValueError('PWL current manifest escapes repository') from error
     policy = value['pwl_policy']
     if not isinstance(policy, Mapping) or set(policy) != {
             'path', 'sha256', 'function'}:
@@ -271,6 +309,63 @@ def validate_binary_qk_admission(
     modes = value['modes']
     if not isinstance(modes, Mapping) or set(modes) != {'flip', 'no_flip'}:
         raise ValueError('PWL Stage-B artifact must contain both modes')
+    baseline_authority = value['baseline_authority']
+    if (
+            not isinstance(baseline_authority, Mapping)
+            or set(baseline_authority) != _BASELINE_AUTHORITY_FIELDS):
+        raise ValueError('PWL Stage-B baseline authority fields are invalid')
+    baseline_source = baseline_authority.get('source')
+    baseline_checkpoint = baseline_authority.get('checkpoint')
+    baseline_config_closure = baseline_authority.get('config_closure')
+    baseline_mode_authority = baseline_authority.get('modes')
+    if (
+            baseline_authority.get('candidate_id') != baseline.id
+            or baseline_authority.get('candidate_row_sha256') !=
+            _manifest_candidate_row_sha256(manifest_file, baseline.id)
+            or baseline_authority.get('seed') != baseline.seed
+            or not isinstance(baseline_source, Mapping)
+            or set(baseline_source) != _SOURCE_FIELDS
+            or baseline_source.get('config_path') != baseline.config.as_posix()
+            or baseline_source.get('config_sha256') !=
+            _sha256(_regular_file(
+                root, baseline.config, label='PWL baseline config'))
+            or baseline_source.get('git_commit') !=
+            pwl_authority.get('git_commit')
+            or baseline_source.get('manifest_path') !=
+            pwl_authority.get('manifest_path')
+            or baseline_source.get('manifest_sha256') !=
+            pwl_authority.get('manifest_sha256')
+            or baseline_source.get('authority_path') !=
+            pwl_authority.get('authority_path')
+            or baseline_source.get('authority_sha256') !=
+            pwl_authority.get('authority_sha256')
+            or not isinstance(baseline_checkpoint, Mapping)
+            or set(baseline_checkpoint) != {'path', 'sha256'}
+            or baseline_checkpoint.get('path') != baseline.checkpoint.as_posix()
+            or baseline_checkpoint.get('sha256') != baseline.checkpoint_sha256
+            or baseline_checkpoint.get('path') !=
+            pwl_authority.get('checkpoint_path')
+            or baseline_checkpoint.get('sha256') !=
+            pwl_authority.get('checkpoint_sha256')
+            or not isinstance(baseline_config_closure, list)
+            or not baseline_config_closure
+            or not isinstance(baseline_mode_authority, Mapping)
+            or set(baseline_mode_authority) != {'flip', 'no_flip'}):
+        raise ValueError(
+            'PWL authority and baseline authority pairing is invalid')
+    try:
+        from .numeric_source import validate_numeric_config_closure
+        current_baseline_closure = list(validate_numeric_config_closure(
+            root, baseline.config))
+    except ValueError as error:
+        raise ValueError(
+            f'PWL baseline config closure is invalid: {error}') from error
+    if baseline_config_closure != current_baseline_closure:
+        raise ValueError('PWL baseline config closure differs from current source')
+
+    observed_baseline_roots = set()
+    observed_pwl_roots = set()
+    expected_baseline_modes = {}
     for mode, row in modes.items():
         if not isinstance(row, Mapping) or set(row) != _MODE_FIELDS:
             raise ValueError(f'PWL Stage-B {mode} row has invalid fields')
@@ -305,6 +400,73 @@ def validate_binary_qk_admission(
                 or pwl_result.seed != pwl.seed
                 or pwl_result.flip_test != (mode == 'flip')):
             raise ValueError(f'{mode} public PWL CandidateResult mismatch')
+        observed_baseline_roots.add(row['baseline_root'])
+        observed_pwl_roots.add(row['candidate_root'])
+        result_baseline_source = _result_mapping(
+            baseline_result, 'source', label=f'{mode} baseline')
+        result_pwl_source = _result_mapping(
+            pwl_result, 'source', label=f'{mode} PWL')
+        baseline_provenance = _result_mapping(
+            baseline_result, 'provenance', label=f'{mode} baseline')
+        pwl_provenance = _result_mapping(
+            pwl_result, 'provenance', label=f'{mode} PWL')
+        baseline_protocol = _result_mapping(
+            baseline_result, 'protocol', label=f'{mode} baseline')
+        pwl_protocol = _result_mapping(
+            pwl_result, 'protocol', label=f'{mode} PWL')
+        baseline_determinism = _result_mapping(
+            baseline_result, 'determinism', label=f'{mode} baseline')
+        pwl_determinism = _result_mapping(
+            pwl_result, 'determinism', label=f'{mode} PWL')
+        expected_pwl_source = {
+            name: pwl_authority[name] for name in _SOURCE_FIELDS}
+        if (
+                _plain_json_value(result_baseline_source) !=
+                _plain_json_value(baseline_source)
+                or _plain_json_value(result_pwl_source) != expected_pwl_source
+                or baseline_provenance.get('checkpoint_sha256') !=
+                baseline.checkpoint_sha256
+                or baseline_provenance.get('config_sha256') !=
+                baseline_source['config_sha256']
+                or baseline_provenance.get('git_commit') !=
+                baseline_source['git_commit']
+                or pwl_provenance.get('checkpoint_sha256') !=
+                pwl.checkpoint_sha256
+                or pwl_provenance.get('config_sha256') !=
+                result_pwl_source['config_sha256']
+                or pwl_provenance.get('git_commit') !=
+                result_pwl_source['git_commit']):
+            raise ValueError(
+                f'{mode} baseline/PWL public source authority is invalid')
+        if (
+                baseline_provenance.get('data_inventory_sha256') !=
+                pwl_provenance.get('data_inventory_sha256')
+                or _paired_projection(
+                    baseline_protocol,
+                    excluded={'source_config', 'checkpoint'}) !=
+                _paired_projection(
+                    pwl_protocol,
+                    excluded={'source_config', 'checkpoint'})
+                or _paired_projection(
+                    baseline_determinism, excluded={'provenance'}) !=
+                _paired_projection(
+                    pwl_determinism, excluded={'provenance'})):
+            raise ValueError(
+                f'{mode} paired baseline/PWL evaluation protocol differs')
+        expected_baseline_modes[mode] = {
+            'artifact_root': row['baseline_root'],
+            'evaluation_sha256': row['baseline_evaluation_sha256'],
+            'provenance_sha256': _canonical_json_sha256(baseline_provenance),
+            'protocol_sha256': _canonical_json_sha256(baseline_protocol),
+            'determinism_sha256': _canonical_json_sha256(
+                baseline_determinism),
+        }
+        recorded_mode_authority = baseline_mode_authority.get(mode)
+        if (
+                not isinstance(recorded_mode_authority, Mapping)
+                or set(recorded_mode_authority) != _BASELINE_MODE_FIELDS):
+            raise ValueError(
+                f'{mode} PWL baseline mode authority is invalid')
         result_profile = getattr(pwl_result, 'profile', None)
         result_parent = (
             result_profile.get('parent')
@@ -328,4 +490,25 @@ def validate_binary_qk_admission(
             raise ValueError(f'{mode} PWL AP drop disagrees with CandidateResult')
         if observed_drop > limit:
             raise ValueError(f'{mode} PWL Stage-B AP drop exceeds 0.3 points')
+    if len(observed_baseline_roots) != 1 or len(observed_pwl_roots) != 1:
+        raise ValueError(
+            'PWL Stage-B modes must use the same artifact root')
+    expected_baseline_authority = {
+        'candidate_id': baseline.id,
+        'candidate_row_sha256': _manifest_candidate_row_sha256(
+            manifest_file, baseline.id),
+        'seed': baseline.seed,
+        'source': _plain_json_value(baseline_source),
+        'checkpoint': {
+            'path': baseline.checkpoint.as_posix(),
+            'sha256': baseline.checkpoint_sha256,
+        },
+        'config_closure': current_baseline_closure,
+        'modes': expected_baseline_modes,
+    }
+    if (
+            _plain_json_value(baseline_authority) !=
+            expected_baseline_authority):
+        raise ValueError(
+            'PWL Stage-B baseline authority disagrees with public evidence')
     return value

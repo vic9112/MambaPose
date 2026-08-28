@@ -295,6 +295,69 @@ def _binding(value: object, *, label: str) -> Mapping[str, Any]:
     return value
 
 
+def _stage_a_config_binding(
+        value: object, *, label: str = 'Stage-A config') -> Mapping[str, Any]:
+    fields = {
+        'path', 'sha256', 'config_closure', 'resolved_config_sha256'}
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError(f'{label} binding is invalid')
+    _binding(
+        {'path': value.get('path'), 'sha256': value.get('sha256')},
+        label=label)
+    closure = value.get('config_closure')
+    if (
+            not isinstance(closure, list) or not closure
+            or any(
+                not isinstance(row, Mapping)
+                or set(row) != {'path', 'sha256'}
+                or not isinstance(row['path'], str) or not row['path']
+                or Path(row['path']).is_absolute()
+                or any(part in {'', '.', '..'}
+                       for part in row['path'].split('/'))
+                or not isinstance(row['sha256'], str)
+                or not _SHA256.fullmatch(row['sha256'])
+                for row in closure)
+            or not isinstance(value.get('resolved_config_sha256'), str)
+            or not _SHA256.fullmatch(value['resolved_config_sha256'])):
+        raise ValueError(f'{label} binding is invalid')
+    return value
+
+
+def _stage_a_config_authority(
+        repository_root: Path, *, candidate: Any,
+        git_commit: str) -> dict[str, Any]:
+    """Rebuild the exact inherited and resolved Binary Stage-A config."""
+    from mmengine.config import Config
+    from .numeric_source import validate_numeric_config_closure
+
+    root = lexical_repository_root(repository_root)
+    try:
+        closure = list(validate_numeric_config_closure(
+            root, candidate.config, git_commit=git_commit))
+    except ValueError as error:
+        raise ValueError(
+            f'Stage-A config closure differs from recorded commit: {error}') \
+            from error
+    direct = next(
+        (row for row in closure if row['path'] == candidate.config.as_posix()),
+        None)
+    if direct is None:
+        raise ValueError('Stage-A config closure omits the direct config')
+    config_path = _relative_file(
+        root, candidate.config.as_posix(), label='Stage-A config')
+    config = Config.fromfile(config_path)
+    serialized = config.dump()
+    if not isinstance(serialized, str):
+        raise ValueError('Stage-A resolved config is not serializable')
+    return {
+        'path': candidate.config.as_posix(),
+        'sha256': direct['sha256'],
+        'config_closure': closure,
+        'resolved_config_sha256': hashlib.sha256(
+            serialized.encode('utf-8')).hexdigest(),
+    }
+
+
 def _validate_smoke_authority(
         value: Mapping[str, Any], *, repository_root: Path) -> None:
     """Rebuild source/checkpoint/PWL authority without loading tensor state."""
@@ -323,13 +386,16 @@ def _validate_smoke_authority(
         manifest_path=manifest, git_commit=str(source.get('git_commit')))
     if dict(source) != expected_source:
         raise ValueError('Stage-A smoke source binding mismatch')
-    config = _binding(value.get('config'), label='Stage-A config')
+    config = _stage_a_config_binding(value.get('config'))
     config_path = _relative_file(
         root, config['path'], label='Stage-A config')
+    expected_config = _stage_a_config_authority(
+        root, candidate=candidate, git_commit=str(source.get('git_commit')))
     if (
             config['path'] != candidate.config.as_posix()
             or config['sha256'] != _sha256(config_path)
-            or config['sha256'] != source['config_sha256']):
+            or config['sha256'] != source['config_sha256']
+            or dict(config) != expected_config):
         raise ValueError('Stage-A smoke config authority mismatch')
     checkpoint = _binding(
         value.get('checkpoint'), label='Stage-A checkpoint')
@@ -367,7 +433,7 @@ def validate_binary_stage_a_artifact(
     }
     if (
             not isinstance(value, Mapping) or set(value) != top_fields
-            or value['schema_version'] != 1
+            or value['schema_version'] != 2
             or value['artifact_kind'] != (
                 'binary-qk-stage-a-full-model-smoke')
             or not isinstance(value['candidate_id'], str)
@@ -389,7 +455,7 @@ def validate_binary_stage_a_artifact(
                     'manifest_sha256', 'config_sha256',
                     'authority_sha256'))):
         raise ValueError('Stage-A smoke source identity is invalid')
-    _binding(value['config'], label='Stage-A config')
+    _stage_a_config_binding(value['config'])
     _binding(value['checkpoint'], label='Stage-A checkpoint')
     _binding(value['pwl_stage_b'], label='Stage-A PWL dependency')
     data = value['data']
@@ -657,6 +723,9 @@ def run_binary_stage_a_smoke(
         raise ValueError('binary smoke requires a binary-qk candidate')
     validate_binary_qk_admission(
         candidate, repository_root=root, manifest_path=manifest_path)
+    config_authority = _stage_a_config_authority(
+        root, candidate=candidate,
+        git_commit=str(authorized.source.get('git_commit')))
     config = Config.fromfile(authorized.config_path)
     loader_config = _smoke_dataloader(config.train_dataloader)
     state = tensor_state(authorized.checkpoint_path)
@@ -705,14 +774,11 @@ def run_binary_stage_a_smoke(
             lease_value = asdict(lease)
             lease_value['allowed_pids'] = list(lease_value['allowed_pids'])
             artifact = {
-                'schema_version': 1,
+                'schema_version': 2,
                 'artifact_kind': 'binary-qk-stage-a-full-model-smoke',
                 'candidate_id': candidate.id,
                 'source': dict(authorized.source),
-                'config': {
-                    'path': candidate.config.as_posix(),
-                    'sha256': _sha256(authorized.config_path),
-                },
+                'config': config_authority,
                 'checkpoint': {
                     'path': candidate.checkpoint.as_posix(),
                     'sha256': candidate.checkpoint_sha256,

@@ -17,6 +17,12 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _json_sha256(value: object) -> str:
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(',', ':'),
+        ensure_ascii=True).encode('utf-8')).hexdigest()
+
+
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, sort_keys=True), encoding='utf-8')
@@ -153,8 +159,107 @@ def _stage_b_fixture(tmp_path: Path, *, candidate_ap: float = 72.6):
         },
         'operation_manifest_sha256': '8' * 64,
     }
+    baseline_source = {
+        'git_commit': pwl_authority['git_commit'],
+        'manifest_path': pwl_authority['manifest_path'],
+        'manifest_sha256': pwl_authority['manifest_sha256'],
+        'config_path': baseline.config.as_posix(),
+        'config_sha256': _sha256(root / baseline.config),
+        'authority_path': pwl_authority['authority_path'],
+        'authority_sha256': pwl_authority['authority_sha256'],
+    }
+    pwl_source = {
+        name: pwl_authority[name]
+        for name in (
+            'git_commit', 'manifest_path', 'manifest_sha256', 'config_path',
+            'config_sha256', 'authority_path', 'authority_sha256')
+    }
+    result_authority = {}
+    result_rows = {}
+    for mode in ('flip', 'no_flip'):
+        baseline_provenance = {
+            'checkpoint_sha256': baseline.checkpoint_sha256,
+            'config_sha256': baseline_source['config_sha256'],
+            'data_inventory_sha256': '9' * 64,
+            'git_commit': baseline_source['git_commit'],
+        }
+        pwl_provenance = {
+            **baseline_provenance,
+            'config_sha256': pwl_source['config_sha256'],
+        }
+        shared_protocol = {
+            'dataset': 'coco', 'split': 'val2017',
+            'complete_split': True,
+            'authority_path': baseline_source['authority_path'],
+            'authority_sha256': baseline_source['authority_sha256'],
+            'data_inventory_sha256': '9' * 64,
+            'detections_sha256': 'a' * 64,
+            'evaluator': 'mmpose.CocoMetric',
+            'tta': {'mode': mode, 'flip_test': mode == 'flip'},
+        }
+        baseline_protocol = {
+            **shared_protocol,
+            'source_config': baseline.config.as_posix(),
+            'checkpoint': baseline.checkpoint.as_posix(),
+        }
+        pwl_protocol = {
+            **shared_protocol,
+            'source_config': pwl.config.as_posix(),
+            'checkpoint': pwl.checkpoint.as_posix(),
+        }
+        baseline_determinism = {
+            'python_seed': 0, 'numpy_seed': 0, 'torch_seed': 0,
+            'worker_count': 2, 'persistent_workers': False,
+            'order_hashes': {'0': 'b' * 64},
+            'provenance': baseline_provenance,
+        }
+        pwl_determinism = {
+            **baseline_determinism,
+            'provenance': pwl_provenance,
+        }
+        result_rows[('baseline', mode)] = {
+            'source': baseline_source,
+            'provenance': baseline_provenance,
+            'protocol': baseline_protocol,
+            'determinism': baseline_determinism,
+        }
+        result_rows[('candidate', mode)] = {
+            'source': pwl_source,
+            'provenance': pwl_provenance,
+            'protocol': pwl_protocol,
+            'determinism': pwl_determinism,
+        }
+        result_authority[mode] = {
+            'artifact_root': modes[mode]['baseline_root'],
+            'evaluation_sha256': modes[mode][
+                'baseline_evaluation_sha256'],
+            'provenance_sha256': _json_sha256(baseline_provenance),
+            'protocol_sha256': _json_sha256(baseline_protocol),
+            'determinism_sha256': _json_sha256(baseline_determinism),
+        }
+    baseline_authority = {
+        'candidate_id': baseline.id,
+        'candidate_row_sha256': _json_sha256({
+            'id': baseline.id, 'route': baseline.route,
+            'kind': baseline.kind, 'config': baseline.config.as_posix(),
+            'checkpoint': baseline.checkpoint.as_posix(),
+            'checkpoint_sha256': baseline.checkpoint_sha256,
+            'seed': baseline.seed, 'features': dict(baseline.features),
+        }),
+        'seed': baseline.seed,
+        'source': baseline_source,
+        'checkpoint': {
+            'path': baseline.checkpoint.as_posix(),
+            'sha256': baseline.checkpoint_sha256,
+        },
+        'config_closure': [{
+            'path': baseline.config.as_posix(),
+            'sha256': _sha256(root / baseline.config),
+        }],
+        'modes': result_authority,
+    }
     gate = {
-        'schema_version': 2,
+        'schema_version': 3,
         'artifact_kind': 'pwl-stage-b-pass',
         'decision': 'passed',
         'ap_drop_limit_points': 0.3,
@@ -165,6 +270,7 @@ def _stage_b_fixture(tmp_path: Path, *, candidate_ap: float = 72.6):
             'sha256': _sha256(root / pwl.config),
             'function': 'gelu',
         },
+        'baseline_authority': baseline_authority,
         'pwl_authority': pwl_authority,
         'modes': modes,
     }
@@ -190,18 +296,21 @@ def _stage_b_fixture(tmp_path: Path, *, candidate_ap: float = 72.6):
     })
     results = {}
     for mode in ('flip', 'no_flip'):
+        baseline_row = result_rows[('baseline', mode)]
+        candidate_row = result_rows[('candidate', mode)]
         results[(roots['baseline'].resolve(), mode)] = SimpleNamespace(
             candidate_id=baseline.id, route=baseline.route,
             candidate_kind=baseline.kind, seed=baseline.seed,
             flip_test=mode == 'flip', metrics=SimpleNamespace(ap=72.8),
             profile={'parent': {'config': baseline.config.as_posix()}},
-            pwl_authority=None)
+            pwl_authority=None, **baseline_row)
         results[(roots['candidate'].resolve(), mode)] = SimpleNamespace(
             candidate_id=pwl.id, route=pwl.route,
             candidate_kind=pwl.kind, seed=pwl.seed,
             flip_test=mode == 'flip', metrics=SimpleNamespace(ap=candidate_ap),
             profile={'parent': {'config': pwl.config.as_posix()}},
-            pwl_authority=json.loads(json.dumps(pwl_authority)))
+            pwl_authority=json.loads(json.dumps(pwl_authority)),
+            **candidate_row)
 
     def load_result(result_root: Path, *, mode: str):
         return results[(Path(result_root).resolve(), mode)]
@@ -776,7 +885,7 @@ def test_stage_a_artifact_contract_binds_full_model_training_evidence(
     exported.parent.mkdir(parents=True)
     exported.write_bytes(b'tensor-only-export')
     value = {
-        'schema_version': 1,
+        'schema_version': 2,
         'artifact_kind': 'binary-qk-stage-a-full-model-smoke',
         'candidate_id': 'binary-qk-s-v1',
         'source': {
@@ -788,8 +897,15 @@ def test_stage_a_artifact_contract_binds_full_model_training_evidence(
             'authority_path': 'optimization/coco_val2017_authority.json',
             'authority_sha256': '2' * 64,
         },
-        'config': {'path': 'configs/optimization/numeric/binary_qk.py',
-                   'sha256': 'b' * 64},
+        'config': {
+            'path': 'configs/optimization/numeric/binary_qk.py',
+            'sha256': 'b' * 64,
+            'config_closure': [{
+                'path': 'configs/optimization/numeric/binary_qk.py',
+                'sha256': 'b' * 64,
+            }],
+            'resolved_config_sha256': '3' * 64,
+        },
         'checkpoint': {
             'path': ('work_dirs/reproduction/runs/coco-s-v1/'
                      'best_coco_AP_epoch_300.pth'),
@@ -867,6 +983,96 @@ def test_stage_a_artifact_contract_binds_full_model_training_evidence(
     assert authority_calls == [value]
 
 
+def test_stage_a_config_authority_binds_inherited_closure_and_resolved_hash(
+        tmp_path):
+    from mambapose_opt.binary_smoke import _stage_a_config_authority
+    from mambapose_opt.schema import CandidateSpec
+
+    root = tmp_path / 'repo'
+    config = root / 'configs/binary.py'
+    inherited = root / 'configs/base.py'
+    inherited.parent.mkdir(parents=True)
+    inherited.write_text('model = dict(type="Canonical")\n', encoding='utf-8')
+    config.write_text(
+        "_base_ = ['./base.py']\nqk_mode = 'binary'\n", encoding='utf-8')
+    subprocess.run(['git', 'init', '-q'], cwd=root, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'test@example.invalid'],
+        cwd=root, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.name', 'Test'], cwd=root, check=True)
+    subprocess.run(['git', 'add', 'configs'], cwd=root, check=True)
+    subprocess.run(['git', 'commit', '-qm', 'fixture'], cwd=root, check=True)
+    commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
+    candidate = CandidateSpec.from_dict({
+        'id': 'binary-qk-s-v1', 'route': 'ssm-quant-pwl',
+        'kind': 'binary-qk', 'config': 'configs/binary.py',
+        'checkpoint': 'weights/model.pth',
+        'checkpoint_sha256': 'a' * 64, 'seed': 0,
+        'features': {'numeric_kind': 'binary-qk', 'conditional': True},
+    })
+
+    authority = _stage_a_config_authority(
+        root, candidate=candidate, git_commit=commit)
+
+    assert authority['config_closure'] == [
+        {'path': 'configs/base.py', 'sha256': _sha256(inherited)},
+        {'path': 'configs/binary.py', 'sha256': _sha256(config)},
+    ]
+    assert len(authority['resolved_config_sha256']) == 64
+    inherited.write_text('model = dict(type="Alternate")\n', encoding='utf-8')
+    subprocess.run(['git', 'add', 'configs/base.py'], cwd=root, check=True)
+    subprocess.run(['git', 'commit', '-qm', 'change base'], cwd=root, check=True)
+
+    with pytest.raises(ValueError, match='recorded commit|closure'):
+        _stage_a_config_authority(root, candidate=candidate, git_commit=commit)
+
+
+def test_stage_a_rejects_config_authority_before_checkpoint_load(
+        tmp_path, monkeypatch):
+    from mambapose_opt.binary_smoke import run_binary_stage_a_smoke
+    from mambapose_opt.schema import CandidateSpec
+
+    root = tmp_path / 'repo'
+    root.mkdir()
+    candidate = CandidateSpec.from_dict({
+        'id': 'binary-qk-s-v1', 'route': 'ssm-quant-pwl',
+        'kind': 'binary-qk', 'config': 'configs/binary.py',
+        'checkpoint': 'weights/model.pth',
+        'checkpoint_sha256': 'a' * 64, 'seed': 0,
+        'features': {'numeric_kind': 'binary-qk', 'conditional': True},
+    })
+    authorized = SimpleNamespace(
+        candidate=candidate, config_path=root / candidate.config,
+        checkpoint_path=root / candidate.checkpoint,
+        source={'git_commit': 'b' * 40})
+    monkeypatch.setattr(
+        'mambapose_opt.checkpoints.authorize_manifest_candidate',
+        lambda *args, **kwargs: authorized)
+    monkeypatch.setattr(
+        'mambapose_opt.binary_readiness.validate_binary_qk_admission',
+        lambda *args, **kwargs: {'decision': 'passed'})
+    monkeypatch.setattr(
+        'mambapose_opt.binary_smoke._stage_a_config_authority',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError('inherited config closure mismatch')))
+    checkpoint_called = []
+    monkeypatch.setattr(
+        'mambapose_opt.checkpoints.tensor_state',
+        lambda *args, **kwargs: checkpoint_called.append(True))
+
+    with pytest.raises(ValueError, match='inherited config closure'):
+        run_binary_stage_a_smoke(
+            repository_root=root, manifest_path=root / 'manifest.json',
+            candidate_id=candidate.id,
+            output_relative=(
+                'work_dirs/optimization/ssm-quant-pwl/binary-qk-s-v1/0/'
+                'smoke-stage-a'),
+            device_index=0)
+    assert checkpoint_called == []
+
+
 def test_binary_stage_a_smoke_cli_is_directly_executable():
     result = subprocess.run(
         [sys.executable, 'tools/optimization/smoke_binary_qk.py', '--help'],
@@ -902,9 +1108,30 @@ def test_binary_smoke_cli_parser_rejects_dot_alias():
 
 def _pareto_fixture(
         tmp_path, monkeypatch, drops, *, baseline_id='full-s-v1'):
+    from mmengine.config import Config
+    from mambapose_opt.numeric_source import validate_numeric_config_closure
+
     roots = {'baseline': {}, 'candidate': {}}
     results = {}
+    authority_path = tmp_path / 'optimization/coco_val2017_authority.json'
+    formal_manifest = tmp_path / 'optimization/formal_stage_c.json'
+    initialization = tmp_path / (
+        'pretrained/vssm_tiny_0230_ckpt_epoch_262.pth')
+    paired_base = tmp_path / 'configs/formal/paired_base.py'
+    _write_json(authority_path, {'dataset': 'coco', 'split': 'val2017'})
+    _write_json(formal_manifest, {
+        'schema_version': 1,
+        'experiment_id': 'mambapose-formal-stage-c',
+    })
+    initialization.parent.mkdir(parents=True)
+    initialization.write_bytes(b'vmamba-t-imagenet-initialization')
+    paired_base.parent.mkdir(parents=True)
+    paired_base.write_text(
+        'train_cfg = dict(max_epochs=300)\n', encoding='utf-8')
+
     for seed, drop in enumerate(drops):
+        manifest_path = tmp_path / f'optimization/candidates-seed{seed}.json'
+        candidate_rows = []
         for kind, candidate_id, ap in (
                 ('baseline', baseline_id, 72.8),
                 ('candidate', 'binary-qk-s-v1', 72.8 - drop)):
@@ -914,31 +1141,299 @@ def _pareto_fixture(
             evaluation = artifact_root / 'evaluate/evaluate.json'
             profile = artifact_root / 'profile/profile.json'
             latency = artifact_root / 'latency/latency.json'
+            config = tmp_path / f'configs/formal/{kind}_seed{seed}.py'
+            config.write_text(
+                "_base_ = ['./paired_base.py']\n"
+                f"formal_role = '{kind}'\nseed = {seed}\n",
+                encoding='utf-8')
+            checkpoint = artifact_root / 'train/best.pth'
+            resume_299 = artifact_root / 'train/epoch_299.pth'
+            resume_300 = artifact_root / 'train/epoch_300.pth'
+            structured_log = artifact_root / 'train/train.jsonl'
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_bytes(f'{kind}-{seed}-best'.encode())
+            resume_299.write_bytes(f'{kind}-{seed}-299'.encode())
+            resume_300.write_bytes(f'{kind}-{seed}-300'.encode())
+            structured_log.write_text(
+                json.dumps({'epoch': 300}) + '\n', encoding='utf-8')
             for path, stage in (
                     (evaluation, 'evaluate'), (profile, 'profile'),
                     (latency, 'latency')):
                 _write_json(path, {'stage': stage, 'seed': seed})
             roots[kind][seed] = relative.as_posix()
-            results[(artifact_root.resolve(), 'flip')] = SimpleNamespace(
-                candidate_id=candidate_id,
-                candidate_kind=('float' if kind == 'baseline' else 'binary-qk'),
-                route=('baseline' if kind == 'baseline' else 'ssm-quant-pwl'),
-                seed=seed, flip_test=True, metrics=SimpleNamespace(ap=ap),
-                source={'git_commit': 'a' * 40, 'authority_sha256': 'b' * 64},
-                binary_operation=(
-                    None if kind == 'baseline' else _valid_operation_manifest()),
-                artifact_paths={
-                    'evaluation': evaluation.resolve(),
-                    'profile': profile.resolve(),
-                    'latency': latency.resolve(),
-                })
+            candidate_kind = (
+                'float' if kind == 'baseline' else 'binary-qk')
+            route = (
+                'baseline' if kind == 'baseline' else 'ssm-quant-pwl')
+            checkpoint_relative = checkpoint.relative_to(tmp_path).as_posix()
+            row = {
+                'id': candidate_id, 'route': route, 'kind': candidate_kind,
+                'config': config.relative_to(tmp_path).as_posix(),
+                'checkpoint': checkpoint_relative,
+                'checkpoint_sha256': _sha256(checkpoint), 'seed': seed,
+                'features': {},
+            }
+            candidate_rows.append(row)
+            source = {
+                'git_commit': 'a' * 40,
+                'manifest_path': manifest_path.relative_to(tmp_path).as_posix(),
+                'manifest_sha256': '',
+                'config_path': config.relative_to(tmp_path).as_posix(),
+                'config_sha256': _sha256(config),
+                'authority_path': authority_path.relative_to(tmp_path).as_posix(),
+                'authority_sha256': _sha256(authority_path),
+            }
+            provenance = {
+                'checkpoint_sha256': _sha256(checkpoint),
+                'config_sha256': _sha256(config),
+                'data_inventory_sha256': 'b' * 64,
+                'git_commit': source['git_commit'],
+            }
+            mode_rows = {}
+            for mode in ('flip', 'no_flip'):
+                protocol = {
+                    'dataset': 'coco', 'split': 'val2017',
+                    'complete_split': True,
+                    'authority_path': source['authority_path'],
+                    'authority_sha256': source['authority_sha256'],
+                    'data_inventory_sha256': 'b' * 64,
+                    'detections_sha256': 'c' * 64,
+                    'evaluator': 'mmpose.CocoMetric',
+                    'tta': {'mode': mode, 'flip_test': mode == 'flip'},
+                    'source_config': source['config_path'],
+                    'checkpoint': checkpoint_relative,
+                }
+                determinism = {
+                    'python_seed': seed, 'numpy_seed': seed,
+                    'torch_seed': seed, 'worker_count': 2,
+                    'persistent_workers': False,
+                    'order_hashes': {'0': f'{seed + 1:x}' * 64},
+                    'provenance': provenance,
+                }
+                mode_rows[mode] = (protocol, determinism)
+                results[(artifact_root.resolve(), mode)] = SimpleNamespace(
+                    candidate_id=candidate_id,
+                    candidate_kind=candidate_kind, route=route,
+                    seed=seed, flip_test=mode == 'flip',
+                    metrics=SimpleNamespace(ap=ap), source=source,
+                    provenance=provenance, protocol=protocol,
+                    determinism=determinism,
+                    binary_operation=(
+                        None if kind == 'baseline'
+                        else _valid_operation_manifest()),
+                    artifact_paths={
+                        'evaluation': evaluation.absolute(),
+                        'profile': profile.absolute(),
+                        'latency': latency.absolute(),
+                    })
+            formal_dir = artifact_root / 'formal'
+            run_init = formal_dir / 'run-init.json'
+            train_result = formal_dir / 'train-result.json'
+            formal_authority = formal_dir / 'formal-authority.json'
+            closure = list(validate_numeric_config_closure(
+                tmp_path, config.relative_to(tmp_path)))
+            base_closure = list(validate_numeric_config_closure(
+                tmp_path, paired_base.relative_to(tmp_path)))
+            resolved_sha = hashlib.sha256(
+                Config.fromfile(config).dump().encode('utf-8')).hexdigest()
+            run_init_value = {
+                'schema_version': 1,
+                'artifact_kind': 'mambapose-formal-stage-c-pareto-run-init',
+                'candidate': {
+                    'candidate_id': candidate_id,
+                    'candidate_kind': candidate_kind,
+                    'route': route, 'seed': seed,
+                    'role': 'baseline' if kind == 'baseline' else 'candidate',
+                },
+                'source': {
+                    **source,
+                    'candidate_row_sha256': '',
+                    'formal_manifest_path': formal_manifest.relative_to(
+                        tmp_path).as_posix(),
+                    'formal_manifest_sha256': _sha256(formal_manifest),
+                },
+                'initialization': {
+                    'id': 'vmamba-t-imagenet-262',
+                    'path': initialization.relative_to(tmp_path).as_posix(),
+                    'sha256': _sha256(initialization),
+                },
+                'config': {
+                    'path': source['config_path'],
+                    'config_closure': closure,
+                    'resolved_config_sha256': resolved_sha,
+                    'paired_base_config_path': paired_base.relative_to(
+                        tmp_path).as_posix(),
+                    'paired_base_config_closure': base_closure,
+                },
+                'protocol': {
+                    'epochs': 300, 'effective_batch_size': 128,
+                    'per_device_batch_size': 128, 'world_size': 1,
+                    'accumulation_steps': 1, 'worker_count': 2,
+                    'persistent_workers': False, 'deterministic': True,
+                    'environment_inventory_sha256': 'd' * 64,
+                    'evaluator': 'mmpose.CocoMetric',
+                    'tta_modes': {'flip': True, 'no_flip': False},
+                    'data_authority': {
+                        'authority_path': source['authority_path'],
+                        'authority_sha256': source['authority_sha256'],
+                        'data_inventory_sha256': 'b' * 64,
+                        'detections_sha256': 'c' * 64,
+                    },
+                },
+            }
+            _write_json(run_init, run_init_value)
+            train_value = {
+                'schema_version': 1,
+                'artifact_kind': 'mambapose-formal-stage-c-pareto-train-result',
+                'candidate': dict(run_init_value['candidate']),
+                'run_init': {
+                    'path': run_init.relative_to(tmp_path).as_posix(),
+                    'sha256': _sha256(run_init),
+                },
+                'status': 'complete', 'final_epoch': 300,
+                'best_checkpoint': {
+                    'path': checkpoint_relative,
+                    'sha256': _sha256(checkpoint),
+                },
+                'resume_checkpoints': [
+                    {'path': item.relative_to(tmp_path).as_posix(),
+                     'sha256': _sha256(item)}
+                    for item in (resume_299, resume_300)
+                ],
+                'structured_log': {
+                    'path': structured_log.relative_to(tmp_path).as_posix(),
+                    'sha256': _sha256(structured_log),
+                },
+                'order_hashes': [f'{index:064x}' for index in range(300)],
+            }
+            _write_json(train_result, train_value)
+            flip_protocol, flip_determinism = mode_rows['flip']
+            no_flip_protocol, no_flip_determinism = mode_rows['no_flip']
+            authority_value = {
+                'schema_version': 1,
+                'artifact_kind': 'mambapose-formal-stage-c-pareto-authority',
+                'candidate': dict(run_init_value['candidate']),
+                'run_init': {
+                    'path': run_init.relative_to(tmp_path).as_posix(),
+                    'sha256': _sha256(run_init),
+                },
+                'train_result': {
+                    'path': train_result.relative_to(tmp_path).as_posix(),
+                    'sha256': _sha256(train_result),
+                },
+                'evaluation': {
+                    'artifact': {
+                        'path': evaluation.relative_to(tmp_path).as_posix(),
+                        'sha256': _sha256(evaluation),
+                    },
+                    'evaluator': 'mmpose.CocoMetric',
+                    'modes': {
+                        'flip': {
+                            'protocol_sha256': _json_sha256(flip_protocol),
+                            'determinism_sha256': _json_sha256(
+                                flip_determinism),
+                        },
+                        'no_flip': {
+                            'protocol_sha256': _json_sha256(no_flip_protocol),
+                            'determinism_sha256': _json_sha256(
+                                no_flip_determinism),
+                        },
+                    },
+                },
+            }
+            _write_json(formal_authority, authority_value)
+            for mode in ('flip', 'no_flip'):
+                results[(artifact_root.resolve(), mode)].artifact_paths[
+                    'formal_authority'] = formal_authority.absolute()
+
+        _write_json(manifest_path, {
+            'schema_version': 1, 'candidates': candidate_rows})
+        manifest_sha = _sha256(manifest_path)
+        for kind in ('baseline', 'candidate'):
+            artifact_root = tmp_path / roots[kind][seed]
+            result = results[(artifact_root.resolve(), 'flip')]
+            for mode in ('flip', 'no_flip'):
+                results[(artifact_root.resolve(), mode)].source[
+                    'manifest_sha256'] = manifest_sha
+            run_init = artifact_root / 'formal/run-init.json'
+            run_value = json.loads(run_init.read_text(encoding='utf-8'))
+            run_value['source']['manifest_sha256'] = manifest_sha
+            row = next(
+                item for item in candidate_rows
+                if item['id'] == result.candidate_id)
+            run_value['source']['candidate_row_sha256'] = _json_sha256(row)
+            _write_json(run_init, run_value)
+            train_result = artifact_root / 'formal/train-result.json'
+            train_value = json.loads(train_result.read_text(encoding='utf-8'))
+            train_value['run_init']['sha256'] = _sha256(run_init)
+            _write_json(train_result, train_value)
+            formal_authority = artifact_root / 'formal/formal-authority.json'
+            authority_value = json.loads(
+                formal_authority.read_text(encoding='utf-8'))
+            authority_value['run_init']['sha256'] = _sha256(run_init)
+            authority_value['train_result']['sha256'] = _sha256(train_result)
+            _write_json(formal_authority, authority_value)
 
     def load_result(root, *, mode='flip'):
         return results[(Path(root).resolve(), mode)]
 
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'test@example.invalid'],
+        cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.name', 'Test'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'add', 'configs', 'optimization', 'pretrained'],
+        cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '-qm', 'formal source fixture'],
+        cwd=tmp_path, check=True)
+    commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=tmp_path, text=True).strip()
+    for kind in ('baseline', 'candidate'):
+        for seed, relative in roots[kind].items():
+            artifact_root = tmp_path / relative
+            for mode in ('flip', 'no_flip'):
+                result = results[(artifact_root.resolve(), mode)]
+                result.source['git_commit'] = commit
+                result.provenance['git_commit'] = commit
+            run_init = artifact_root / 'formal/run-init.json'
+            run_value = json.loads(run_init.read_text(encoding='utf-8'))
+            run_value['source']['git_commit'] = commit
+            _write_json(run_init, run_value)
+            formal_authority = artifact_root / 'formal/formal-authority.json'
+            authority_value = json.loads(
+                formal_authority.read_text(encoding='utf-8'))
+            authority_value['evaluation']['modes'] = {
+                mode: {
+                    'protocol_sha256': _json_sha256(
+                        results[(artifact_root.resolve(), mode)].protocol),
+                    'determinism_sha256': _json_sha256(
+                        results[(artifact_root.resolve(), mode)].determinism),
+                }
+                for mode in ('flip', 'no_flip')
+            }
+            _write_json(formal_authority, authority_value)
+            _rebind_formal_fixture(artifact_root)
+
     monkeypatch.setattr(
         'mambapose_opt.pareto.CandidateResult.from_artifacts', load_result)
+    roots['results'] = results
     return roots
+
+
+def _rebind_formal_fixture(artifact_root: Path) -> None:
+    run_init = artifact_root / 'formal/run-init.json'
+    train_result = artifact_root / 'formal/train-result.json'
+    formal_authority = artifact_root / 'formal/formal-authority.json'
+    train_value = json.loads(train_result.read_text(encoding='utf-8'))
+    train_value['run_init']['sha256'] = _sha256(run_init)
+    _write_json(train_result, train_value)
+    authority_value = json.loads(formal_authority.read_text(encoding='utf-8'))
+    authority_value['run_init']['sha256'] = _sha256(run_init)
+    authority_value['train_result']['sha256'] = _sha256(train_result)
+    _write_json(formal_authority, authority_value)
 
 
 def test_final_pareto_rules_include_binary_without_speedup_overclaim(
@@ -951,11 +1446,91 @@ def test_final_pareto_rules_include_binary_without_speedup_overclaim(
         candidate_id='binary-qk-s-v1', repository_root=tmp_path,
         baseline_roots=roots['baseline'], candidate_roots=roots['candidate'])
 
+    assert record['schema_version'] == 3
     assert record['decision'] == 'pareto-eligible'
     assert record['statistics']['paired_sample_stddev_points'] == pytest.approx(
         0.01)
     assert record['statistics']['paired_95_ci_points'][1] < 0.1
     assert record['hardware_evidence']['speedup_claim'] == 'none-software-proxy'
+    assert all(
+        len(row['paired_formal_authority_sha256']) == 64
+        for row in record['seeds'])
+
+
+@pytest.mark.parametrize(
+    ('field_path', 'replacement'),
+    [
+        (('source', 'manifest_sha256'), '9' * 64),
+        (('initialization', 'id'), 'alternate-initialization'),
+        (('config', 'resolved_config_sha256'), '9' * 64),
+        (('protocol', 'epochs'), 299),
+        (('protocol', 'effective_batch_size'), 64),
+        (('protocol', 'worker_count'), 3),
+        (('protocol', 'persistent_workers'), True),
+        (('protocol', 'deterministic'), False),
+        (('protocol', 'environment_inventory_sha256'), '9' * 64),
+        (('protocol', 'evaluator'), 'alternate.Evaluator'),
+        (('protocol', 'tta_modes'), {'flip': False, 'no_flip': False}),
+        (('protocol', 'data_authority', 'detections_sha256'), '9' * 64),
+    ],
+)
+def test_final_pareto_rejects_mismatched_formal_stage_c_run_authority(
+        tmp_path, monkeypatch, field_path, replacement):
+    from mambapose_opt.pareto import build_final_pareto_record
+
+    roots = _pareto_fixture(tmp_path, monkeypatch, [0.05, 0.06, 0.04])
+    candidate_root = tmp_path / roots['candidate'][0]
+    run_init = candidate_root / 'formal/run-init.json'
+    value = json.loads(run_init.read_text(encoding='utf-8'))
+    target = value
+    for field in field_path[:-1]:
+        target = target[field]
+    target[field_path[-1]] = replacement
+    _write_json(run_init, value)
+    _rebind_formal_fixture(candidate_root)
+
+    with pytest.raises(ValueError, match='formal|paired'):
+        build_final_pareto_record(
+            candidate_id='binary-qk-s-v1', repository_root=tmp_path,
+            baseline_roots=roots['baseline'],
+            candidate_roots=roots['candidate'])
+
+
+def test_final_pareto_rejects_mismatched_formal_training_order_hash(
+        tmp_path, monkeypatch):
+    from mambapose_opt.pareto import build_final_pareto_record
+
+    roots = _pareto_fixture(tmp_path, monkeypatch, [0.05, 0.06, 0.04])
+    candidate_root = tmp_path / roots['candidate'][0]
+    train_result = candidate_root / 'formal/train-result.json'
+    value = json.loads(train_result.read_text(encoding='utf-8'))
+    value['order_hashes'][42] = '9' * 64
+    _write_json(train_result, value)
+    _rebind_formal_fixture(candidate_root)
+
+    with pytest.raises(ValueError, match='formal paired'):
+        build_final_pareto_record(
+            candidate_id='binary-qk-s-v1', repository_root=tmp_path,
+            baseline_roots=roots['baseline'],
+            candidate_roots=roots['candidate'])
+
+
+def test_final_pareto_rejects_symlinked_candidate_result_child(
+        tmp_path, monkeypatch):
+    from mambapose_opt.pareto import build_final_pareto_record
+
+    roots = _pareto_fixture(tmp_path, monkeypatch, [0.05, 0.06, 0.04])
+    baseline_root = tmp_path / roots['baseline'][0]
+    evaluation = baseline_root / 'evaluate/evaluate.json'
+    real = baseline_root / 'evaluate/real-evaluate.json'
+    evaluation.rename(real)
+    evaluation.symlink_to(real)
+
+    with pytest.raises(ValueError, match='symlink'):
+        build_final_pareto_record(
+            candidate_id='binary-qk-s-v1', repository_root=tmp_path,
+            baseline_roots=roots['baseline'],
+            candidate_roots=roots['candidate'])
 
 
 def test_final_pareto_three_seed_ci_intersection_requires_seeds_three_and_four(
@@ -1035,6 +1610,79 @@ def _rebind_gate(binary, gate_path: Path, root: Path):
         'pwl_stage_b_artifact': gate_path.relative_to(root).as_posix(),
         'pwl_stage_b_sha256': _sha256(gate_path),
     }))
+
+
+@pytest.mark.parametrize(
+    ('section', 'field', 'replacement'),
+    [
+        ('source', 'git_commit', '9' * 40),
+        ('source', 'manifest_sha256', '9' * 64),
+        ('source', 'authority_sha256', '9' * 64),
+        ('provenance', 'checkpoint_sha256', '9' * 64),
+        ('protocol', 'evaluator', 'alternate.Evaluator'),
+        ('determinism', 'order_hashes', {'0': '9' * 64}),
+    ],
+)
+def test_binary_admission_recomputes_full_baseline_result_authority(
+        tmp_path, monkeypatch, section, field, replacement):
+    """No individually valid but stale baseline may control the PWL AP drop."""
+    from mambapose_opt.binary_readiness import validate_binary_qk_admission
+
+    root, manifest, binary, _, load_result = _stage_b_fixture(tmp_path)
+    baseline_root = next(
+        key for key in load_result.results
+        if 'full-s-v1' in key[0].as_posix() and key[1] == 'flip')
+    getattr(load_result.results[baseline_root], section)[field] = replacement
+    monkeypatch.setattr(
+        'mambapose_opt.binary_readiness.CandidateResult.from_artifacts',
+        load_result)
+
+    with pytest.raises(ValueError, match='baseline|paired'):
+        validate_binary_qk_admission(
+            binary, repository_root=root, manifest_path=manifest)
+
+
+def test_binary_admission_rejects_different_baseline_roots_across_modes(
+        tmp_path, monkeypatch):
+    from mambapose_opt.binary_readiness import validate_binary_qk_admission
+
+    root, manifest, binary, gate, load_result = _stage_b_fixture(tmp_path)
+    original_root = root / gate['modes']['flip']['baseline_root']
+    alternate_root = original_root.with_name('0-alternate')
+    evaluation = alternate_root / 'evaluate/evaluate.json'
+    _write_json(evaluation, {'fixture': 'alternate-baseline'})
+    original_result = load_result.results[(original_root.resolve(), 'no_flip')]
+    load_result.results[(alternate_root.resolve(), 'no_flip')] = SimpleNamespace(
+        **vars(original_result))
+    gate['modes']['no_flip']['baseline_root'] = (
+        alternate_root.relative_to(root).as_posix())
+    gate['modes']['no_flip']['baseline_evaluation_sha256'] = _sha256(evaluation)
+    gate_path = root / binary.features['pwl_stage_b_artifact']
+    _write_json(gate_path, gate)
+    claimed = _rebind_gate(binary, gate_path, root)
+    monkeypatch.setattr(
+        'mambapose_opt.binary_readiness.CandidateResult.from_artifacts',
+        load_result)
+
+    with pytest.raises(ValueError, match='same artifact root'):
+        validate_binary_qk_admission(
+            claimed, repository_root=root, manifest_path=manifest)
+
+
+def test_binary_admission_rejects_symlinked_manifest_alias(
+        tmp_path, monkeypatch):
+    from mambapose_opt.binary_readiness import validate_binary_qk_admission
+
+    root, manifest, binary, _, load_result = _stage_b_fixture(tmp_path)
+    alias = manifest.with_name('manifest-alias.json')
+    alias.symlink_to(manifest)
+    monkeypatch.setattr(
+        'mambapose_opt.binary_readiness.CandidateResult.from_artifacts',
+        load_result)
+
+    with pytest.raises(ValueError, match='manifest.*symlink'):
+        validate_binary_qk_admission(
+            binary, repository_root=root, manifest_path=alias)
 
 
 def test_binary_admission_rejects_relative_path_escape(tmp_path):

@@ -320,7 +320,7 @@ class OptimizationController:
             except ValueError as error:
                 raise ArtifactValidationError(
                     f'binary Stage-A smoke artifact is invalid: {error}') from error
-            return 'binary-qk-stage-a-full-model-smoke-v1'
+            return 'binary-qk-stage-a-full-model-smoke-v2'
         if stage == 'calibrate' and self.candidate.route == 'ssm-quant-pwl':
             try:
                 from .numeric_calibration import validate_calibration_provenance
