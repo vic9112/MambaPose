@@ -496,6 +496,8 @@ class FormalRunInit:
     persistent_workers: bool
     output_root: Path
     initialization: InitializationAuthority
+    output_root_device: int | None = None
+    output_root_inode: int | None = None
 
     @classmethod
     def from_dict(
@@ -551,6 +553,7 @@ class FormalRunInit:
         run_fields = frozenset({
             'run_id', 'role', 'seed', 'epochs', 'effective_batch_size',
             'worker_count', 'persistent_workers', 'output_root',
+            'output_root_device', 'output_root_inode',
         })
         _require_exact_fields(run, run_fields, 'run')
         run_id, role, seed = _parse_run_identity(run)
@@ -580,6 +583,10 @@ class FormalRunInit:
             run['effective_batch_size'], 'effective_batch_size', minimum=1)
         if effective_batch_size != 128:
             raise FormalManifestError('formal effective batch must be 128')
+        output_root_device = _require_int(
+            run['output_root_device'], 'output root device', minimum=1)
+        output_root_inode = _require_int(
+            run['output_root_inode'], 'output root inode', minimum=1)
         closure_sha256 = _require_sha256(
             config['closure_sha256'], 'config closure SHA-256')
         try:
@@ -652,6 +659,8 @@ class FormalRunInit:
             persistent_workers=False,
             output_root=output_root,
             initialization=initialization,
+            output_root_device=output_root_device,
+            output_root_inode=output_root_inode,
         )
 
 
@@ -676,7 +685,9 @@ class FormalTrainResult:
             repository_root: Path | str,
             verify_files: bool = False,
             run_init: FormalRunInit | None = None,
-            expected_run_init_sha256: str | None = None) -> FormalTrainResult:
+            expected_run_init_sha256: str | None = None,
+            _final_epoch_commit_payload: bytes | None = None
+            ) -> FormalTrainResult:
         document = _require_mapping(value, 'train result')
         root = Path(repository_root).resolve(strict=False)
         fields = frozenset({
@@ -740,7 +751,12 @@ class FormalTrainResult:
         if best.path in set(resume_paths):
             raise FormalManifestError(
                 'best checkpoint must not impersonate a resume checkpoint')
-        if not best.path.name.startswith('best_') or best.path.suffix != '.pth':
+        best_match = re.fullmatch(
+            r'best_coco_AP_epoch_([1-9][0-9]*)\.pth', best.path.name)
+        if best_match is None:
+            raise FormalManifestError('best checkpoint path is not canonical')
+        best_epoch = int(best_match.group(1))
+        if best_epoch < 5 or best_epoch > 300 or best_epoch % 5:
             raise FormalManifestError('best checkpoint path is not canonical')
         if log.path != output_root / 'training.jsonl':
             raise FormalManifestError('structured log path is not canonical')
@@ -798,6 +814,13 @@ class FormalTrainResult:
                     or run_init.initialization != initialization):
                 raise FormalManifestError(
                     'train result does not match run init authority')
+
+        _verify_final_epoch_commit_best(
+            root, output_root=output_root, run_id=run_id, role=role,
+            seed=seed, run_init_sha256=run_init_sha256,
+            best=best, latest_resume=resume[1], structured_log=log,
+            final_order_sha256=order_hashes[-1],
+            captured_payload=_final_epoch_commit_payload)
 
         return cls(
             run_init_sha256=run_init_sha256,
@@ -1858,3 +1881,127 @@ def _verify_file(root: Path, binding: FileBinding, field: str) -> None:
             digest.update(block)
     if digest.hexdigest() != binding.sha256:
         raise FormalManifestError(f'{field} SHA-256 mismatch')
+
+
+def _read_internal_regular_nofollow(
+        root: Path, relative: Path, field: str) -> bytes:
+    if relative.is_absolute() or not relative.parts or any(
+            part in {'', '.', '..'} for part in relative.parts):
+        raise FormalManifestError(f'{field} path is not canonical')
+    flags = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+             | getattr(os, 'O_CLOEXEC', 0))
+    descriptor = None
+    try:
+        descriptor = os.open('/', flags)
+        for component in root.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        for component in relative.parts[:-1]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        file_fd = os.open(
+            relative.name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0),
+            dir_fd=descriptor)
+        try:
+            before = os.fstat(file_fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise FormalManifestError(f'{field} is not a regular file')
+            chunks: list[bytes] = []
+            while True:
+                block = os.read(file_fd, 1024 * 1024)
+                if not block:
+                    break
+                chunks.append(block)
+            after = os.fstat(file_fd)
+            if (before.st_dev, before.st_ino, before.st_size,
+                    before.st_mtime_ns) != (
+                    after.st_dev, after.st_ino, after.st_size,
+                    after.st_mtime_ns):
+                raise FormalManifestError(f'{field} changed during read')
+            return b''.join(chunks)
+        finally:
+            os.close(file_fd)
+    except FormalManifestError:
+        raise
+    except OSError as error:
+        raise FormalManifestError(f'{field} is unavailable') from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _verify_final_epoch_commit_best(
+        root: Path, *, output_root: Path, run_id: str,
+        role: Literal['baseline', 'no_pif'], seed: int,
+        run_init_sha256: str, best: FileBinding,
+        latest_resume: FileBinding, structured_log: FileBinding,
+        final_order_sha256: str,
+        captured_payload: bytes | None = None) -> None:
+    if captured_payload is not None and not isinstance(
+            captured_payload, bytes):
+        raise FormalManifestError(
+            'captured final epoch commit must be bytes')
+    relative = output_root / 'epoch-commits/epoch_300.json'
+    payload = (captured_payload if captured_payload is not None else
+               _read_internal_regular_nofollow(
+                   root, relative, 'final epoch commit'))
+    try:
+        document = json.loads(payload.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FormalManifestError('final epoch commit is malformed') from error
+    fields = {
+        'schema_version', 'identity', 'completed_epoch', 'checkpoint',
+        'structured_log', 'log_record', 'best', 'previous_commit'}
+    if not isinstance(document, Mapping) or set(document) != fields \
+            or document['schema_version'] != 1 \
+            or document['completed_epoch'] != 300:
+        raise FormalManifestError('final epoch commit fields are invalid')
+    if document['identity'] != {
+            'run_id': run_id, 'role': role, 'seed': seed,
+            'run_init_sha256': run_init_sha256}:
+        raise FormalManifestError('final epoch commit identity is invalid')
+    if document['checkpoint'] != {
+            'path': latest_resume.path.name,
+            'sha256': latest_resume.sha256}:
+        raise FormalManifestError(
+            'final epoch commit resume authority is invalid')
+    if document['structured_log'] != {
+            'path': structured_log.path.name,
+            'sha256': structured_log.sha256}:
+        raise FormalManifestError(
+            'final epoch commit log authority is invalid')
+    expected_record = {
+        'schema_version': 1, 'run_id': run_id, 'role': role, 'seed': seed,
+        'epoch': 300, 'order_sha256': final_order_sha256,
+        'resume_checkpoint': latest_resume.path.name,
+        'resume_sha256': latest_resume.sha256}
+    if document['log_record'] != expected_record:
+        raise FormalManifestError(
+            'final epoch commit log record is invalid')
+    authority = document['best']
+    if not isinstance(authority, Mapping) or set(authority) != {
+            'decision', 'checkpoint'} \
+            or authority['checkpoint'] != {
+                'path': best.path.name, 'sha256': best.sha256}:
+        raise FormalManifestError(
+            'final epoch commit best authority mismatch')
+    decision = authority['decision']
+    best_epoch = int(re.fullmatch(
+        r'best_coco_AP_epoch_([1-9][0-9]*)\.pth', best.path.name).group(1))
+    if not isinstance(decision, Mapping) or set(decision) != {
+            'path', 'sha256'} or decision['path'] != (
+                f'best-lineages/epoch_{best_epoch}.json') \
+            or not isinstance(decision['sha256'], str) \
+            or _SHA256.fullmatch(decision['sha256']) is None:
+        raise FormalManifestError(
+            'final epoch commit best decision is invalid')
+    previous = document['previous_commit']
+    if not isinstance(previous, Mapping) or set(previous) != {
+            'path', 'sha256'} or previous['path'] != 'epoch_299.json' \
+            or not isinstance(previous['sha256'], str) \
+            or _SHA256.fullmatch(previous['sha256']) is None:
+        raise FormalManifestError(
+            'final epoch commit predecessor is invalid')

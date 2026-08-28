@@ -5,10 +5,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import io
 import os
 from pathlib import Path, PurePosixPath
 import stat
-import tempfile
 from types import MappingProxyType
 from typing import Any, Iterator, Mapping
 
@@ -17,14 +17,6 @@ import torch
 
 class FormalCheckpointError(ValueError):
     """A checkpoint is not the exact authenticated tensor artifact."""
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open('rb') as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _sha(value: str, label: str) -> str:
@@ -144,28 +136,14 @@ def _capture_authority_bytes(
         os.close(directory_fd)
 
 
-def _remove_private_tensor_copy(directory: Path, source: Path) -> None:
-    if directory.is_symlink() or not directory.is_dir():
-        raise FormalCheckpointError(
-            'private checkpoint directory is unsafe during cleanup')
-    directory.chmod(0o700)
-    if source.exists():
-        if source.is_symlink() or not source.is_file():
-            raise FormalCheckpointError(
-                'private checkpoint copy is unsafe during cleanup')
-        source.chmod(0o600)
-        source.unlink()
-    directory.rmdir()
-
-
 @contextmanager
 def load_authenticated_tensor_document(
         path: Path, authority: FileAuthority
         ) -> Iterator[Mapping[str, Any]]:
     """Yield one weights-only document from captured authenticated bytes.
 
-    The live authority is opened without following symlinks, copied to a
-    private read-only file, and revalidated after the consumer finishes.
+    The live authority is opened without following symlinks, captured once,
+    and deserialized directly from the authenticated immutable byte sequence.
     """
     if os.environ.get('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD') == '1':
         raise FormalCheckpointError(
@@ -182,49 +160,22 @@ def load_authenticated_tensor_document(
     captured_sha256 = hashlib.sha256(captured).hexdigest()
     if captured_sha256 != authority.sha256:
         raise FormalCheckpointError('checkpoint SHA-256 differs from authority')
-    temporary_root = Path('/tmp')
-    if temporary_root.is_symlink() or not temporary_root.is_dir():
-        raise FormalCheckpointError('private checkpoint root is unsafe')
-    directory = Path(tempfile.mkdtemp(
-        prefix='mambapose-formal-tensor-', dir=temporary_root))
-    source = directory / 'checkpoint.pth'
-    document: Mapping[str, Any] | None = None
     use_error: Exception | None = None
     try:
-        descriptor = os.open(
-            source, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-            0o600)
         try:
-            view = memoryview(captured)
-            while view:
-                written = os.write(descriptor, view)
-                view = view[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        source.chmod(0o400)
-        directory.chmod(0o500)
-        try:
-            loaded = torch.load(
-                source, map_location='cpu', weights_only=True)
+            loaded = torch.load(io.BytesIO(captured), map_location='cpu',
+                                weights_only=True)
         except Exception as error:
             raise FormalCheckpointError(
                 'checkpoint could not be loaded in weights-only mode') from error
         if not isinstance(loaded, Mapping):
             raise FormalCheckpointError('checkpoint must be a mapping')
-        document = loaded
-        yield document
+        yield loaded
     except Exception as error:
         use_error = error
     finally:
         authority_error: Exception | None = None
         try:
-            if source.is_symlink() or not source.is_file() \
-                    or stat.S_IMODE(source.stat().st_mode) != 0o400 \
-                    or stat.S_IMODE(directory.stat().st_mode) != 0o500 \
-                    or _sha256(source) != captured_sha256:
-                raise FormalCheckpointError(
-                    'private checkpoint copy changed during use')
             observed, observed_identity = _capture_authority_bytes(authority)
             if observed_identity != identity \
                     or hashlib.sha256(observed).hexdigest() != captured_sha256:
@@ -232,11 +183,6 @@ def load_authenticated_tensor_document(
                     'checkpoint live authority changed after use')
         except Exception as error:
             authority_error = error
-        try:
-            _remove_private_tensor_copy(directory, source)
-        except Exception as error:
-            if authority_error is None:
-                authority_error = error
         if authority_error is not None:
             if isinstance(authority_error, FormalCheckpointError):
                 raise authority_error

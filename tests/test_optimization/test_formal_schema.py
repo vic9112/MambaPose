@@ -241,6 +241,8 @@ def _run_init_document() -> dict[str, object]:
             'worker_count': 2,
             'persistent_workers': False,
             'output_root': 'work_dirs/optimization/formal-stage-c/full-seed0',
+            'output_root_device': 1,
+            'output_root_inode': 2,
         },
         'initialization': {
             'id': 'vmamba-t-imagenet-262',
@@ -294,6 +296,60 @@ def _train_result_document() -> dict[str, object]:
         'final_epoch': 300,
         'status': 'complete',
     }
+
+
+def _write_final_epoch_commit(
+        repository_root: Path, document: dict[str, object], *,
+        best_path: str | None = None, best_sha256: str | None = None) -> Path:
+    output = repository_root / document['run']['output_root']
+    commits = output / 'epoch-commits'
+    commits.mkdir(parents=True, exist_ok=True)
+    best = document['best_checkpoint']
+    commit = {
+        'schema_version': 1,
+        'identity': {
+            'run_id': document['run']['run_id'],
+            'role': document['run']['role'],
+            'seed': document['run']['seed'],
+            'run_init_sha256': document['run_init_sha256'],
+        },
+        'completed_epoch': 300,
+        'checkpoint': {
+            'path': 'epoch_300.pth',
+            'sha256': document['resume_checkpoints'][1]['sha256'],
+        },
+        'structured_log': {
+            'path': 'training.jsonl',
+            'sha256': document['structured_log']['sha256'],
+        },
+        'log_record': {
+            'schema_version': 1,
+            'run_id': document['run']['run_id'],
+            'role': document['run']['role'],
+            'seed': document['run']['seed'],
+            'epoch': 300,
+            'order_sha256': document['order_hashes'][-1]['sha256'],
+            'resume_checkpoint': 'epoch_300.pth',
+            'resume_sha256': document['resume_checkpoints'][1]['sha256'],
+        },
+        'best': {
+            'decision': {
+                'path': 'best-lineages/epoch_300.json',
+                'sha256': _sha(b'decision-300'),
+            },
+            'checkpoint': {
+                'path': best_path or Path(best['path']).name,
+                'sha256': best_sha256 or best['sha256'],
+            },
+        },
+        'previous_commit': {
+            'path': 'epoch_299.json',
+            'sha256': _sha(b'commit-299'),
+        },
+    }
+    path = commits / 'epoch_300.json'
+    path.write_text(json.dumps(commit, sort_keys=True) + '\n')
+    return path
 
 
 def test_manifest_requires_exact_paired_seed_matrix(tmp_path):
@@ -777,6 +833,39 @@ def test_train_result_rejects_best_checkpoint_as_resume():
         FormalTrainResult.from_dict(document, repository_root=ROOT)
 
 
+@pytest.mark.parametrize(
+    'name', [
+        'best_unversioned.pth',
+        'best_coco_AP_epoch_0.pth',
+        'best_coco_AP_epoch_4.pth',
+        'best_coco_AP_epoch_301.pth',
+        'best_coco_AP_epoch_299.pth',
+    ],
+)
+def test_train_result_requires_versioned_best_on_validation_cadence(name):
+    document = _train_result_document()
+    output = document['run']['output_root']
+    document['best_checkpoint']['path'] = f'{output}/{name}'
+    with pytest.raises(FormalManifestError, match='best checkpoint.*canonical'):
+        FormalTrainResult.from_dict(document, repository_root=ROOT)
+
+
+def test_train_result_binds_best_to_final_epoch_commit(tmp_path):
+    document = _train_result_document()
+    _write_final_epoch_commit(tmp_path, document)
+    parsed = FormalTrainResult.from_dict(
+        document, repository_root=tmp_path)
+    assert parsed.best_checkpoint.path.name == 'best_coco_AP_epoch_300.pth'
+
+    commit = tmp_path / document['run']['output_root'] \
+        / 'epoch-commits/epoch_300.json'
+    forged = json.loads(commit.read_text())
+    forged['best']['checkpoint']['sha256'] = _sha(b'forged-best')
+    commit.write_text(json.dumps(forged, sort_keys=True) + '\n')
+    with pytest.raises(FormalManifestError, match='final epoch commit.*best'):
+        FormalTrainResult.from_dict(document, repository_root=tmp_path)
+
+
 def test_train_result_rejects_duplicate_order_hashes():
     document = _train_result_document()
     document['order_hashes'][1]['sha256'] = (
@@ -799,22 +888,23 @@ def test_train_result_rejects_nonexistent_or_unhashed_outputs():
             verify_files=True)
 
 
-def test_train_result_rejects_run_init_identity_rebinding():
+def test_train_result_rejects_run_init_identity_rebinding(tmp_path):
     run_init_document = _run_init_document()
     run_init = FormalRunInit.from_dict(
         run_init_document, repository_root=ROOT)
     run_init_sha256 = formal_schema.canonical_json_sha256(run_init_document)
     document = _train_result_document()
     document['run_init_sha256'] = run_init_sha256
+    _write_final_epoch_commit(tmp_path, document)
     result = FormalTrainResult.from_dict(
-        document, repository_root=ROOT, run_init=run_init,
+        document, repository_root=tmp_path, run_init=run_init,
         expected_run_init_sha256=run_init_sha256)
     assert result.run_id == run_init.run_id
 
     document['run']['role'] = 'no_pif'
     with pytest.raises(FormalManifestError, match='run init|canonical'):
         FormalTrainResult.from_dict(
-            document, repository_root=ROOT, run_init=run_init,
+            document, repository_root=tmp_path, run_init=run_init,
             expected_run_init_sha256=run_init_sha256)
 
 

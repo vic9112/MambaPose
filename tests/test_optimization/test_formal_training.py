@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import inspect
+import io
 import json
+import os
 from pathlib import Path
 import random
 import stat
@@ -14,10 +17,12 @@ import torch
 
 from mambapose_opt.formal_schema import (
     AssetBinding,
+    FileBinding,
     FormalRunInit,
     FormalRunSpec,
     InitializationAuthority,
     FormalStageCManifest,
+    INITIALIZATION_SHA256,
     config_closure_sha256,
 )
 from mambapose_opt.formal_environment import EnvironmentAuthority
@@ -52,37 +57,38 @@ def _config_init(root: Path) -> FormalRunInit:
         config_closure_sha256=config_closure_sha256(root, config))
 
 
-def test_authenticated_config_parses_captured_closure_during_transient_swap(
+def test_authenticated_config_parses_captured_bytes_without_named_parser(
         tmp_path, monkeypatch):
     configs = tmp_path / 'configs'
     configs.mkdir()
-    (configs / 'base.py').write_text('value = 7\n')
+    (configs / 'base.py').write_text(
+        "value = 7\n"
+        "nested = dict(keep=1, replace=2, erased=dict(old=1))\n")
     leaf = configs / 'leaf.py'
-    leaf.write_text("_base_ = ['./base.py']\nanswer = 11\n")
+    leaf.write_text(
+        "_base_ = ['./base.py']\n"
+        "answer = value = 11\n"
+        "nested = dict(replace=3, erased=dict(_delete_=True, new=4))\n")
     init = _config_init(tmp_path)
     monkeypatch.setattr(
         formal_training, '_validate_frozen_source', lambda _root: init.git_commit)
     from mmengine.config import Config
-    original = Config.fromfile
-    parsed_paths = []
-
-    def transient_swap(path, *args, **kwargs):
-        parsed_paths.append(Path(path))
-        original_bytes = leaf.read_bytes()
-        leaf.write_text("_base_ = ['./base.py']\nanswer = 999\n")
-        try:
-            return original(path, *args, **kwargs)
-        finally:
-            leaf.write_bytes(original_bytes)
-
-    monkeypatch.setattr(Config, 'fromfile', transient_swap)
+    monkeypatch.setattr(
+        Config, 'fromfile',
+        lambda *_args, **_kwargs: pytest.fail('named Config.fromfile used'))
+    monkeypatch.setattr(
+        Config, 'fromstring',
+        lambda *_args, **_kwargs: pytest.fail('named Config.fromstring used'))
     config = load_authenticated_formal_config(init, tmp_path)
-    assert config.answer == 11 and config.value == 7
-    assert parsed_paths and parsed_paths[0] != leaf
-    assert not parsed_paths[0].exists()
+    assert config.answer == 11 and config.value == 11
+    assert config.nested == {
+        'keep': 1, 'replace': 3, 'erased': {'new': 4}}
+    assert config.filename == 'configs/leaf.py'
+    assert "_base_ = ['./base.py']" in config.text
+    assert 'nested = dict(keep=1' in config.text
 
 
-def test_authenticated_config_never_follows_repository_snapshot_parent_symlink(
+def test_authenticated_config_never_creates_a_named_private_snapshot(
         tmp_path, monkeypatch):
     configs = tmp_path / 'configs'
     configs.mkdir()
@@ -90,49 +96,26 @@ def test_authenticated_config_never_follows_repository_snapshot_parent_symlink(
     init = _config_init(tmp_path)
     monkeypatch.setattr(
         formal_training, '_validate_frozen_source', lambda _root: init.git_commit)
-    outside = tmp_path / 'outside'
-    outside.mkdir()
-    parent = tmp_path / 'work_dirs/optimization/formal-stage-c'
-    parent.mkdir(parents=True)
-    (parent / '.formal-config-snapshots').symlink_to(outside)
-    from mmengine.config import Config
-    original = Config.fromfile
-    parsed = []
-
-    def observe(path, *args, **kwargs):
-        parsed.append(Path(path))
-        return original(path, *args, **kwargs)
-
-    monkeypatch.setattr(Config, 'fromfile', observe)
+    monkeypatch.setattr(
+        formal_training.tempfile, 'mkdtemp',
+        lambda *_args, **_kwargs: pytest.fail('named snapshot created'))
     assert load_authenticated_formal_config(init, tmp_path).answer == 11
-    assert parsed and outside not in parsed[0].resolve().parents
-    assert not tuple(outside.iterdir())
 
 
-def test_authenticated_config_private_tree_is_readonly_and_swap_fails_closed(
+def test_authenticated_config_rejects_unsupported_import_syntax(
         tmp_path, monkeypatch):
     configs = tmp_path / 'configs'
     configs.mkdir()
-    (configs / 'leaf.py').write_text('answer = 11\n')
+    (configs / 'leaf.py').write_text(
+        'import os\nanswer = os.environ.get("HOME")\n')
     init = _config_init(tmp_path)
     monkeypatch.setattr(
         formal_training, '_validate_frozen_source', lambda _root: init.git_commit)
-    from mmengine.config import Config
-
-    def attack(path, *args, **kwargs):
-        source = Path(path)
-        assert stat.S_IMODE(source.stat().st_mode) == 0o400
-        assert stat.S_IMODE(source.parent.stat().st_mode) == 0o500
-        source.chmod(0o600)
-        source.write_text('answer = 999\n')
-        return Config({'answer': 999})
-
-    monkeypatch.setattr(Config, 'fromfile', attack)
-    with pytest.raises(FormalTrainingError, match='private config snapshot'):
+    with pytest.raises(FormalTrainingError, match='unsupported.*import'):
         load_authenticated_formal_config(init, tmp_path)
 
 
-def test_authenticated_config_is_detached_and_fingerprinted_after_cleanup(
+def test_authenticated_config_is_stable_and_fingerprinted_after_parse(
         tmp_path, monkeypatch):
     configs = tmp_path / 'configs'
     configs.mkdir()
@@ -142,7 +125,8 @@ def test_authenticated_config_is_detached_and_fingerprinted_after_cleanup(
         formal_training, '_validate_frozen_source', lambda _root: init.git_commit)
     config = load_authenticated_formal_config(init, tmp_path)
     first = formal_training._deterministic_config_fingerprint(config.to_dict())
-    assert config.filename is None
+    assert config.filename == 'configs/leaf.py'
+    assert config.text == 'answer = 11\nnested = dict(value=7)\n'
     assert config.answer == 11 and config.nested.value == 7
     assert formal_training._deterministic_config_fingerprint(
         config.to_dict()) == first
@@ -156,7 +140,8 @@ def test_authenticated_config_materializes_real_formal_closure(monkeypatch):
     monkeypatch.setattr(
         formal_training, '_validate_frozen_source', lambda _root: init.git_commit)
     config = load_authenticated_formal_config(init, ROOT)
-    assert config.filename is None
+    assert config.filename == relative.as_posix()
+    assert '_base_' in config.text
     assert config.formal_role == 'baseline' and config.formal_seed == 0
     assert config.train_cfg.max_epochs == 300
     assert config.train_dataloader.num_workers == 2
@@ -176,7 +161,7 @@ def test_authenticated_config_rejects_live_closure_drift_before_capture(
         load_authenticated_formal_config(init, tmp_path)
 
 
-def test_trace_config_uses_captured_manifest_closure_during_transient_swap(
+def test_trace_config_uses_in_memory_manifest_closure(
         tmp_path, monkeypatch):
     configs = tmp_path / 'configs'
     configs.mkdir()
@@ -197,30 +182,68 @@ def test_trace_config_uses_captured_manifest_closure_during_transient_swap(
         formal_training, '_validate_trace_source', lambda _root: '2' * 40,
         raising=False)
     from mmengine.config import Config
-    original = Config.fromfile
-
-    def transient_swap(path, *args, **kwargs):
-        original_bytes = leaf.read_bytes()
-        leaf.write_text("_base_ = ['./base.py']\nanswer = 999\n")
-        try:
-            return original(path, *args, **kwargs)
-        finally:
-            leaf.write_bytes(original_bytes)
-
-    monkeypatch.setattr(Config, 'fromfile', transient_swap)
+    monkeypatch.setattr(
+        Config, 'fromfile',
+        lambda *_args, **_kwargs: pytest.fail('named Config.fromfile used'))
+    monkeypatch.setattr(
+        Config, 'fromstring',
+        lambda *_args, **_kwargs: pytest.fail('named Config.fromstring used'))
     config = formal_training.load_authenticated_trace_config(
         manifest, 'full-seed0', tmp_path)
-    assert config.filename is None
+    assert config.filename == 'configs/leaf.py'
     assert config.answer == 11 and config.value == 7
+
+
+def test_authenticated_config_rejects_same_byte_parent_replacement(
+        tmp_path, monkeypatch):
+    configs = tmp_path / 'configs'
+    configs.mkdir()
+    (configs / 'base.py').write_text('value = 7\n')
+    (configs / 'leaf.py').write_text(
+        "_base_ = ['./base.py']\nanswer = 11\n")
+    init = _config_init(tmp_path)
+    monkeypatch.setattr(
+        formal_training, '_validate_frozen_source', lambda _root: init.git_commit)
+    original_capture = formal_training._capture_config_closure
+    attacked = False
+
+    def replace_after_capture(*args, **kwargs):
+        nonlocal attacked
+        records = original_capture(*args, **kwargs)
+        if attacked:
+            return records
+        attacked = True
+        original = tmp_path / 'configs-original'
+        configs.rename(original)
+        configs.mkdir()
+        for source in original.iterdir():
+            (configs / source.name).write_bytes(source.read_bytes())
+        return records
+
+    monkeypatch.setattr(
+        formal_training, '_capture_config_closure', replace_after_capture)
+    with pytest.raises(FormalTrainingError, match='directory authority|changed'):
+        load_authenticated_formal_config(init, tmp_path)
+
+
+def test_formal_config_source_has_one_in_memory_parser_boundary():
+    source = inspect.getsource(formal_training)
+    assert 'Config.fromfile' not in source
+    assert 'Config.fromstring' not in source
+    assert 'mambapose-formal-config-' not in source
 
 
 def test_production_model_callers_never_parse_live_config_path_directly():
     import inspect
 
-    for function in (
-            formal_training.run_formal_model_preflight,
-            formal_training.train_formal_candidate):
-        source = inspect.getsource(function)
+    call_paths = (
+        (formal_training.run_formal_model_preflight,),
+        (formal_training.train_formal_candidate,
+         formal_training._prepare_and_train_formal_candidate_held),
+    )
+    for functions in call_paths:
+        source = '\n'.join(inspect.getsource(function)
+                           for function in functions)
         assert 'Config.fromfile' not in source
         assert 'load_authenticated_formal_config' in source
 
@@ -228,7 +251,11 @@ def test_production_model_callers_never_parse_live_config_path_directly():
 def test_training_never_reinitializes_after_safe_load_or_uses_generic_resume():
     import inspect
 
-    source = inspect.getsource(formal_training.train_formal_candidate)
+    source = '\n'.join((
+        inspect.getsource(formal_training.train_formal_candidate),
+        inspect.getsource(formal_training._prepare_and_train_formal_candidate_held),
+        inspect.getsource(formal_training._train_formal_candidate_held),
+    ))
     assert 'runner.train()' not in source
     assert 'load_or_resume' not in source
     assert '_run_authenticated_training_loop' in source
@@ -237,7 +264,7 @@ def test_training_never_reinitializes_after_safe_load_or_uses_generic_resume():
 def test_production_training_recovers_before_resume_choice_and_has_no_fixed_best():
     import inspect
 
-    source = inspect.getsource(formal_training.train_formal_candidate)
+    source = inspect.getsource(formal_training._train_formal_candidate_held)
     assert source.index('recover_training_lineage(') < source.index(
         'if resume_path is None')
     assert 'best_coco_AP.pth' not in source
@@ -367,6 +394,28 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _inject_authority_failure_once(
+        monkeypatch, method_name: str, relative: str, message: str, *,
+        after: bool = False):
+    original = getattr(formal_training._FormalOutputAuthority, method_name)
+    failed = False
+
+    def fail_once(self, target, *args, **kwargs):
+        nonlocal failed
+        matches = Path(target).as_posix() == relative
+        if matches and not failed and not after:
+            failed = True
+            raise OSError(message)
+        result = original(self, target, *args, **kwargs)
+        if matches and not failed and after:
+            failed = True
+            raise OSError(message)
+        return result
+
+    monkeypatch.setattr(
+        formal_training._FormalOutputAuthority, method_name, fail_once)
+
+
 def _run_init(output_root='work_dirs/optimization/formal-stage-c/full-seed0'):
     return FormalRunInit(
         manifest_sha256='1' * 64,
@@ -400,6 +449,81 @@ def test_run_init_write_is_atomic_idempotent_and_mismatch_closed(tmp_path):
     assert not tuple(tmp_path.glob('*.tmp'))
     with pytest.raises(FormalTrainingError, match='immutable'):
         write_formal_run_init(replace(init, seed=1), destination)
+
+
+def test_run_init_publish_rejects_output_root_replacement_without_victim_write(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    destination = output / 'run-init.json'
+    held_output = tmp_path / 'run-held'
+    original = formal_training._canonical_json_bytes
+    attacked = False
+
+    def replace_after_output_stat(value):
+        nonlocal attacked
+        payload = original(value)
+        if not attacked and output.is_dir():
+            attacked = True
+            output.rename(held_output)
+            output.mkdir()
+        return payload
+
+    monkeypatch.setattr(
+        formal_training, '_canonical_json_bytes', replace_after_output_stat)
+    with pytest.raises(FormalTrainingError, match='authority|changed'):
+        write_formal_run_init(init, destination)
+    assert not tuple(output.iterdir())
+    assert held_output.is_dir()
+
+
+def test_run_init_immutable_link_race_never_overwrites_competitor(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    destination = tmp_path / 'run/run-init.json'
+    original = formal_training.os.link
+    hostile = b'competitor\n'
+    attacked = False
+
+    def race_link(source, target, *args, **kwargs):
+        nonlocal attacked
+        if not attacked and target == 'run-init.json':
+            attacked = True
+            descriptor = os.open(
+                target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                dir_fd=kwargs['dst_dir_fd'])
+            os.write(descriptor, hostile)
+            os.close(descriptor)
+        return original(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(formal_training.os, 'link', race_link)
+    with pytest.raises(FormalTrainingError, match='immutable'):
+        write_formal_run_init(init, destination)
+    assert destination.read_bytes() == hostile
+
+
+def test_run_init_publish_never_unlinks_replaced_foreign_pending(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    destination = output / 'run-init.json'
+    original = formal_training.os.link
+    foreign = b'foreign-pending'
+
+    def replace_pending_before_link(source, target, *args, **kwargs):
+        if source == '.run-init.json.pending':
+            os.unlink(source, dir_fd=kwargs['src_dir_fd'])
+            descriptor = os.open(
+                source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                dir_fd=kwargs['src_dir_fd'])
+            os.write(descriptor, foreign)
+            os.close(descriptor)
+        return original(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(formal_training.os, 'link', replace_pending_before_link)
+    with pytest.raises(FormalTrainingError, match='publication|pending'):
+        write_formal_run_init(init, destination)
+    assert (output / '.run-init.json.pending').read_bytes() == foreign
 
 
 def test_all_ten_run_inits_are_built_before_publication(monkeypatch):
@@ -474,6 +598,202 @@ def test_resume_epoch_commit_binds_checkpoint_and_complete_structured_log(
     assert state.structured_log_sha256 == _sha(log)
 
 
+def test_formal_output_authority_holds_original_root_across_replacement(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    held_output = tmp_path / 'run-held'
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        output.rename(held_output)
+        output.mkdir()
+        authority.write_immutable(Path('epoch_1.pth'), b'partial')
+        with pytest.raises(FormalTrainingError, match='output.*authority'):
+            authority.revalidate()
+        assert not tuple(output.iterdir())
+        assert (held_output / 'epoch_1.pth').read_bytes() == b'partial'
+    assert authority.closed
+
+
+def test_formal_output_authority_immutable_publish_never_overwrites(tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        authority.write_immutable(Path('epoch_1.pth'), b'first')
+        with pytest.raises(FormalTrainingError, match='immutable'):
+            authority.write_immutable(Path('epoch_1.pth'), b'second')
+        assert authority.read_regular(Path('epoch_1.pth')) == b'first'
+
+
+def test_immutable_publish_never_unlinks_replaced_foreign_pending(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    original = formal_training.os.link
+    foreign = b'foreign-pending'
+
+    def replace_pending_before_link(source, target, *args, **kwargs):
+        if source == '.epoch_1.pth.pending':
+            os.unlink(source, dir_fd=kwargs['src_dir_fd'])
+            descriptor = os.open(
+                source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                dir_fd=kwargs['src_dir_fd'])
+            os.write(descriptor, foreign)
+            os.close(descriptor)
+        return original(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(formal_training.os, 'link', replace_pending_before_link)
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='pending|publication'):
+            authority.write_immutable(Path('epoch_1.pth'), b'ours')
+    assert (output / '.epoch_1.pth.pending').read_bytes() == foreign
+
+
+def test_mutable_publish_detects_pending_replacement_before_replace(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    original = formal_training.os.replace
+    foreign = b'foreign-pending'
+
+    def replace_pending(source, target, *args, **kwargs):
+        if source == '.training.jsonl.pending':
+            os.unlink(source, dir_fd=kwargs['src_dir_fd'])
+            descriptor = os.open(
+                source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                dir_fd=kwargs['src_dir_fd'])
+            os.write(descriptor, foreign)
+            os.close(descriptor)
+        return original(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(formal_training.os, 'replace', replace_pending)
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='pending|publication'):
+            authority.write_mutable(Path('training.jsonl'), b'ours')
+    assert (output / 'training.jsonl').read_bytes() == foreign
+
+
+def test_formal_output_authority_holds_cached_child_directory(tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    held_commits = output / 'epoch-commits-held'
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        authority.mkdir(Path('epoch-commits'))
+        (output / 'epoch-commits').rename(held_commits)
+        (output / 'epoch-commits').mkdir()
+        authority.write_immutable(
+            Path('epoch-commits/epoch_1.json'), b'{}\n')
+        with pytest.raises(FormalTrainingError, match='output.*authority'):
+            authority.revalidate()
+        assert not tuple((output / 'epoch-commits').iterdir())
+        assert (held_commits / 'epoch_1.json').read_bytes() == b'{}\n'
+
+
+def test_formal_output_authority_rejects_forked_mutation_and_closes_fds(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    authority = formal_training._FormalOutputAuthority(tmp_path, init)
+    descriptor = authority.output_fd
+    read_end, write_end = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_end)
+        try:
+            authority.write_immutable(Path('child.pth'), b'forbidden')
+        except FormalTrainingError:
+            os.write(write_end, b'rejected')
+        else:
+            os.write(write_end, b'accepted')
+        finally:
+            os.close(write_end)
+            os._exit(0)
+    os.close(write_end)
+    observed = os.read(read_end, 32)
+    os.close(read_end)
+    os.waitpid(child, 0)
+    assert observed == b'rejected'
+    assert not (output / 'child.pth').exists()
+    authority.close()
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    assert not tuple(formal_training._ACTIVE_FORMAL_OUTPUT_AUTHORITIES)
+
+
+def test_private_runner_staging_cleanup_is_fd_bound_and_victim_safe(tmp_path):
+    staging = formal_training._PrivateRunnerStaging('full-seed0')
+    assert stat.S_IMODE(staging.path.stat().st_mode) == 0o700
+    (staging.path / 'runner.log').write_bytes(b'log')
+    held = tmp_path / 'held-staging'
+    staging.path.rename(held)
+    victim = tmp_path / 'victim'
+    victim.mkdir()
+    (victim / 'valuable.bin').write_bytes(b'valuable')
+    staging.path.symlink_to(victim, target_is_directory=True)
+    with pytest.raises(FormalTrainingError, match='staging authority'):
+        staging.cleanup()
+    assert (held / 'runner.log').read_bytes() == b'log'
+    assert (victim / 'valuable.bin').read_bytes() == b'valuable'
+
+
+def test_private_runner_staging_normal_cleanup_and_fork_fd_closure():
+    staging = formal_training._PrivateRunnerStaging('full-seed0')
+    path = staging.path
+    (path / 'runner.log').write_bytes(b'log')
+    read_end, write_end = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_end)
+        try:
+            os.fstat(staging._directory_fd)
+        except OSError:
+            os.write(write_end, b'closed')
+        else:
+            os.write(write_end, b'open')
+        finally:
+            os.close(write_end)
+            os._exit(0)
+    os.close(write_end)
+    observed = os.read(read_end, 16)
+    os.close(read_end)
+    os.waitpid(child, 0)
+    assert observed == b'closed'
+    staging.cleanup()
+    assert not path.exists()
+    assert not tuple(formal_training._ACTIVE_PRIVATE_RUNNER_STAGINGS)
+
+
+def test_public_recovery_rejects_preexisting_same_byte_output_replacement(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    original = tmp_path / 'run-original'
+    output.rename(original)
+    output.mkdir()
+    (output / 'run-init.json').write_bytes(
+        (original / 'run-init.json').read_bytes())
+    with pytest.raises(FormalTrainingError, match='output.*(identity|mismatch)'):
+        recover_training_lineage(tmp_path, init, dataset_size=11)
+    (output / 'run-init.json').unlink()
+    output.rmdir()
+    original.rename(output)
+    assert recover_training_lineage(
+        tmp_path, init, dataset_size=11) is None
+
+
 @pytest.mark.parametrize('failure_target', [
     'training.jsonl', 'epoch-commits/epoch_2.json'])
 def test_epoch_transaction_failure_recovers_previous_committed_boundary(
@@ -488,18 +808,11 @@ def test_epoch_transaction_failure_recovers_previous_committed_boundary(
         model_state={'weight': torch.ones(1)}, optimizer_state={},
         scheduler_state={}, scaler_state={}, order_hashes=orders[:1],
         dataset_size=11)
-    original = formal_training._atomic_write_bytes
-    failed = False
-
-    def fail_once(destination, payload):
-        nonlocal failed
-        if not failed and Path(destination).relative_to(output).as_posix() \
-                == failure_target:
-            failed = True
-            raise OSError('injected durable boundary failure')
-        return original(destination, payload)
-
-    monkeypatch.setattr(formal_training, '_atomic_write_bytes', fail_once)
+    method = ('write_mutable' if failure_target == 'training.jsonl'
+              else 'write_immutable')
+    _inject_authority_failure_once(
+        monkeypatch, method, failure_target,
+        'injected durable boundary failure')
     with pytest.raises(OSError, match='injected'):
         write_resume_checkpoint(
             repository_root=tmp_path, expected=init, completed_epoch=2,
@@ -528,17 +841,8 @@ def test_durable_epoch_commit_precedes_prune_and_survives_prune_failure(
             model_state={'weight': torch.full((1,), float(epoch))},
             optimizer_state={}, scheduler_state={}, scaler_state={},
             order_hashes=orders[:epoch], dataset_size=11)
-    original = formal_training._durable_unlink
-    failed = False
-
-    def fail_once(path):
-        nonlocal failed
-        if not failed and Path(path).name == 'epoch_1.pth':
-            failed = True
-            raise OSError('injected prune failure')
-        return original(path)
-
-    monkeypatch.setattr(formal_training, '_durable_unlink', fail_once)
+    _inject_authority_failure_once(
+        monkeypatch, 'unlink', 'epoch_1.pth', 'injected prune failure')
     with pytest.raises(OSError, match='prune'):
         write_resume_checkpoint(
             repository_root=tmp_path, expected=init, completed_epoch=3,
@@ -567,30 +871,10 @@ def test_checkpoint_publication_failure_retains_previous_committed_boundary(
         model_state={'weight': torch.ones(1)}, optimizer_state={},
         scheduler_state={}, scaler_state={}, order_hashes=orders[:1],
         dataset_size=11)
-    failed = False
-    if boundary == 'replace':
-        original_replace = formal_training.os.replace
-
-        def fail_once(source, destination):
-            nonlocal failed
-            if not failed and Path(destination) == output / 'epoch_2.pth':
-                failed = True
-                raise OSError('injected checkpoint replace failure')
-            return original_replace(source, destination)
-
-        monkeypatch.setattr(formal_training.os, 'replace', fail_once)
-    else:
-        original_fsync = formal_training._fsync_directory
-
-        def fail_once(directory):
-            nonlocal failed
-            if not failed and Path(directory) == output \
-                    and (output / 'epoch_2.pth').exists():
-                failed = True
-                raise OSError('injected checkpoint parent fsync failure')
-            return original_fsync(directory)
-
-        monkeypatch.setattr(formal_training, '_fsync_directory', fail_once)
+    _inject_authority_failure_once(
+        monkeypatch, 'write_immutable', 'epoch_2.pth',
+        'injected checkpoint publication failure',
+        after=(boundary == 'parent_fsync'))
     with pytest.raises(OSError, match='checkpoint'):
         write_resume_checkpoint(
             repository_root=tmp_path, expected=init, completed_epoch=2,
@@ -619,6 +903,325 @@ def test_epoch_recovery_rejects_non_next_or_multiple_uncommitted_artifacts(
     (output / 'epoch_3.pth').write_bytes(b'unknown')
     with pytest.raises(FormalTrainingError, match='uncommitted'):
         recover_training_lineage(tmp_path, init, dataset_size=11)
+
+
+def test_epoch_recovery_removes_only_exact_next_fixed_pending(tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    write_resume_checkpoint(
+        repository_root=tmp_path, expected=init, completed_epoch=1,
+        model_state={'weight': torch.ones(1)}, optimizer_state={},
+        scheduler_state={}, scaler_state={},
+        order_hashes=trace_epoch_orders(init, 1, dataset_size=11),
+        dataset_size=11)
+    pending = output / '.epoch_2.pth.pending'
+    pending.write_bytes(b'partial')
+    recovered = recover_training_lineage(tmp_path, init, dataset_size=11)
+    assert recovered is not None and recovered.completed_epoch == 1
+    assert not pending.exists()
+
+
+def test_epoch_recovery_rejects_unknown_or_multiple_fixed_pending(tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    write_resume_checkpoint(
+        repository_root=tmp_path, expected=init, completed_epoch=1,
+        model_state={'weight': torch.ones(1)}, optimizer_state={},
+        scheduler_state={}, scaler_state={},
+        order_hashes=trace_epoch_orders(init, 1, dataset_size=11),
+        dataset_size=11)
+    (output / '.epoch_7.pth.pending').write_bytes(b'unknown')
+    with pytest.raises(FormalTrainingError, match='pending'):
+        recover_training_lineage(tmp_path, init, dataset_size=11)
+
+
+@pytest.mark.parametrize(
+    ('relative', 'payload'), (
+        (Path('epoch_1.pth'), b'checkpoint'),
+        (Path('best_coco_AP_epoch_5.pth'), b'best'),
+        (Path('epoch-commits/epoch_1.json'), b'commit\n'),
+        (Path('best-lineages/epoch_5.json'), b'decision\n'),
+        (Path('train-result.json'), b'result\n'),
+    ))
+def test_recovery_finishes_linked_immutable_pending_publication(
+        tmp_path, relative, payload):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        if len(relative.parts) > 1:
+            authority.mkdir(relative.parent)
+        authority.write_immutable(relative, payload)
+        parent = output / relative.parent
+        pending = parent / f'.{relative.name}.pending'
+        os.link(output / relative, pending)
+        formal_training._recover_linked_pending_publications(
+            authority,
+            committed=(300 if relative == Path('train-result.json')
+                       else None))
+        assert not pending.exists()
+        assert (output / relative).read_bytes() == payload
+
+
+def test_recovery_rejects_foreign_final_for_immutable_pending_without_unlink(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    final = output / 'epoch_1.pth'
+    pending = output / '.epoch_1.pth.pending'
+    final.write_bytes(b'foreign-final')
+    pending.write_bytes(b'our-pending')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='pending.*publication'):
+            formal_training._recover_linked_pending_publications(authority)
+    assert final.read_bytes() == b'foreign-final'
+    assert pending.read_bytes() == b'our-pending'
+
+
+@pytest.mark.parametrize('second_name', (
+    '.evil.pending', '.best-lineage.json.pending'))
+def test_pending_inventory_rejects_before_mutating_any_member(
+        tmp_path, second_name):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    first = output / '.training.jsonl.pending'
+    second = output / second_name
+    first.write_bytes(b'first')
+    second.write_bytes(b'second')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='pending.*inventory'):
+            formal_training._recover_linked_pending_publications(authority)
+    assert first.read_bytes() == b'first'
+    assert second.read_bytes() == b'second'
+
+
+def test_public_recovery_rejects_pre_final_linked_train_result_without_unlink(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    final = output / 'train-result.json'
+    pending = output / '.train-result.json.pending'
+    final.write_bytes(b'premature\n')
+    os.link(final, pending)
+    with pytest.raises(FormalTrainingError, match='precedes final'):
+        recover_training_lineage(tmp_path, init, dataset_size=11)
+    assert final.read_bytes() == b'premature\n'
+    assert pending.read_bytes() == b'premature\n'
+
+
+def test_public_completed_result_recovers_linked_pending_and_validates_bindings(
+        tmp_path):
+    raw_init = _run_init()
+    init = replace(
+        raw_init,
+        initialization=replace(
+            raw_init.initialization,
+            asset=replace(raw_init.initialization.asset,
+                          sha256=INITIALIZATION_SHA256)))
+    output = tmp_path / init.output_root
+    write_formal_run_init(init, output / 'run-init.json')
+    order_hashes = trace_epoch_orders(init, 300, dataset_size=11)
+    run_init_sha = _sha(output / 'run-init.json')
+    best_name = 'best_coco_AP_epoch_5.pth'
+    (output / best_name).write_bytes(b'best')
+    best_sha = _sha(output / best_name)
+    best_decisions = output / 'best-lineages'
+    best_decisions.mkdir()
+    decision_document = {
+        'schema_version': 1,
+        'identity': {
+            'run_id': init.run_id, 'role': init.role, 'seed': init.seed},
+        'completed_epoch': 5, 'metric': 0.5,
+        'checkpoint': {'path': best_name, 'sha256': best_sha},
+        'previous_decision': None,
+    }
+    decision_path = best_decisions / 'epoch_5.json'
+    decision_path.write_bytes(
+        formal_training._canonical_json_bytes(decision_document))
+    decision_sha = _sha(decision_path)
+    best_authority = {
+        'decision': {
+            'path': 'best-lineages/epoch_5.json', 'sha256': decision_sha},
+        'checkpoint': {'path': best_name, 'sha256': best_sha},
+    }
+    (output / 'best-lineage.json').write_bytes(
+        formal_training._canonical_json_bytes({
+            'schema_version': 1,
+            'decision': best_authority['decision'],
+        }))
+
+    checkpoint_shas = {epoch: hashlib.sha256(
+        f'pruned-checkpoint-{epoch}'.encode()).hexdigest()
+        for epoch in range(1, 299)}
+    for epoch in (299, 300):
+        document = formal_training._resume_document(
+            expected=init, run_init_sha256=run_init_sha,
+            completed_epoch=epoch, order_hashes=order_hashes[:epoch],
+            model_state={'weight': torch.tensor([float(epoch)])},
+            optimizer_state={}, scheduler_state={}, scaler_state={})
+        torch.save(document, output / f'epoch_{epoch}.pth')
+        checkpoint_shas[epoch] = _sha(output / f'epoch_{epoch}.pth')
+
+    commits = output / 'epoch-commits'
+    commits.mkdir()
+    structured_log = b''
+    previous_commit_sha = None
+    for epoch in range(1, 301):
+        record = {
+            'schema_version': 1, 'run_id': init.run_id,
+            'role': init.role, 'seed': init.seed, 'epoch': epoch,
+            'order_sha256': order_hashes[epoch - 1],
+            'resume_checkpoint': f'epoch_{epoch}.pth',
+            'resume_sha256': checkpoint_shas[epoch],
+        }
+        structured_log += formal_training._canonical_json_bytes(record)
+        commit = {
+            'schema_version': 1,
+            'identity': {
+                'run_id': init.run_id, 'role': init.role, 'seed': init.seed,
+                'run_init_sha256': run_init_sha,
+            },
+            'completed_epoch': epoch,
+            'checkpoint': {
+                'path': f'epoch_{epoch}.pth',
+                'sha256': checkpoint_shas[epoch],
+            },
+            'structured_log': {
+                'path': 'training.jsonl',
+                'sha256': hashlib.sha256(structured_log).hexdigest(),
+            },
+            'log_record': record,
+            'best': None if epoch < 5 else best_authority,
+            'previous_commit': (
+                None if epoch == 1 else {
+                    'path': f'epoch_{epoch - 1}.json',
+                    'sha256': previous_commit_sha,
+                }),
+        }
+        commit_path = commits / f'epoch_{epoch}.json'
+        commit_path.write_bytes(
+            formal_training._canonical_json_bytes(commit))
+        previous_commit_sha = _sha(commit_path)
+    (output / 'training.jsonl').write_bytes(structured_log)
+    bindings = {
+        name: FileBinding(
+            path=init.output_root / name,
+            sha256=_sha(output / name))
+        for name in (best_name, 'epoch_299.pth', 'epoch_300.pth',
+                     'training.jsonl')
+    }
+    result = formal_training.FormalTrainResult(
+        run_init_sha256=run_init_sha,
+        initialization=init.initialization, run_id=init.run_id,
+        role=init.role, seed=init.seed, output_root=init.output_root,
+        best_checkpoint=bindings[best_name],
+        resume_checkpoints=(bindings['epoch_299.pth'],
+                            bindings['epoch_300.pth']),
+        structured_log=bindings['training.jsonl'],
+        order_hashes=order_hashes, final_epoch=300, status='complete')
+    result_path = output / 'train-result.json'
+    result_path.write_bytes(formal_training._canonical_json_bytes(
+        formal_training._train_result_document(result)))
+    pending = output / '.train-result.json.pending'
+    os.link(result_path, pending)
+    recovered = formal_training.recover_completed_training_result(
+        tmp_path, init, dataset_size=11)
+    assert recovered == result
+    assert not pending.exists()
+
+
+def test_held_epoch_route_never_uses_pathname_or_legacy_atomic_io(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    orders = trace_epoch_orders(init, 1, dataset_size=11)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail('pathname or legacy atomic I/O entered held route')
+
+    for name in ('read_bytes', 'write_bytes', 'exists', 'iterdir', 'glob'):
+        monkeypatch.setattr(Path, name, forbidden)
+    for name in ('_atomic_write_bytes', '_atomic_torch_save',
+                 '_write_atomic_file_at', '_durable_unlink'):
+        monkeypatch.setattr(formal_training, name, forbidden)
+    monkeypatch.setattr(formal_training.tempfile, 'mkdtemp', forbidden)
+    original_save = torch.save
+    original_load = torch.load
+
+    def bytes_only_save(document, destination, *args, **kwargs):
+        assert isinstance(destination, io.BytesIO)
+        return original_save(document, destination, *args, **kwargs)
+
+    def bytes_only_load(source, *args, **kwargs):
+        assert isinstance(source, io.BytesIO)
+        return original_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(torch, 'save', bytes_only_save)
+    monkeypatch.setattr(torch, 'load', bytes_only_load)
+    checkpoint = write_resume_checkpoint(
+        repository_root=tmp_path, expected=init, completed_epoch=1,
+        model_state={'weight': torch.ones(1)}, optimizer_state={},
+        scheduler_state={}, scaler_state={}, order_hashes=orders,
+        dataset_size=11)
+    recovered = recover_training_lineage(tmp_path, init, dataset_size=11)
+    assert checkpoint.name == 'epoch_1.pth'
+    assert recovered is not None and recovered.completed_epoch == 1
+
+
+def test_run_init_recovers_crash_before_and_after_immutable_link(tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    identity = output.stat().st_dev, output.stat().st_ino
+    payload = formal_training._canonical_json_bytes(
+        formal_training._init_document(init, output_identity=identity))
+    pending = output / '.run-init.json.pending'
+
+    pending.write_bytes(payload)
+    first = write_formal_run_init(init, output / 'run-init.json')
+    assert first.sha256 == hashlib.sha256(payload).hexdigest()
+    assert not pending.exists()
+
+    os.link(output / 'run-init.json', pending)
+    second = write_formal_run_init(init, output / 'run-init.json')
+    assert second == first
+    assert not pending.exists()
+
+
+def test_run_init_pending_mismatch_and_foreign_final_fail_without_unlink(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    pending = output / '.run-init.json.pending'
+    pending.write_bytes(b'wrong')
+    with pytest.raises(FormalTrainingError, match='pending'):
+        write_formal_run_init(init, output / 'run-init.json')
+    assert pending.read_bytes() == b'wrong'
+
+    pending.unlink()
+    identity = output.stat().st_dev, output.stat().st_ino
+    payload = formal_training._canonical_json_bytes(
+        formal_training._init_document(init, output_identity=identity))
+    pending.write_bytes(payload)
+    (output / 'run-init.json').write_bytes(payload)
+    with pytest.raises(FormalTrainingError, match='pending.*publication'):
+        write_formal_run_init(init, output / 'run-init.json')
+    assert pending.read_bytes() == payload
+    assert (output / 'run-init.json').read_bytes() == payload
 
 
 def _publish_test_best(tmp_path, init, epoch, metric):
@@ -673,21 +1276,9 @@ def test_best_pointer_failure_retains_previous_committed_best(
         scheduler_state={}, scaler_state={}, order_hashes=orders,
         dataset_size=11, best_decision_path=first_decision)
     first_best = output / 'best_coco_AP_epoch_1.pth'
-    original = formal_training._write_atomic_file_at
-    failed = False
-
-    def fail_pointer(directory_fd, destination_name, payload, *,
-                     temporary_name):
-        nonlocal failed
-        if not failed and destination_name == 'best-lineage.json':
-            failed = True
-            raise OSError('injected best pointer failure')
-        return original(
-            directory_fd, destination_name, payload,
-            temporary_name=temporary_name)
-
-    monkeypatch.setattr(
-        formal_training, '_write_atomic_file_at', fail_pointer)
+    _inject_authority_failure_once(
+        monkeypatch, 'write_mutable', 'best-lineage.json',
+        'injected best pointer failure')
     with pytest.raises(OSError, match='pointer'):
         _publish_test_best(tmp_path, init, 2, 0.6)
     assert first_best.is_file()
@@ -715,17 +1306,9 @@ def test_committed_best_survives_old_best_prune_failure(
         dataset_size=11, best_decision_path=first_decision)
     second_decision = _publish_test_best(tmp_path, init, 2, 0.6)
     first_best = output / 'best_coco_AP_epoch_1.pth'
-    original = formal_training._durable_unlink
-    failed = False
-
-    def fail_old_best(path):
-        nonlocal failed
-        if not failed and Path(path) == first_best:
-            failed = True
-            raise OSError('injected old best prune failure')
-        return original(path)
-
-    monkeypatch.setattr(formal_training, '_durable_unlink', fail_old_best)
+    _inject_authority_failure_once(
+        monkeypatch, 'unlink', first_best.name,
+        'injected old best prune failure')
     with pytest.raises(OSError, match='best prune'):
         write_resume_checkpoint(
             repository_root=tmp_path, expected=init, completed_epoch=2,
@@ -926,18 +1509,10 @@ def test_sparse_best_transaction_failure_recovers_prior_effective_authority(
     else:
         attempted_decision = formal_training.inherit_best_checkpoint(
             tmp_path, init, completed_epoch=failed_epoch)
-    original = formal_training._atomic_write_bytes
-    failed = False
-
-    def fail_commit(destination, payload):
-        nonlocal failed
-        if not failed and Path(destination) == (
-                output / f'epoch-commits/epoch_{failed_epoch}.json'):
-            failed = True
-            raise OSError('injected sparse best commit failure')
-        return original(destination, payload)
-
-    monkeypatch.setattr(formal_training, '_atomic_write_bytes', fail_commit)
+    _inject_authority_failure_once(
+        monkeypatch, 'write_immutable',
+        f'epoch-commits/epoch_{failed_epoch}.json',
+        'injected sparse best commit failure')
     with pytest.raises(OSError, match='sparse best'):
         write_resume_checkpoint(
             repository_root=tmp_path, expected=init,
@@ -1011,9 +1586,12 @@ def test_best_writer_rejects_pointer_replacement_after_prior_load(
     original = formal_training._load_best_lineage
     replaced = False
 
-    def replace_after_load(root, expected, *, completed_epoch):
+    def replace_after_load(
+            root, expected, *, completed_epoch, authority=None):
         nonlocal replaced
-        result = original(root, expected, completed_epoch=completed_epoch)
+        result = original(
+            root, expected, completed_epoch=completed_epoch,
+            authority=authority)
         if completed_epoch == 1 and not replaced:
             replaced = True
             (output / 'best-lineage.json').write_bytes(
@@ -1151,13 +1729,12 @@ def test_resume_loader_uses_captured_checkpoint_bytes_during_transient_swap(
     original_load = torch.load
 
     def transient_swap(source, *args, **kwargs):
-        if Path(source).absolute() == path.absolute():
-            path.write_bytes(hostile)
-            try:
-                return original_load(source, *args, **kwargs)
-            finally:
-                path.write_bytes(approved)
-        return original_load(source, *args, **kwargs)
+        assert isinstance(source, io.BytesIO)
+        path.write_bytes(hostile)
+        try:
+            return original_load(source, *args, **kwargs)
+        finally:
+            path.write_bytes(approved)
 
     monkeypatch.setattr(torch, 'load', transient_swap)
     resume = validate_resume_checkpoint(
@@ -1398,3 +1975,175 @@ def test_training_stop_publishes_no_partial_epoch_and_acks_last_init(
         (output / 'stop-ack.json').read_text(encoding='utf-8'))
     assert acknowledgement['resume']['completed_epoch'] == 0
     assert acknowledgement['resume']['sha256'] == _sha(init_path)
+
+
+def test_formal_training_stop_uses_one_held_output_authority_across_ack(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    init_path = output / 'run-init.json'
+    write_formal_run_init(init, init_path)
+    control = output / 'stop-request.json'
+    control.write_bytes(formal_training._canonical_json_bytes({
+        'schema_version': 1, 'request_id': 'held-stop',
+        'stage': 'training', 'input_path': str(init_path),
+        'input_sha256': _sha(init_path), 'issued_at_ns': time.time_ns(),
+        'acknowledgement_path': str(output / 'stop-ack.json'),
+        'partial_staging_path': str(output / 'partial-staging'),
+    }))
+    held_output = tmp_path / 'run-held'
+    replacement = tmp_path / 'replacement'
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        request = formal_training._poll_formal_training_stop(
+            authority, StageSafeBoundary('training', 'optimizer', 3, True))
+        assert request is not None
+        output.rename(held_output)
+        output.mkdir()
+        with pytest.raises(FormalTrainingError, match='authority'):
+            formal_training._write_formal_training_stop_ack(
+                authority, request,
+                TrainingResumeAuthority(
+                    init.run_id, 0, str(init_path),
+                    _sha(held_output / 'run-init.json')))
+        assert not tuple(output.iterdir())
+    output.rename(replacement)
+    held_output.rename(output)
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        request = formal_training._poll_formal_training_stop(
+            authority, StageSafeBoundary('training', 'optimizer', 3, True))
+        assert request is not None
+        acknowledgement = formal_training._write_formal_training_stop_ack(
+            authority, request,
+            TrainingResumeAuthority(
+                init.run_id, 0, str(init_path), _sha(init_path)))
+    assert acknowledgement.exit_code == 75
+    assert (output / 'stop-ack.json').is_file()
+    assert not tuple(replacement.iterdir())
+
+
+def test_formal_training_hook_never_reopens_generic_stop_paths():
+    source = inspect.getsource(formal_training._build_training_hook)
+    assert 'poll_cooperative_stop(' not in source
+    assert 'write_stop_acknowledgement(' not in source
+    assert '_poll_formal_training_stop(' in source
+    assert '_write_formal_training_stop_ack(' in source
+
+
+def test_formal_training_stop_rejects_wrong_run_epoch_and_nonlatest_input(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    init_path = output / 'run-init.json'
+    write_formal_run_init(init, init_path)
+    control = output / 'stop-request.json'
+
+    def publish(input_path):
+        control.write_bytes(formal_training._canonical_json_bytes({
+            'schema_version': 1, 'request_id': 'authority-stop',
+            'stage': 'training', 'input_path': str(input_path),
+            'input_sha256': _sha(input_path),
+            'issued_at_ns': time.time_ns(),
+            'acknowledgement_path': str(output / 'stop-ack.json'),
+            'partial_staging_path': str(output / 'partial-staging'),
+        }))
+
+    publish(init_path)
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        request = formal_training._poll_formal_training_stop(
+            authority, StageSafeBoundary('training', 'optimizer', 1, True))
+        assert request is not None
+        with pytest.raises(FormalTrainingError, match='resume input'):
+            formal_training._write_formal_training_stop_ack(
+                authority, request,
+                TrainingResumeAuthority(
+                    'wrong-run', 0, str(init_path), _sha(init_path)))
+        with pytest.raises(FormalTrainingError, match='latest committed'):
+            formal_training._write_formal_training_stop_ack(
+                authority, request,
+                TrainingResumeAuthority(
+                    init.run_id, 1, str(init_path), _sha(init_path)))
+
+    training_log = output / 'training.jsonl'
+    training_log.write_bytes(b'not-a-resume\n')
+    publish(training_log)
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='latest committed'):
+            formal_training._poll_formal_training_stop(
+                authority,
+                StageSafeBoundary('training', 'optimizer', 1, True))
+
+
+def test_formal_training_stop_rejects_control_swap_before_ack(tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    init_path = output / 'run-init.json'
+    write_formal_run_init(init, init_path)
+    control = output / 'stop-request.json'
+    control.write_bytes(formal_training._canonical_json_bytes({
+        'schema_version': 1, 'request_id': 'control-swap',
+        'stage': 'training', 'input_path': str(init_path),
+        'input_sha256': _sha(init_path), 'issued_at_ns': time.time_ns(),
+        'acknowledgement_path': str(output / 'stop-ack.json'),
+        'partial_staging_path': str(output / 'partial-staging'),
+    }))
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        request = formal_training._poll_formal_training_stop(
+            authority, StageSafeBoundary('training', 'optimizer', 1, True))
+        assert request is not None
+        payload = control.read_bytes()
+        control.unlink()
+        control.write_bytes(payload)
+        with pytest.raises(FormalTrainingError, match='authority'):
+            formal_training._write_formal_training_stop_ack(
+                authority, request,
+                TrainingResumeAuthority(
+                    init.run_id, 0, str(init_path), _sha(init_path)))
+    assert not (output / 'stop-ack.json').exists()
+
+
+def test_formal_training_stop_staging_replacement_never_purges_victim(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    init_path = output / 'run-init.json'
+    write_formal_run_init(init, init_path)
+    staging = output / 'partial-staging'
+    staging.mkdir()
+    (staging / 'partial.bin').write_bytes(b'partial')
+    control = output / 'stop-request.json'
+    control.write_bytes(formal_training._canonical_json_bytes({
+        'schema_version': 1, 'request_id': 'staging-swap',
+        'stage': 'training', 'input_path': str(init_path),
+        'input_sha256': _sha(init_path), 'issued_at_ns': time.time_ns(),
+        'acknowledgement_path': str(output / 'stop-ack.json'),
+        'partial_staging_path': str(staging),
+    }))
+    outside = tmp_path / 'outside'
+    victim = outside / 'victim'
+    victim.mkdir(parents=True)
+    (victim / 'valuable.bin').write_bytes(b'valuable')
+    held_staging = output / 'held-staging'
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        request = formal_training._poll_formal_training_stop(
+            authority, StageSafeBoundary('training', 'optimizer', 1, True))
+        assert request is not None
+        original = authority.purge_directory
+
+        def replace_before_purge(relative):
+            staging.rename(held_staging)
+            staging.symlink_to(victim, target_is_directory=True)
+            return original(relative)
+
+        monkeypatch.setattr(authority, 'purge_directory', replace_before_purge)
+        with pytest.raises(FormalTrainingError, match='purge'):
+            formal_training._write_formal_training_stop_ack(
+                authority, request,
+                TrainingResumeAuthority(
+                    init.run_id, 0, str(init_path), _sha(init_path)))
+    assert (victim / 'valuable.bin').read_bytes() == b'valuable'
+    assert (held_staging / 'partial.bin').read_bytes() == b'partial'
+    assert not (output / 'stop-ack.json').exists()

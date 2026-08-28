@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import io
 from pathlib import Path
 
 import pytest
@@ -45,13 +46,12 @@ def test_tensor_loader_uses_captured_authorized_bytes_during_transient_swap(
     original_load = torch.load
 
     def transient_swap(source, *args, **kwargs):
-        if Path(source).absolute() == path.absolute():
-            path.write_bytes(hostile)
-            try:
-                return original_load(source, *args, **kwargs)
-            finally:
-                path.write_bytes(approved)
-        return original_load(source, *args, **kwargs)
+        assert isinstance(source, io.BytesIO)
+        path.write_bytes(hostile)
+        try:
+            return original_load(source, *args, **kwargs)
+        finally:
+            path.write_bytes(approved)
 
     monkeypatch.setattr(torch, 'load', transient_swap)
     loaded = load_formal_tensor_checkpoint(path, authority, expected)
@@ -168,13 +168,12 @@ def test_backbone_loader_uses_captured_authorized_bytes_during_transient_swap(
     original_load = torch.load
 
     def transient_swap(source, *args, **kwargs):
-        if Path(source).absolute() == approved_path.absolute():
-            approved_path.write_bytes(hostile)
-            try:
-                return original_load(source, *args, **kwargs)
-            finally:
-                approved_path.write_bytes(approved)
-        return original_load(source, *args, **kwargs)
+        assert isinstance(source, io.BytesIO)
+        approved_path.write_bytes(hostile)
+        try:
+            return original_load(source, *args, **kwargs)
+        finally:
+            approved_path.write_bytes(approved)
 
     monkeypatch.setattr(torch, 'load', transient_swap)
     target = torch.nn.Linear(3, 2)
