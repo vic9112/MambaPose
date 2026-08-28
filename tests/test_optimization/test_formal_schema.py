@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tracemalloc
 import zipfile
 
 from mmengine.config import Config
@@ -13,6 +14,7 @@ import pytest
 import mambapose_opt.formal_schema as formal_schema
 from mambapose_opt.formal_schema import (
     AssetBinding,
+    FileBinding,
     FormalManifestError,
     FormalRunInit,
     FormalStageCManifest,
@@ -1089,6 +1091,216 @@ def test_paired_config_validator_rejects_common_closure_drift(
 def test_public_run_init_and_train_result_loaders_exist():
     assert callable(getattr(formal_schema, 'load_formal_run_init'))
     assert callable(getattr(formal_schema, 'load_formal_train_result'))
+
+
+def _public_loader_run_init(output: Path) -> FormalRunInit:
+    document = _run_init_document()
+    observed = output.stat()
+    document['run']['output_root_device'] = observed.st_dev
+    document['run']['output_root_inode'] = observed.st_ino
+    return FormalRunInit.from_dict(document, repository_root=ROOT)
+
+
+def _stub_public_run_init_dependencies(monkeypatch, expected):
+    monkeypatch.setattr(
+        formal_schema, 'load_formal_manifest', lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(formal_schema, '_sha256_file', lambda _path: 'a' * 64)
+    monkeypatch.setattr(
+        formal_schema.FormalRunInit, 'from_dict',
+        classmethod(lambda _cls, *_args, **_kwargs: expected))
+    monkeypatch.setattr(
+        formal_schema, '_validate_formal_source_authority',
+        lambda *_args, **_kwargs: None)
+
+
+def test_public_run_init_rejects_preexisting_same_byte_output_replacement(
+        tmp_path, monkeypatch):
+    repository = tmp_path / 'repo'
+    output = repository / (
+        'work_dirs/optimization/formal-stage-c/full-seed0')
+    output.mkdir(parents=True)
+    expected = _public_loader_run_init(output)
+    payload = json.dumps(_run_init_document()).encode()
+    (output / 'run-init.json').write_bytes(payload)
+    original = repository / 'original-output'
+    output.rename(original)
+    output.mkdir()
+    (output / 'run-init.json').write_bytes(payload)
+    _stub_public_run_init_dependencies(monkeypatch, expected)
+
+    with pytest.raises(FormalManifestError, match='identity|authority'):
+        formal_schema.load_formal_run_init(
+            output / 'run-init.json', repository_root=repository)
+
+
+def test_public_run_init_revalidates_held_name_after_source_checks(
+        tmp_path, monkeypatch):
+    repository = tmp_path / 'repo'
+    output = repository / (
+        'work_dirs/optimization/formal-stage-c/full-seed0')
+    output.mkdir(parents=True)
+    expected = _public_loader_run_init(output)
+    payload = json.dumps(_run_init_document()).encode()
+    (output / 'run-init.json').write_bytes(payload)
+    _stub_public_run_init_dependencies(monkeypatch, expected)
+    original = repository / 'original-output'
+
+    def replace_during_source_check(*_args, **_kwargs):
+        output.rename(original)
+        output.mkdir()
+        (output / 'run-init.json').write_bytes(payload)
+
+    monkeypatch.setattr(
+        formal_schema, '_validate_formal_source_authority',
+        replace_during_source_check)
+    with pytest.raises(FormalManifestError, match='identity|authority'):
+        formal_schema.load_formal_run_init(
+            output / 'run-init.json', repository_root=repository)
+
+
+def test_public_train_result_uses_one_held_output_for_all_reads(
+        tmp_path, monkeypatch):
+    repository = tmp_path / 'repo'
+    output = repository / (
+        'work_dirs/optimization/formal-stage-c/full-seed0')
+    output.mkdir(parents=True)
+    init = _public_loader_run_init(output)
+    run_init_payload = json.dumps(_run_init_document()).encode()
+    (output / 'run-init.json').write_bytes(run_init_payload)
+    result = FormalTrainResult(
+        run_init_sha256=_sha(run_init_payload),
+        initialization=init.initialization,
+        run_id=init.run_id, role=init.role, seed=init.seed,
+        output_root=init.output_root,
+        best_checkpoint=FileBinding(
+            init.output_root / 'best_coco_AP_epoch_300.pth', _sha(b'best')),
+        resume_checkpoints=(
+            FileBinding(init.output_root / 'epoch_299.pth', _sha(b'299')),
+            FileBinding(init.output_root / 'epoch_300.pth', _sha(b'300'))),
+        structured_log=FileBinding(
+            init.output_root / 'training.jsonl', _sha(b'log')),
+        order_hashes=tuple(_sha(f'epoch:{epoch}'.encode())
+                           for epoch in range(1, 301)),
+        final_epoch=300, status='complete')
+    (output / 'train-result.json').write_text('{}')
+    commits = output / 'epoch-commits'
+    commits.mkdir()
+    (commits / 'epoch_300.json').write_text('{}')
+    original = repository / 'original-output'
+    calls = 0
+
+    def parse_result(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            output.rename(original)
+            output.mkdir()
+            (output / 'run-init.json').write_bytes(run_init_payload)
+            (output / 'train-result.json').write_text('{}')
+            replacement_commits = output / 'epoch-commits'
+            replacement_commits.mkdir()
+            (replacement_commits / 'epoch_300.json').write_text('{}')
+        return result
+
+    monkeypatch.setattr(
+        formal_schema.FormalTrainResult, 'from_dict',
+        classmethod(lambda _cls, *args, **kwargs: parse_result(*args, **kwargs)))
+    monkeypatch.setattr(
+        formal_schema, 'load_formal_run_init',
+        lambda *_args, **_kwargs: init)
+    monkeypatch.setattr(
+        formal_schema, '_sha256_file',
+        lambda _path: _sha(run_init_payload))
+    with pytest.raises(FormalManifestError, match='identity|authority'):
+        formal_schema.load_formal_train_result(
+            output / 'train-result.json', repository_root=repository,
+            verify_files=False)
+
+
+def test_held_runtime_file_streams_large_sha_without_materializing_payload(
+        tmp_path):
+    source = tmp_path / 'large-checkpoint.pth'
+    size = 64 * 1024 * 1024
+    with source.open('wb') as stream:
+        stream.truncate(size)
+    expected = hashlib.sha256()
+    block = b'\0' * (1024 * 1024)
+    for _ in range(64):
+        expected.update(block)
+    tracemalloc.start()
+    try:
+        with formal_schema._HeldRuntimeTree(tmp_path) as held_tree:
+            held = held_tree.hold_regular(Path('large-checkpoint.pth'))
+            observed = held.sha256()
+            held.revalidate()
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert observed == expected.hexdigest()
+    assert peak < 8 * 1024 * 1024
+
+
+def test_held_runtime_tree_revalidates_directories_after_last_file(
+        tmp_path, monkeypatch):
+    repository = tmp_path / 'repo'
+    output = repository / 'output'
+    output.mkdir(parents=True)
+    source = output / 'record.json'
+    source.write_bytes(b'{}')
+    original_output = repository / 'output-held'
+    with formal_schema._HeldRuntimeTree(repository) as tree:
+        held = tree.hold_regular(Path('output/record.json'))
+        original_revalidate = held.revalidate
+
+        def replace_after_file_revalidation():
+            original_revalidate()
+            output.rename(original_output)
+            output.mkdir()
+            (output / 'record.json').write_bytes(b'{}')
+
+        monkeypatch.setattr(held, 'revalidate', replace_after_file_revalidation)
+        with pytest.raises(FormalManifestError, match='directory.*authority'):
+            tree.revalidate()
+
+
+@pytest.mark.parametrize('mutation', ['nonfinite_metric', 'invalid_predecessor'])
+def test_held_best_decision_rejects_incomplete_chain_semantics(
+        tmp_path, mutation):
+    output = tmp_path / 'output'
+    output.mkdir()
+    run_init = _public_loader_run_init(output)
+    best = FileBinding(
+        run_init.output_root / 'best_coco_AP_epoch_5.pth', 'b' * 64)
+    result = FormalTrainResult(
+        run_init_sha256='a' * 64, initialization=run_init.initialization,
+        run_id=run_init.run_id, role=run_init.role, seed=run_init.seed,
+        output_root=run_init.output_root, best_checkpoint=best,
+        resume_checkpoints=(
+            FileBinding(run_init.output_root / 'epoch_299.pth', 'c' * 64),
+            FileBinding(run_init.output_root / 'epoch_300.pth', 'd' * 64)),
+        structured_log=FileBinding(
+            run_init.output_root / 'training.jsonl', 'e' * 64),
+        order_hashes=tuple(f'{epoch:064x}' for epoch in range(1, 301)),
+        final_epoch=300, status='complete')
+    decision = {
+        'schema_version': 1,
+        'identity': {
+            'run_id': run_init.run_id, 'role': run_init.role,
+            'seed': run_init.seed},
+        'completed_epoch': 5, 'metric': 0.5,
+        'checkpoint': {'path': best.path.name, 'sha256': best.sha256},
+        'previous_decision': None,
+    }
+    if mutation == 'nonfinite_metric':
+        decision['metric'] = float('nan')
+    else:
+        decision['previous_decision'] = {
+            'path': 'best-lineages/../epoch_1.json', 'sha256': 'f' * 64}
+    payload = json.dumps(decision, sort_keys=True).encode()
+    with pytest.raises(FormalManifestError, match='decision'):
+        formal_schema._validate_held_best_decision(
+            payload, expected_sha256=_sha(payload), run_init=run_init,
+            result=result, decision_path='best-lineages/epoch_5.json')
 
 
 def test_formal_source_authority_requires_clean_detached_exact_head(tmp_path):

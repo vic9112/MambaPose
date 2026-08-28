@@ -10,6 +10,7 @@ import ast
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -904,6 +905,230 @@ def _load_runtime_json(
     return source, _require_mapping(document, field)
 
 
+class _HeldRegular:
+    """One no-follow regular file held through parse/hash/revalidation."""
+
+    def __init__(self, parent_fd: int, name: str, *, field: str):
+        self._parent_fd = parent_fd
+        self.name = name
+        self.field = field
+        self._closed = False
+        try:
+            self._fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW
+                | getattr(os, 'O_CLOEXEC', 0), dir_fd=parent_fd)
+            observed = os.fstat(self._fd)
+            if not stat.S_ISREG(observed.st_mode):
+                raise FormalManifestError(f'{field} is not a regular file')
+            self.identity = (
+                observed.st_dev, observed.st_ino, observed.st_size,
+                observed.st_mtime_ns, observed.st_ctime_ns)
+        except FormalManifestError:
+            if hasattr(self, '_fd'):
+                os.close(self._fd)
+            raise
+        except OSError as error:
+            if hasattr(self, '_fd'):
+                os.close(self._fd)
+            raise FormalManifestError(f'{field} is unavailable') from error
+
+    def _rewind(self) -> None:
+        if self._closed:
+            raise FormalManifestError(f'{self.field} authority is closed')
+        os.lseek(self._fd, 0, os.SEEK_SET)
+
+    def read_bytes(self, *, maximum_size: int = 1024 * 1024) -> bytes:
+        if self.identity[2] > maximum_size:
+            raise FormalManifestError(f'{self.field} exceeds the size limit')
+        self._rewind()
+        chunks: list[bytes] = []
+        remaining = self.identity[2]
+        while remaining:
+            block = os.read(self._fd, min(1024 * 1024, remaining))
+            if not block:
+                raise FormalManifestError(f'{self.field} changed during read')
+            chunks.append(block)
+            remaining -= len(block)
+        if os.read(self._fd, 1):
+            raise FormalManifestError(f'{self.field} changed during read')
+        self._revalidate_fd()
+        return b''.join(chunks)
+
+    def sha256(self) -> str:
+        self._rewind()
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(self._fd, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        self._revalidate_fd()
+        return digest.hexdigest()
+
+    def _revalidate_fd(self) -> None:
+        observed = os.fstat(self._fd)
+        if (
+                observed.st_dev, observed.st_ino, observed.st_size,
+                observed.st_mtime_ns, observed.st_ctime_ns) != self.identity:
+            raise FormalManifestError(f'{self.field} authority changed')
+
+    def revalidate(self) -> None:
+        self._revalidate_fd()
+        try:
+            named = os.stat(
+                self.name, dir_fd=self._parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise FormalManifestError(
+                f'{self.field} name authority changed') from error
+        if not stat.S_ISREG(named.st_mode) or (
+                named.st_dev, named.st_ino, named.st_size,
+                named.st_mtime_ns, named.st_ctime_ns) != self.identity:
+            raise FormalManifestError(f'{self.field} name authority changed')
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        os.close(self._fd)
+
+
+class _HeldRuntimeTree:
+    """Component-wise no-follow authority rooted at one repository inode."""
+
+    def __init__(self, repository_root: Path | str):
+        self.root = Path(repository_root).absolute()
+        if not self.root.is_absolute():
+            raise FormalManifestError('runtime repository root is not absolute')
+        self._closed = False
+        self._directories: dict[tuple[str, ...], tuple[int, tuple[int, int]]] = {}
+        self._regulars: list[_HeldRegular] = []
+        flags = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                 | getattr(os, 'O_CLOEXEC', 0))
+        descriptor = os.open('/', flags)
+        observed = os.fstat(descriptor)
+        self._directories[()] = (
+            descriptor, (observed.st_dev, observed.st_ino))
+        try:
+            key: tuple[str, ...] = ()
+            for component in self.root.parts[1:]:
+                child = os.open(component, flags, dir_fd=descriptor)
+                child_stat = os.fstat(child)
+                if not stat.S_ISDIR(child_stat.st_mode):
+                    os.close(child)
+                    raise FormalManifestError(
+                        'runtime repository component is not a directory')
+                key = key + (component,)
+                self._directories[key] = (
+                    child, (child_stat.st_dev, child_stat.st_ino))
+                descriptor = child
+            self._root_parts = key
+            self.revalidate_directories()
+        except Exception:
+            self.close()
+            raise
+
+    def __enter__(self) -> _HeldRuntimeTree:
+        return self
+
+    def __exit__(self, _kind, _value, _traceback) -> None:
+        self.close()
+
+    @staticmethod
+    def _relative_parts(relative: Path | str) -> tuple[str, ...]:
+        raw = os.fspath(relative)
+        if not isinstance(raw, str) or not raw or raw.startswith('/') \
+                or raw.endswith('/') or '//' in raw:
+            raise FormalManifestError('runtime relative path is not canonical')
+        parts = tuple(raw.split('/'))
+        if any(part in {'', '.', '..'} for part in parts) \
+                or Path(raw).as_posix() != raw:
+            raise FormalManifestError('runtime relative path is not canonical')
+        return parts
+
+    def _directory_fd(self, relative_parts: tuple[str, ...]) -> int:
+        key = self._root_parts
+        descriptor = self._directories[key][0]
+        flags = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                 | getattr(os, 'O_CLOEXEC', 0))
+        for component in relative_parts:
+            key = key + (component,)
+            existing = self._directories.get(key)
+            if existing is None:
+                try:
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except OSError as error:
+                    raise FormalManifestError(
+                        'runtime output directory is unavailable') from error
+                child_stat = os.fstat(child)
+                if not stat.S_ISDIR(child_stat.st_mode):
+                    os.close(child)
+                    raise FormalManifestError(
+                        'runtime output component is not a directory')
+                existing = (
+                    child, (child_stat.st_dev, child_stat.st_ino))
+                self._directories[key] = existing
+            descriptor = existing[0]
+        return descriptor
+
+    def directory_identity(self, relative: Path | str) -> tuple[int, int]:
+        parts = self._relative_parts(relative)
+        descriptor = self._directory_fd(parts)
+        observed = os.fstat(descriptor)
+        return observed.st_dev, observed.st_ino
+
+    def hold_regular(
+            self, relative: Path | str, *, field: str = 'runtime file'
+            ) -> _HeldRegular:
+        parts = self._relative_parts(relative)
+        parent = self._directory_fd(parts[:-1])
+        held = _HeldRegular(parent, parts[-1], field=field)
+        self._regulars.append(held)
+        return held
+
+    def revalidate_directories(self) -> None:
+        for key in sorted(self._directories, key=len):
+            descriptor, identity = self._directories[key]
+            opened = os.fstat(descriptor)
+            if not stat.S_ISDIR(opened.st_mode) or (
+                    opened.st_dev, opened.st_ino) != identity:
+                raise FormalManifestError('runtime directory authority changed')
+            if not key:
+                continue
+            parent = self._directories[key[:-1]][0]
+            try:
+                named = os.stat(
+                    key[-1], dir_fd=parent, follow_symlinks=False)
+            except OSError as error:
+                raise FormalManifestError(
+                    'runtime directory name authority changed') from error
+            if not stat.S_ISDIR(named.st_mode) or (
+                    named.st_dev, named.st_ino) != identity:
+                raise FormalManifestError(
+                    'runtime directory name authority changed')
+
+    def revalidate(self) -> None:
+        self.revalidate_directories()
+        for regular in self._regulars:
+            regular.revalidate()
+        # Directory names are the final authority boundary.  A replacement
+        # after the last held-file check must not be allowed to return.
+        self.revalidate_directories()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for regular in self._regulars:
+            regular.close()
+        self._regulars.clear()
+        for descriptor, _identity in reversed(tuple(self._directories.values())):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self._directories.clear()
+
+
 def _validate_formal_source_authority(
         repository_root: Path | str, expected_commit: str) -> None:
     root = Path(repository_root).resolve(strict=True)
@@ -932,43 +1157,219 @@ def _validate_formal_source_authority(
         raise FormalManifestError('formal source tracked tree must be clean')
 
 
+def _runtime_output_relative(
+        path: Path | str, *, repository_root: Path,
+        filename: str) -> tuple[Path, Path]:
+    source = Path(path)
+    if not source.is_absolute():
+        source = repository_root / source
+    lexical = source.absolute()
+    try:
+        relative = lexical.relative_to(repository_root)
+    except ValueError as error:
+        raise FormalManifestError(
+            f'formal {filename} must remain inside the worktree') from error
+    if len(relative.parts) != 5 or relative.parts[:3] != (
+            'work_dirs', 'optimization', 'formal-stage-c') \
+            or relative.parts[-1] != filename \
+            or _IDENTIFIER.fullmatch(relative.parts[-2]) is None:
+        raise FormalManifestError(f'formal {filename} path is not canonical')
+    return relative, relative.parent
+
+
+def _held_json_document(held: _HeldRegular, *, field: str) -> Mapping[str, Any]:
+    try:
+        value = json.loads(held.read_bytes().decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FormalManifestError(f'{field} is malformed: {error}') from error
+    return _require_mapping(value, field)
+
+
+def _load_formal_run_init_held(
+        tree: _HeldRuntimeTree, *, repository_root: Path,
+        output_relative: Path) -> tuple[FormalRunInit, _HeldRegular]:
+    held = tree.hold_regular(
+        output_relative / 'run-init.json', field='formal run init')
+    document = _held_json_document(held, field='formal run init')
+    manifest_path = repository_root / 'optimization/formal_stage_c.json'
+    manifest = load_formal_manifest(
+        manifest_path, repository_root=repository_root)
+    manifest_sha256 = _sha256_file(manifest_path)
+    run_init = FormalRunInit.from_dict(
+        document, repository_root=repository_root, manifest=manifest,
+        expected_manifest_sha256=manifest_sha256)
+    if run_init.output_root != output_relative:
+        raise FormalManifestError('formal run init path is not canonical')
+    observed_identity = tree.directory_identity(output_relative)
+    declared_identity = (
+        run_init.output_root_device, run_init.output_root_inode)
+    if declared_identity != observed_identity:
+        raise FormalManifestError(
+            'formal output root identity differs from run init authority')
+    _validate_formal_source_authority(repository_root, run_init.git_commit)
+    held.revalidate()
+    tree.revalidate_directories()
+    return run_init, held
+
+
+def _validate_held_best_decision(
+        payload: bytes, *, expected_sha256: str,
+        run_init: FormalRunInit, result: FormalTrainResult | None,
+        decision_path: str) -> Mapping[str, str] | None:
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise FormalManifestError('final best decision SHA-256 mismatch')
+    match = re.fullmatch(
+        r'best-lineages/epoch_([1-9][0-9]*)\.json', decision_path)
+    if match is None:
+        raise FormalManifestError('final best decision path is invalid')
+    decision_epoch = int(match.group(1))
+    try:
+        document = json.loads(payload.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FormalManifestError('final best decision is malformed') from error
+    fields = {
+        'schema_version', 'identity', 'completed_epoch', 'metric',
+        'checkpoint', 'previous_decision'}
+    if not isinstance(document, Mapping) or set(document) != fields \
+            or document['schema_version'] != 1 \
+            or document['identity'] != {
+                'run_id': run_init.run_id, 'role': run_init.role,
+                'seed': run_init.seed} \
+            or document['completed_epoch'] != decision_epoch:
+        raise FormalManifestError('final best decision authority is invalid')
+    metric = document['metric']
+    if isinstance(metric, bool) or not isinstance(metric, (int, float)) \
+            or not math.isfinite(metric):
+        raise FormalManifestError('final best decision metric is invalid')
+    checkpoint = document['checkpoint']
+    if not isinstance(checkpoint, Mapping) or set(checkpoint) != {
+            'path', 'sha256'} or not isinstance(checkpoint['path'], str) \
+            or not isinstance(checkpoint['sha256'], str) \
+            or _SHA256.fullmatch(checkpoint['sha256']) is None:
+        raise FormalManifestError(
+            'final best decision checkpoint is invalid')
+    checkpoint_match = re.fullmatch(
+        r'best_coco_AP_epoch_([1-9][0-9]*)\.pth', checkpoint['path'])
+    if checkpoint_match is None \
+            or int(checkpoint_match.group(1)) != decision_epoch:
+        raise FormalManifestError(
+            'final best decision checkpoint is invalid')
+    if result is not None and checkpoint != {
+            'path': result.best_checkpoint.path.name,
+            'sha256': result.best_checkpoint.sha256}:
+        raise FormalManifestError(
+            'final best decision checkpoint authority mismatch')
+    previous = document['previous_decision']
+    if previous is None:
+        return None
+    if not isinstance(previous, Mapping) or set(previous) != {
+            'path', 'sha256'} or not isinstance(previous['path'], str) \
+            or not isinstance(previous['sha256'], str) \
+            or _SHA256.fullmatch(previous['sha256']) is None:
+        raise FormalManifestError(
+            'final best decision predecessor is invalid')
+    predecessor_match = re.fullmatch(
+        r'best-lineages/epoch_([1-9][0-9]*)\.json', previous['path'])
+    if predecessor_match is None \
+            or int(predecessor_match.group(1)) >= decision_epoch:
+        raise FormalManifestError(
+            'final best decision predecessor is invalid')
+    return MappingProxyType(dict(previous))
+
+
+def _load_formal_train_result_held(
+        tree: _HeldRuntimeTree, *, repository_root: Path,
+        output_relative: Path) -> FormalTrainResult:
+    result_held = tree.hold_regular(
+        output_relative / 'train-result.json', field='formal train result')
+    final_commit_held = tree.hold_regular(
+        output_relative / 'epoch-commits/epoch_300.json',
+        field='final epoch commit')
+    result_document = _held_json_document(
+        result_held, field='formal train result')
+    final_commit_payload = final_commit_held.read_bytes()
+    preliminary = FormalTrainResult.from_dict(
+        result_document, repository_root=repository_root,
+        verify_files=False,
+        _final_epoch_commit_payload=final_commit_payload)
+    if preliminary.output_root != output_relative:
+        raise FormalManifestError('formal train result path is not canonical')
+    tree.revalidate_directories()
+    run_init, run_init_held = _load_formal_run_init_held(
+        tree, repository_root=repository_root,
+        output_relative=output_relative)
+    run_init_sha256 = run_init_held.sha256()
+    result = FormalTrainResult.from_dict(
+        result_document, repository_root=repository_root,
+        verify_files=False, run_init=run_init,
+        expected_run_init_sha256=run_init_sha256,
+        _final_epoch_commit_payload=final_commit_payload)
+    try:
+        final_document = json.loads(final_commit_payload.decode('utf-8'))
+        decision = final_document['best']['decision']
+        decision_path = decision['path']
+        decision_sha256 = decision['sha256']
+    except (KeyError, TypeError, UnicodeDecodeError,
+            json.JSONDecodeError) as error:
+        raise FormalManifestError(
+            'final epoch commit best decision is malformed') from error
+    if not isinstance(decision_path, str) or not isinstance(
+            decision_sha256, str):
+        raise FormalManifestError(
+            'final epoch commit best decision is malformed')
+    seen_decisions: set[str] = set()
+    selected_result: FormalTrainResult | None = result
+    while True:
+        if decision_path in seen_decisions:
+            raise FormalManifestError('final best decision chain cycles')
+        seen_decisions.add(decision_path)
+        decision_held = tree.hold_regular(
+            output_relative / decision_path, field='final best decision')
+        previous = _validate_held_best_decision(
+            decision_held.read_bytes(), expected_sha256=decision_sha256,
+            run_init=run_init, result=selected_result,
+            decision_path=decision_path)
+        if previous is None:
+            break
+        decision_path = previous['path']
+        decision_sha256 = previous['sha256']
+        selected_result = None
+    for field, binding in (
+            ('best checkpoint', result.best_checkpoint),
+            ('resume checkpoint 299', result.resume_checkpoints[0]),
+            ('resume checkpoint 300', result.resume_checkpoints[1]),
+            ('structured log', result.structured_log)):
+        held = tree.hold_regular(binding.path, field=field)
+        if held.sha256() != binding.sha256:
+            raise FormalManifestError(f'{field} SHA-256 mismatch')
+    tree.revalidate()
+    return result
+
+
 def load_formal_run_init(
         path: Path | str, *, repository_root: Path | str) -> FormalRunInit:
     """Load one canonical run-init record and bind it to the tracked manifest."""
-    root = Path(repository_root).resolve(strict=True)
-    source, document = _load_runtime_json(
-        path, repository_root=root, field='formal run init')
-    manifest_path = root / 'optimization/formal_stage_c.json'
-    manifest = load_formal_manifest(manifest_path, repository_root=root)
-    manifest_sha256 = _sha256_file(manifest_path)
-    run_init = FormalRunInit.from_dict(
-        document, repository_root=root, manifest=manifest,
-        expected_manifest_sha256=manifest_sha256)
-    expected_path = root / run_init.output_root / 'run-init.json'
-    if source.absolute() != expected_path.absolute():
-        raise FormalManifestError('formal run init path is not canonical')
-    _validate_formal_source_authority(root, run_init.git_commit)
-    return run_init
+    root = Path(repository_root).absolute()
+    _source_relative, output_relative = _runtime_output_relative(
+        path, repository_root=root, filename='run-init.json')
+    with _HeldRuntimeTree(root) as tree:
+        run_init, _held = _load_formal_run_init_held(
+            tree, repository_root=root, output_relative=output_relative)
+        tree.revalidate()
+        return run_init
 
 
 def load_formal_train_result(
         path: Path | str, *, repository_root: Path | str,
         verify_files: bool = True) -> FormalTrainResult:
     """Load a canonical train result and bind it to its exact run-init bytes."""
-    root = Path(repository_root).resolve(strict=True)
-    source, document = _load_runtime_json(
-        path, repository_root=root, field='formal train result')
-    preliminary = FormalTrainResult.from_dict(
-        document, repository_root=root, verify_files=False)
-    expected_path = root / preliminary.output_root / 'train-result.json'
-    if source.absolute() != expected_path.absolute():
-        raise FormalManifestError('formal train result path is not canonical')
-    run_init_path = root / preliminary.output_root / 'run-init.json'
-    run_init = load_formal_run_init(run_init_path, repository_root=root)
-    return FormalTrainResult.from_dict(
-        document, repository_root=root, verify_files=verify_files,
-        run_init=run_init,
-        expected_run_init_sha256=_sha256_file(run_init_path))
+    del verify_files  # Public loading is always fully authenticated.
+    root = Path(repository_root).absolute()
+    _source_relative, output_relative = _runtime_output_relative(
+        path, repository_root=root, filename='train-result.json')
+    with _HeldRuntimeTree(root) as tree:
+        return _load_formal_train_result_held(
+            tree, repository_root=root, output_relative=output_relative)
 
 
 def config_closure_sha256(

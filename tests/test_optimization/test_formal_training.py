@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import importlib.util
 import inspect
 import io
 import json
@@ -10,6 +11,7 @@ from pathlib import Path
 import random
 import stat
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -277,6 +279,15 @@ def test_production_training_recovers_before_resume_choice_and_has_no_fixed_best
     second_authority = source.index(
         '_revalidate_resume_state_authority(', first_authority + 1)
     assert first_authority < injection < restore < second_authority
+
+
+def test_production_result_publish_runs_full_held_recovery_before_return():
+    source = inspect.getsource(formal_training._train_formal_candidate_held)
+    publish = source.index(
+        "authority.write_immutable(Path('train-result.json'), payload)")
+    final_recovery = source.rindex('_recover_training_lineage_held(')
+    final_validation = source.rindex('_load_completed_training_result_held(')
+    assert publish < final_recovery < final_validation
 
 
 def test_controlled_runner_lifecycle_preserves_authenticated_state_exactly_once():
@@ -549,6 +560,131 @@ def test_all_ten_run_inits_are_built_before_publication(monkeypatch):
                and item.persistent_workers is False for item in records)
 
 
+def _load_run_init_builder_module():
+    path = ROOT / 'tools/optimization/build_formal_run_init.py'
+    spec = importlib.util.spec_from_file_location('formal_run_init_builder', path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize('check', [False, True])
+def test_run_init_builder_publicly_reloads_all_ten_only_after_all_writes(
+        tmp_path, monkeypatch, check):
+    module = _load_run_init_builder_module()
+    environment_path = tmp_path / 'environment.json'
+    environment_path.write_text('{}')
+    module.ROOT = tmp_path
+    module.ENVIRONMENT = environment_path
+    module.MANIFEST = tmp_path / 'manifest.json'
+    inits = tuple(
+        replace(
+            _run_init(output_root=f'runs/{role}-seed{seed}'),
+            run_id=f'{role}-seed{seed}', role='baseline', seed=seed)
+        for seed in range(5) for role in ('full', 'paired'))
+    if check:
+        for init in inits:
+            destination = tmp_path / init.output_root / 'run-init.json'
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text('{}')
+    monkeypatch.setattr(
+        module.EnvironmentAuthority, 'from_dict',
+        classmethod(lambda _cls, _value: object()))
+    monkeypatch.setattr(module, 'load_formal_manifest', lambda *_a, **_kw: object())
+    monkeypatch.setattr(
+        module, 'build_all_formal_run_inits',
+        lambda *_args, **_kwargs: inits)
+    writes = []
+    loads = []
+
+    def write(init, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text('{}')
+        writes.append(init.run_id)
+        observed = destination.parent.stat()
+        enriched = replace(
+            init, output_root_device=observed.st_dev,
+            output_root_inode=observed.st_ino)
+        payload = module._canonical_json_bytes(module._init_document(
+            enriched, output_identity=(observed.st_dev, observed.st_ino)))
+        return SimpleNamespace(
+            path=destination.relative_to(tmp_path).as_posix(),
+            sha256=hashlib.sha256(payload).hexdigest())
+
+    def load(path, *, repository_root):
+        assert len(writes) == 10
+        expected = inits[len(loads)]
+        observed = path.parent.stat()
+        loaded = replace(
+            expected, output_root_device=observed.st_dev,
+            output_root_inode=observed.st_ino)
+        loads.append(loaded.run_id)
+        return loaded
+
+    monkeypatch.setattr(module, 'write_formal_run_init', write)
+    monkeypatch.setattr(module, 'load_formal_run_init', load, raising=False)
+    monkeypatch.setattr(
+        module.sys, 'argv', ['build_formal_run_init.py']
+        + (['--check'] if check else []))
+    assert module.main() == 0
+    assert writes == [init.run_id for init in inits]
+    assert loads == writes
+
+
+def test_run_init_builder_rejects_one_public_reload_mismatch(
+        tmp_path, monkeypatch):
+    module = _load_run_init_builder_module()
+    environment_path = tmp_path / 'environment.json'
+    environment_path.write_text('{}')
+    module.ROOT = tmp_path
+    module.ENVIRONMENT = environment_path
+    module.MANIFEST = tmp_path / 'manifest.json'
+    inits = tuple(
+        replace(
+            _run_init(output_root=f'runs/full-seed{seed}'),
+            run_id=f'full-seed{seed}', seed=seed)
+        for seed in range(10))
+    monkeypatch.setattr(
+        module.EnvironmentAuthority, 'from_dict',
+        classmethod(lambda _cls, _value: object()))
+    monkeypatch.setattr(module, 'load_formal_manifest', lambda *_a, **_kw: object())
+    monkeypatch.setattr(
+        module, 'build_all_formal_run_inits',
+        lambda *_args, **_kwargs: inits)
+
+    def write(init, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text('{}')
+        observed = destination.parent.stat()
+        enriched = replace(
+            init, output_root_device=observed.st_dev,
+            output_root_inode=observed.st_ino)
+        payload = module._canonical_json_bytes(module._init_document(
+            enriched, output_identity=(observed.st_dev, observed.st_ino)))
+        return SimpleNamespace(
+            path=destination.relative_to(tmp_path).as_posix(),
+            sha256=hashlib.sha256(payload).hexdigest())
+
+    calls = 0
+
+    def load(path, *, repository_root):
+        nonlocal calls
+        expected = inits[calls]
+        calls += 1
+        observed = path.parent.stat()
+        loaded = replace(
+            expected, output_root_device=observed.st_dev,
+            output_root_inode=observed.st_ino)
+        return replace(loaded, worker_count=3) if calls == 7 else loaded
+
+    monkeypatch.setattr(module, 'write_formal_run_init', write)
+    monkeypatch.setattr(module, 'load_formal_run_init', load, raising=False)
+    monkeypatch.setattr(module.sys, 'argv', ['build_formal_run_init.py'])
+    with pytest.raises((RuntimeError, SystemExit, ValueError), match='reload|mismatch'):
+        module.main()
+
+
 def test_resume_checkpoint_roundtrip_binds_complete_training_state(tmp_path):
     init = _run_init(output_root='run')
     output = tmp_path / 'run'
@@ -652,6 +788,35 @@ def test_immutable_publish_never_unlinks_replaced_foreign_pending(
         with pytest.raises(FormalTrainingError, match='pending|publication'):
             authority.write_immutable(Path('epoch_1.pth'), b'ours')
     assert (output / '.epoch_1.pth.pending').read_bytes() == foreign
+
+
+def test_immutable_publish_preserves_original_pending_after_final_replacement(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    original_link = formal_training.os.link
+
+    def replace_final_after_link(source, target, *args, **kwargs):
+        result = original_link(source, target, *args, **kwargs)
+        if target == 'epoch_1.pth':
+            os.unlink(target, dir_fd=kwargs['dst_dir_fd'])
+            descriptor = os.open(
+                target, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600, dir_fd=kwargs['dst_dir_fd'])
+            try:
+                os.write(descriptor, b'alternate-final')
+            finally:
+                os.close(descriptor)
+        return result
+
+    monkeypatch.setattr(formal_training.os, 'link', replace_final_after_link)
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='publication changed'):
+            authority.write_immutable(Path('epoch_1.pth'), b'ours')
+    assert (output / 'epoch_1.pth').read_bytes() == b'alternate-final'
+    assert (output / '.epoch_1.pth.pending').read_bytes() == b'ours'
 
 
 def test_mutable_publish_detects_pending_replacement_before_replace(
@@ -772,6 +937,92 @@ def test_private_runner_staging_normal_cleanup_and_fork_fd_closure():
     staging.cleanup()
     assert not path.exists()
     assert not tuple(formal_training._ACTIVE_PRIVATE_RUNNER_STAGINGS)
+
+
+@pytest.mark.parametrize('failure', ['child_open', 'fstat', 'mode'])
+def test_private_runner_staging_constructor_failure_closes_and_removes_exact_dir(
+        monkeypatch, failure):
+    token = f'constructor-{failure}'
+    name = f'mambapose-formal-runner-full-seed0-{token}'
+    path = Path('/tmp') / name
+    assert not path.exists()
+    monkeypatch.setattr(formal_training.secrets, 'token_hex', lambda _n: token)
+    original_open = formal_training.os.open
+    original_fstat = formal_training.os.fstat
+    child_fd = None
+
+    def injected_open(target, flags, *args, **kwargs):
+        nonlocal child_fd
+        if target == name and failure == 'child_open':
+            raise OSError('injected child open failure')
+        descriptor = original_open(target, flags, *args, **kwargs)
+        if target == name:
+            child_fd = descriptor
+        return descriptor
+
+    def injected_fstat(descriptor):
+        observed = original_fstat(descriptor)
+        if descriptor == child_fd and failure == 'fstat':
+            raise OSError('injected child fstat failure')
+        if descriptor == child_fd and failure == 'mode':
+            values = list(observed)
+            values[0] = (observed.st_mode & ~0o777) | 0o755
+            return os.stat_result(values)
+        return observed
+
+    monkeypatch.setattr(formal_training.os, 'open', injected_open)
+    monkeypatch.setattr(formal_training.os, 'fstat', injected_fstat)
+    try:
+        with pytest.raises((OSError, FormalTrainingError)):
+            formal_training._PrivateRunnerStaging('full-seed0')
+        assert not path.exists()
+        assert not tuple(formal_training._ACTIVE_PRIVATE_RUNNER_STAGINGS)
+        if child_fd is not None:
+            with pytest.raises(OSError):
+                original_fstat(child_fd)
+    finally:
+        if path.is_dir():
+            path.rmdir()
+
+
+def test_private_runner_staging_constructor_failure_preserves_replaced_name(
+        monkeypatch):
+    token = 'constructor-replaced-name'
+    name = f'mambapose-formal-runner-full-seed0-{token}'
+    path = Path('/tmp') / name
+    held = Path('/tmp') / f'{name}.held'
+    victim = Path('/tmp') / f'{name}.victim'
+    for candidate in (path, held, victim):
+        assert not candidate.exists() and not candidate.is_symlink()
+    monkeypatch.setattr(formal_training.secrets, 'token_hex', lambda _n: token)
+    original_open = formal_training.os.open
+
+    def replace_before_child_open(target, flags, *args, **kwargs):
+        if target == name:
+            path.rename(held)
+            victim.mkdir()
+            (victim / 'valuable.bin').write_bytes(b'valuable')
+            path.symlink_to(victim, target_is_directory=True)
+            raise OSError('injected replaced-name child open failure')
+        return original_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(formal_training.os, 'open', replace_before_child_open)
+    try:
+        with pytest.raises(OSError, match='replaced-name'):
+            formal_training._PrivateRunnerStaging('full-seed0')
+        assert path.is_symlink()
+        assert held.is_dir()
+        assert (victim / 'valuable.bin').read_bytes() == b'valuable'
+        assert not tuple(formal_training._ACTIVE_PRIVATE_RUNNER_STAGINGS)
+    finally:
+        if path.is_symlink():
+            path.unlink()
+        if (victim / 'valuable.bin').exists():
+            (victim / 'valuable.bin').unlink()
+        if victim.is_dir():
+            victim.rmdir()
+        if held.is_dir():
+            held.rmdir()
 
 
 def test_public_recovery_rejects_preexisting_same_byte_output_replacement(
@@ -921,6 +1172,157 @@ def test_epoch_recovery_removes_only_exact_next_fixed_pending(tmp_path):
     recovered = recover_training_lineage(tmp_path, init, dataset_size=11)
     assert recovered is not None and recovered.completed_epoch == 1
     assert not pending.exists()
+
+
+@pytest.mark.parametrize('kind', ['exact', 'mutable'])
+def test_recovery_pending_cleanup_rejects_classified_name_replacement(
+        tmp_path, monkeypatch, kind):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    name = ('.epoch_1.pth.pending' if kind == 'exact'
+            else '.training.jsonl.pending')
+    pending = output / name
+    pending.write_bytes(b'classified')
+    held_original = output / f'{name}.held'
+    original_unlink = formal_training._FormalOutputAuthority.unlink
+    swapped = False
+
+    def replace_before_unlink(self, relative, *args, **kwargs):
+        nonlocal swapped
+        if Path(relative).as_posix() == name and not swapped:
+            swapped = True
+            pending.rename(held_original)
+            pending.write_bytes(b'foreign-replacement')
+        return original_unlink(self, relative, *args, **kwargs)
+
+    monkeypatch.setattr(
+        formal_training._FormalOutputAuthority, 'unlink',
+        replace_before_unlink)
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='authority'):
+            if kind == 'exact':
+                formal_training._recover_exact_pending_transaction(
+                    authority, next_epoch=1, committed=0)
+            else:
+                formal_training._recover_linked_pending_publications(
+                    authority, committed=0)
+    assert pending.read_bytes() == b'foreign-replacement'
+    assert held_original.read_bytes() == b'classified'
+
+
+def test_uncommitted_next_checkpoint_cleanup_uses_logged_sha_and_identity(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    orders = trace_epoch_orders(init, 2, dataset_size=11)
+    for epoch in (1, 2):
+        write_resume_checkpoint(
+            repository_root=tmp_path, expected=init, completed_epoch=epoch,
+            model_state={'weight': torch.ones(1)}, optimizer_state={},
+            scheduler_state={}, scaler_state={}, order_hashes=orders[:epoch],
+            dataset_size=11)
+    (output / 'epoch-commits/epoch_2.json').unlink()
+    checkpoint = output / 'epoch_2.pth'
+    held_original = output / 'epoch_2.pth.uncommitted'
+    original_unlink = formal_training._FormalOutputAuthority.unlink
+    swapped = False
+
+    def replace_before_rollback(self, relative, *args, **kwargs):
+        nonlocal swapped
+        if Path(relative) == Path('epoch_2.pth') and not swapped:
+            swapped = True
+            checkpoint.rename(held_original)
+            checkpoint.write_bytes(b'foreign-replacement')
+        return original_unlink(self, relative, *args, **kwargs)
+
+    monkeypatch.setattr(
+        formal_training._FormalOutputAuthority, 'unlink',
+        replace_before_rollback)
+    with pytest.raises(FormalTrainingError, match='authority'):
+        recover_training_lineage(tmp_path, init, dataset_size=11)
+    assert checkpoint.read_bytes() == b'foreign-replacement'
+    assert held_original.exists()
+
+
+def test_uncommitted_log_cleanup_uses_captured_sha_and_identity(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    orders = trace_epoch_orders(init, 2, dataset_size=11)
+    for epoch in (1, 2):
+        write_resume_checkpoint(
+            repository_root=tmp_path, expected=init, completed_epoch=epoch,
+            model_state={'weight': torch.ones(1)}, optimizer_state={},
+            scheduler_state={}, scaler_state={}, order_hashes=orders[:epoch],
+            dataset_size=11)
+    (output / 'epoch-commits/epoch_2.json').unlink()
+    log = output / 'training.jsonl'
+    held_original = output / 'training.jsonl.uncommitted'
+    original_write = formal_training._FormalOutputAuthority.write_mutable
+    swapped = False
+
+    def replace_before_rollback(self, relative, *args, **kwargs):
+        nonlocal swapped
+        if Path(relative) == Path('training.jsonl') and not swapped:
+            swapped = True
+            log.rename(held_original)
+            log.write_bytes(b'foreign-replacement')
+        return original_write(self, relative, *args, **kwargs)
+
+    monkeypatch.setattr(
+        formal_training._FormalOutputAuthority, 'write_mutable',
+        replace_before_rollback)
+    with pytest.raises(FormalTrainingError, match='authority'):
+        recover_training_lineage(tmp_path, init, dataset_size=11)
+    assert log.read_bytes() == b'foreign-replacement'
+    assert held_original.exists()
+
+
+def test_uncommitted_best_cleanup_uses_captured_decision_identity(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    orders = trace_epoch_orders(init, 6, dataset_size=11)
+    decision = None
+    for epoch in range(1, 6):
+        if epoch == 5:
+            decision = _publish_test_best(tmp_path, init, 5, 0.5)
+        write_resume_checkpoint(
+            repository_root=tmp_path, expected=init,
+            completed_epoch=epoch,
+            model_state={'weight': torch.ones(1)}, optimizer_state={},
+            scheduler_state={}, scaler_state={},
+            order_hashes=orders[:epoch], dataset_size=11,
+            best_decision_path=decision)
+    _publish_test_best(tmp_path, init, 6, 0.6)
+    extra = output / 'best-lineages/epoch_6.json'
+    held_original = output / 'best-lineages/epoch_6.json.uncommitted'
+    original_unlink = formal_training._FormalOutputAuthority.unlink
+    swapped = False
+
+    def replace_before_cleanup(self, relative, *args, **kwargs):
+        nonlocal swapped
+        if Path(relative) == Path('best-lineages/epoch_6.json') and not swapped:
+            swapped = True
+            extra.rename(held_original)
+            extra.write_bytes(b'foreign-replacement')
+        return original_unlink(self, relative, *args, **kwargs)
+
+    monkeypatch.setattr(
+        formal_training._FormalOutputAuthority, 'unlink',
+        replace_before_cleanup)
+    with pytest.raises(FormalTrainingError, match='authority'):
+        recover_training_lineage(tmp_path, init, dataset_size=11)
+    assert extra.read_bytes() == b'foreign-replacement'
+    assert held_original.exists()
 
 
 def test_epoch_recovery_rejects_unknown_or_multiple_fixed_pending(tmp_path):
@@ -1139,6 +1541,167 @@ def test_public_completed_result_recovers_linked_pending_and_validates_bindings(
         tmp_path, init, dataset_size=11)
     assert recovered == result
     assert not pending.exists()
+
+
+@pytest.mark.parametrize('target', [
+    'train-result.json', 'epoch-commits/epoch_300.json',
+    'best-lineages/epoch_5.json', 'best_coco_AP_epoch_5.pth',
+    'epoch_299.pth', 'epoch_300.pth', 'training.jsonl',
+    '__root_after_files__',
+])
+def test_completed_result_revalidates_every_captured_binding_before_return(
+        tmp_path, monkeypatch, target):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    payloads = {
+        'best_coco_AP_epoch_5.pth': b'best',
+        'epoch_299.pth': b'299',
+        'epoch_300.pth': b'300',
+        'training.jsonl': b'log',
+    }
+    for name, payload in payloads.items():
+        (output / name).write_bytes(payload)
+    best_sha = _sha(output / 'best_coco_AP_epoch_5.pth')
+    decision = {
+        'schema_version': 1,
+        'identity': {'run_id': init.run_id, 'role': init.role, 'seed': init.seed},
+        'completed_epoch': 5, 'metric': 0.5,
+        'checkpoint': {
+            'path': 'best_coco_AP_epoch_5.pth', 'sha256': best_sha},
+        'previous_decision': None,
+    }
+    decisions = output / 'best-lineages'
+    decisions.mkdir()
+    decision_path = decisions / 'epoch_5.json'
+    decision_path.write_bytes(formal_training._canonical_json_bytes(decision))
+    order_hashes = tuple(
+        hashlib.sha256(f'order:{epoch}'.encode()).hexdigest()
+        for epoch in range(1, 301))
+    run_init_sha = _sha(output / 'run-init.json')
+    result = formal_training.FormalTrainResult(
+        run_init_sha256=run_init_sha, initialization=init.initialization,
+        run_id=init.run_id, role=init.role, seed=init.seed,
+        output_root=init.output_root,
+        best_checkpoint=FileBinding(
+            init.output_root / 'best_coco_AP_epoch_5.pth', best_sha),
+        resume_checkpoints=(
+            FileBinding(init.output_root / 'epoch_299.pth',
+                        _sha(output / 'epoch_299.pth')),
+            FileBinding(init.output_root / 'epoch_300.pth',
+                        _sha(output / 'epoch_300.pth'))),
+        structured_log=FileBinding(
+            init.output_root / 'training.jsonl', _sha(output / 'training.jsonl')),
+        order_hashes=order_hashes, final_epoch=300, status='complete')
+    final_commit = {
+        'schema_version': 1,
+        'identity': {
+            'run_id': init.run_id, 'role': init.role, 'seed': init.seed,
+            'run_init_sha256': run_init_sha},
+        'completed_epoch': 300,
+        'checkpoint': {
+            'path': 'epoch_300.pth',
+            'sha256': result.resume_checkpoints[1].sha256},
+        'structured_log': {
+            'path': 'training.jsonl', 'sha256': result.structured_log.sha256},
+        'log_record': {
+            'schema_version': 1, 'run_id': init.run_id, 'role': init.role,
+            'seed': init.seed, 'epoch': 300,
+            'order_sha256': order_hashes[-1],
+            'resume_checkpoint': 'epoch_300.pth',
+            'resume_sha256': result.resume_checkpoints[1].sha256},
+        'best': {
+            'decision': {
+                'path': 'best-lineages/epoch_5.json',
+                'sha256': _sha(decision_path)},
+            'checkpoint': {
+                'path': 'best_coco_AP_epoch_5.pth', 'sha256': best_sha}},
+        'previous_commit': {'path': 'epoch_299.json', 'sha256': 'a' * 64},
+    }
+    commits = output / 'epoch-commits'
+    commits.mkdir()
+    (commits / 'epoch_300.json').write_bytes(
+        formal_training._canonical_json_bytes(final_commit))
+    result_path = output / 'train-result.json'
+    result_path.write_bytes(formal_training._canonical_json_bytes(
+        formal_training._train_result_document(result)))
+    monkeypatch.setattr(
+        formal_training.FormalTrainResult, 'from_dict',
+        classmethod(lambda _cls, *_args, **_kwargs: result))
+    replaced = False
+    held_original = (
+        output.parent / 'run.captured' if target == '__root_after_files__'
+        else output / f'{Path(target).name}.captured')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        original_hold = authority.hold_streaming_regular
+
+        def replace_target():
+            nonlocal replaced
+            if replaced:
+                return
+            replaced = True
+            if target == '__root_after_files__':
+                output.rename(held_original)
+                output.mkdir()
+                return
+            live = output / target
+            live.rename(held_original)
+            live.parent.mkdir(parents=True, exist_ok=True)
+            live.write_bytes(b'foreign-replacement')
+
+        def hold(relative):
+            captured = original_hold(relative)
+            if Path(relative).as_posix() == target:
+                replace_target()
+            elif target == '__root_after_files__' \
+                    and Path(relative) == Path('training.jsonl'):
+                original_revalidate = captured.revalidate
+
+                def revalidate_then_replace_root():
+                    original_revalidate()
+                    replace_target()
+
+                monkeypatch.setattr(
+                    captured, 'revalidate', revalidate_then_replace_root)
+            return captured
+
+        monkeypatch.setattr(authority, 'hold_streaming_regular', hold)
+        with pytest.raises(FormalTrainingError, match='authority|binding|result'):
+            formal_training._load_completed_training_result_held(
+                tmp_path, init, authority)
+    if target == '__root_after_files__':
+        assert output.is_dir() and not tuple(output.iterdir())
+        assert held_original.is_dir()
+    else:
+        assert (output / target).read_bytes() == b'foreign-replacement'
+        assert held_original.exists()
+
+
+@pytest.mark.parametrize('mutation', ['nonfinite_metric', 'invalid_predecessor'])
+def test_training_completed_decision_rejects_incomplete_chain_semantics(
+        mutation):
+    init = _run_init(output_root='run')
+    checkpoint = {
+        'path': 'best_coco_AP_epoch_5.pth', 'sha256': 'b' * 64}
+    decision = {
+        'schema_version': 1,
+        'identity': {
+            'run_id': init.run_id, 'role': init.role, 'seed': init.seed},
+        'completed_epoch': 5, 'metric': 0.5,
+        'checkpoint': checkpoint, 'previous_decision': None,
+    }
+    if mutation == 'nonfinite_metric':
+        decision['metric'] = float('nan')
+    else:
+        decision['previous_decision'] = {
+            'path': 'best-lineages/../epoch_1.json', 'sha256': 'f' * 64}
+    payload = json.dumps(decision, sort_keys=True).encode()
+    with pytest.raises(FormalTrainingError, match='decision'):
+        formal_training._validate_completed_best_decision_payload(
+            payload, expected_sha256=hashlib.sha256(payload).hexdigest(),
+            expected=init, decision_path='best-lineages/epoch_5.json',
+            expected_checkpoint=checkpoint)
 
 
 def test_held_epoch_route_never_uses_pathname_or_legacy_atomic_io(
@@ -1641,6 +2204,44 @@ def test_resume_retention_never_publishes_a_fourth_checkpoint(tmp_path):
         'epoch_3.pth', 'epoch_4.pth')
 
 
+def test_stale_checkpoint_prune_rejects_replacement_after_commit_classification(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    orders = trace_epoch_orders(init, 3, dataset_size=11)
+    for epoch in (1, 2):
+        write_resume_checkpoint(
+            repository_root=tmp_path, expected=init, completed_epoch=epoch,
+            model_state={'weight': torch.ones(1)}, optimizer_state={},
+            scheduler_state={}, scaler_state={}, order_hashes=orders[:epoch],
+            dataset_size=11)
+    stale = output / 'epoch_1.pth'
+    held_original = output / 'epoch_1.pth.committed'
+    original_unlink = formal_training._FormalOutputAuthority.unlink
+    swapped = False
+
+    def replace_before_prune(self, relative, *args, **kwargs):
+        nonlocal swapped
+        if Path(relative) == Path('epoch_1.pth') and not swapped:
+            swapped = True
+            stale.rename(held_original)
+            stale.write_bytes(b'foreign-replacement')
+        return original_unlink(self, relative, *args, **kwargs)
+
+    monkeypatch.setattr(
+        formal_training._FormalOutputAuthority, 'unlink', replace_before_prune)
+    with pytest.raises(FormalTrainingError, match='authority'):
+        write_resume_checkpoint(
+            repository_root=tmp_path, expected=init, completed_epoch=3,
+            model_state={'weight': torch.ones(1)}, optimizer_state={},
+            scheduler_state={}, scaler_state={}, order_hashes=orders,
+            dataset_size=11)
+    assert stale.read_bytes() == b'foreign-replacement'
+    assert held_original.exists()
+
+
 @pytest.mark.parametrize('field', [
     'manifest_sha256', 'config_closure_sha256', 'resolved_config_sha256',
     'environment_inventory_sha256', 'run_id', 'role', 'seed',
@@ -1975,6 +2576,68 @@ def test_training_stop_publishes_no_partial_epoch_and_acks_last_init(
         (output / 'stop-ack.json').read_text(encoding='utf-8'))
     assert acknowledgement['resume']['completed_epoch'] == 0
     assert acknowledgement['resume']['sha256'] == _sha(init_path)
+
+
+@pytest.mark.parametrize(
+    ('boundary', 'completed_epoch', 'prior_epoch'),
+    [('before_val_epoch', 5, 0),
+     ('after_val_iter', 10, 9),
+     ('after_val_epoch', 300, 299)],
+)
+def test_validation_stop_acks_prior_commit_and_never_publishes_pending_epoch(
+        tmp_path, monkeypatch, boundary, completed_epoch, prior_epoch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    init_path = output / 'run-init.json'
+    write_formal_run_init(init, init_path)
+    (output / 'stop-request.json').write_bytes(b'pending-stop')
+    hook = formal_training._build_training_hook(
+        root=tmp_path, init=init, run_init_path=init_path, resume=None)
+    hook.order_hashes = [f'{epoch:064x}' for epoch in range(1, completed_epoch + 1)]
+    hook.pending_checkpoint = {'completed_epoch': completed_epoch}
+    if prior_epoch:
+        checkpoint = output / f'epoch_{prior_epoch}.pth'
+        checkpoint.write_bytes(f'committed-{prior_epoch}'.encode())
+        hook.last_checkpoint = checkpoint
+    runner = SimpleNamespace(epoch=completed_epoch)
+    synchronized = []
+    acknowledgements = []
+    monkeypatch.setattr(torch.cuda, 'synchronize', lambda: synchronized.append(True))
+    monkeypatch.setattr(
+        formal_training, '_poll_formal_training_stop',
+        lambda _authority, safe_boundary: SimpleNamespace(
+            request_id=f'stop-{boundary}', boundary=safe_boundary))
+
+    def acknowledge(_authority, _request, resume):
+        acknowledgements.append(resume)
+        return SimpleNamespace(exit_code=75)
+
+    monkeypatch.setattr(
+        formal_training, '_write_formal_training_stop_ack', acknowledge)
+
+    def forbidden_publish(*_args, **_kwargs):
+        pytest.fail('interrupted validation published an epoch artifact')
+
+    for name in ('publish_best_checkpoint', 'inherit_best_checkpoint',
+                 'write_resume_checkpoint'):
+        monkeypatch.setattr(formal_training, name, forbidden_publish)
+    with pytest.raises(SystemExit) as stopped:
+        if boundary == 'before_val_epoch':
+            hook.before_val_epoch(runner)
+        elif boundary == 'after_val_iter':
+            hook.after_val_iter(runner, completed_epoch - 1)
+        else:
+            # This request arrives after the final after_val_iter callback.
+            hook.after_val_epoch(runner, metrics=None)
+    assert stopped.value.code == 75
+    assert synchronized == [True]
+    assert len(acknowledgements) == 1
+    assert acknowledgements[0].completed_epoch == prior_epoch
+    assert hook.pending_checkpoint == {'completed_epoch': completed_epoch}
+    assert not (output / f'epoch_{completed_epoch}.pth').exists()
+    assert not (output / f'epoch-commits/epoch_{completed_epoch}.json').exists()
+    assert not tuple(output.glob(f'best_coco_AP_epoch_{completed_epoch}.pth'))
 
 
 def test_formal_training_stop_uses_one_held_output_authority_across_ack(
