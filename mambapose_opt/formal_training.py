@@ -15,11 +15,13 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import struct
 import stat
 import subprocess
 import tempfile
+import time
 from types import MappingProxyType
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
@@ -28,6 +30,10 @@ import torch
 
 from .formal_checkpoint import FileAuthority
 from .formal_checkpoint import load_formal_backbone_initialization
+from .formal_checkpoint import (
+    FormalCheckpointError,
+    load_authenticated_tensor_document,
+)
 from .formal_determinism import trace_epoch_orders
 from .formal_environment import (
     EnvironmentAuthority,
@@ -584,12 +590,43 @@ def _captured_closure_sha256(records: Mapping[str, bytes]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+@dataclass(frozen=True)
+class _ConfigLoadAuthority:
+    config: Path
+    config_closure_sha256: str
+    git_commit: str
+
+
+def _validate_trace_source(root: Path) -> str:
+    try:
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=root, text=True,
+            stderr=subprocess.DEVNULL).strip()
+        dirty = subprocess.check_output(
+            ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+            cwd=root, text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise FormalTrainingError('trace source Git authority failed') from error
+    if not _is_commit(commit):
+        raise FormalTrainingError('trace source commit is invalid')
+    if dirty:
+        raise FormalTrainingError('trace source must be clean')
+    return commit
+
+
 def _revalidate_live_config_authority(
-        init: FormalRunInit, root: Path) -> None:
-    if _validate_frozen_source(root) != init.git_commit:
+        authority: _ConfigLoadAuthority, root: Path, *, source_kind: str
+        ) -> None:
+    if source_kind == 'frozen':
+        commit = _validate_frozen_source(root)
+    elif source_kind == 'trace':
+        commit = _validate_trace_source(root)
+    else:
+        raise FormalTrainingError('formal config source kind is invalid')
+    if commit != authority.git_commit:
         raise FormalTrainingError('formal source commit changed')
-    if config_closure_sha256(root, init.config) \
-            != init.config_closure_sha256:
+    if config_closure_sha256(root, authority.config) \
+            != authority.config_closure_sha256:
         raise FormalTrainingError('formal config closure changed')
 
 
@@ -654,17 +691,18 @@ def _remove_private_config_snapshot(snapshot: Path) -> None:
     shutil.rmtree(snapshot)
 
 
-def load_authenticated_formal_config(
-        init: FormalRunInit, repository_root: Path):
-    """Parse a private immutable copy of the already authenticated closure."""
-    if not isinstance(init, FormalRunInit):
-        raise FormalTrainingError('formal config init type is invalid')
+def _load_authenticated_config(
+        authority: _ConfigLoadAuthority, repository_root: Path, *,
+        source_kind: str):
     root = Path(repository_root).absolute()
-    _revalidate_live_config_authority(init, root)
-    records = _capture_config_closure(root, init.config)
-    if _captured_closure_sha256(records) != init.config_closure_sha256:
+    _revalidate_live_config_authority(
+        authority, root, source_kind=source_kind)
+    records = _capture_config_closure(root, authority.config)
+    if _captured_closure_sha256(records) \
+            != authority.config_closure_sha256:
         raise FormalTrainingError('captured formal config closure mismatch')
-    _revalidate_live_config_authority(init, root)
+    _revalidate_live_config_authority(
+        authority, root, source_kind=source_kind)
     temporary_root = Path('/tmp')
     if temporary_root.is_symlink() or not temporary_root.is_dir():
         raise FormalTrainingError('private system temporary root is unsafe')
@@ -697,10 +735,11 @@ def load_authenticated_formal_config(
         for directory in directories:
             directory.chmod(0o500)
         snapshot.chmod(0o500)
-        _validate_private_config_snapshot(snapshot, records, init.config)
+        _validate_private_config_snapshot(snapshot, records, authority.config)
         from mmengine.config import Config
-        parsed = Config.fromfile(snapshot / init.config)
-        _validate_private_config_snapshot(snapshot, records, init.config)
+        parsed = Config.fromfile(snapshot / authority.config)
+        _validate_private_config_snapshot(
+            snapshot, records, authority.config)
         document = parsed.to_dict()
         fingerprint = _deterministic_config_fingerprint(document)
         detached = Config(document)
@@ -714,7 +753,8 @@ def load_authenticated_formal_config(
     finally:
         authority_error: Exception | None = None
         try:
-            _revalidate_live_config_authority(init, root)
+            _revalidate_live_config_authority(
+                authority, root, source_kind=source_kind)
         except Exception as error:
             authority_error = error
         try:
@@ -723,7 +763,8 @@ def load_authenticated_formal_config(
             if authority_error is None:
                 authority_error = error
         try:
-            _revalidate_live_config_authority(init, root)
+            _revalidate_live_config_authority(
+                authority, root, source_kind=source_kind)
         except Exception as error:
             if authority_error is None:
                 authority_error = error
@@ -743,6 +784,40 @@ def load_authenticated_formal_config(
         raise FormalTrainingError(
             'formal config changed after private snapshot cleanup')
     return detached
+
+
+def load_authenticated_formal_config(
+        init: FormalRunInit, repository_root: Path):
+    """Parse a private immutable copy of a run-init config closure."""
+    if not isinstance(init, FormalRunInit):
+        raise FormalTrainingError('formal config init type is invalid')
+    authority = _ConfigLoadAuthority(
+        config=init.config,
+        config_closure_sha256=init.config_closure_sha256,
+        git_commit=init.git_commit)
+    return _load_authenticated_config(
+        authority, repository_root, source_kind='frozen')
+
+
+def load_authenticated_trace_config(
+        manifest: FormalStageCManifest, run_id: str, repository_root: Path):
+    """Parse the selected public-manifest config from captured exact bytes."""
+    if not isinstance(manifest, FormalStageCManifest):
+        raise FormalTrainingError('trace manifest type is invalid')
+    root = Path(repository_root).absolute()
+    if manifest.repository_root.absolute() != root:
+        raise FormalTrainingError('trace manifest repository root mismatch')
+    matches = tuple(spec for spec in manifest.runs if spec.run_id == run_id)
+    if len(matches) != 1:
+        raise FormalTrainingError('trace run id is invalid')
+    spec = matches[0]
+    commit = _validate_trace_source(root)
+    authority = _ConfigLoadAuthority(
+        config=spec.config,
+        config_closure_sha256=spec.config_sha256,
+        git_commit=commit)
+    return _load_authenticated_config(
+        authority, root, source_kind='trace')
 
 
 def run_formal_model_preflight(
@@ -1123,6 +1198,10 @@ def _validate_finite_tree(value: object, label: str) -> None:
 @dataclass(frozen=True)
 class ResumeState:
     run_init_sha256: str
+    checkpoint_sha256: str
+    commit_path: str
+    commit_sha256: str
+    structured_log_sha256: str
     completed_epoch: int
     order_hashes: tuple[str, ...]
     model_state: Mapping[str, Any]
@@ -1130,6 +1209,14 @@ class ResumeState:
     scheduler_state: Mapping[str, Any]
     scaler_state: Mapping[str, Any]
     rng_state: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _EpochCommitChain:
+    documents: tuple[Mapping[str, Any], ...]
+    paths: tuple[Path, ...]
+    sha256s: tuple[str, ...]
+    structured_log: bytes
 
 
 def _resume_document(
@@ -1176,9 +1263,296 @@ def _atomic_torch_save(document: Mapping[str, Any], destination: Path) -> None:
         with temporary.open('rb') as stream:
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
+            _fsync_directory(destination.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _durable_unlink(path: Path) -> None:
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def _training_log_record(
+        expected: FormalRunInit, completed_epoch: int,
+        order_sha256: str, checkpoint: Path) -> dict[str, Any]:
+    return {
+        'schema_version': 1, 'run_id': expected.run_id,
+        'role': expected.role, 'seed': expected.seed,
+        'epoch': completed_epoch, 'order_sha256': order_sha256,
+        'resume_checkpoint': checkpoint.name,
+        'resume_sha256': _sha256_file(checkpoint),
+    }
+
+
+def _epoch_commit_path(output: Path, epoch: int) -> Path:
+    return output / 'epoch-commits' / f'epoch_{epoch}.json'
+
+
+def _epoch_commit_document(
+        *, expected: FormalRunInit, completed_epoch: int,
+        checkpoint: Path, structured_log: Path,
+        log_record: Mapping[str, Any], previous_commit: Path | None,
+        best_decision: Path | None,
+        ) -> dict[str, Any]:
+    previous = None
+    if previous_commit is not None:
+        previous = {
+            'path': previous_commit.name,
+            'sha256': _sha256_file(previous_commit),
+        }
+    return {
+        'schema_version': 1,
+        'identity': {
+            'run_id': expected.run_id, 'role': expected.role,
+            'seed': expected.seed,
+            'run_init_sha256': _sha256_file(
+                checkpoint.parent / 'run-init.json'),
+        },
+        'completed_epoch': completed_epoch,
+        'checkpoint': {
+            'path': checkpoint.name, 'sha256': _sha256_file(checkpoint)},
+        'structured_log': {
+            'path': structured_log.name,
+            'sha256': _sha256_file(structured_log)},
+        'log_record': dict(log_record),
+        'best': (None if best_decision is None else
+                 _best_epoch_authority(
+                     checkpoint.parent, expected, completed_epoch,
+                     best_decision)),
+        'previous_commit': previous,
+    }
+
+
+def _load_epoch_commit(
+        output: Path, expected: FormalRunInit, epoch: int
+        ) -> tuple[Mapping[str, Any], Path, str]:
+    path = _epoch_commit_path(output, epoch)
+    if path.is_symlink() or not path.is_file():
+        raise FormalTrainingError('resume epoch commit is unavailable')
+    try:
+        payload = path.read_bytes()
+        document = json.loads(payload.decode('utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FormalTrainingError('resume epoch commit is malformed') from error
+    fields = {
+        'schema_version', 'identity', 'completed_epoch', 'checkpoint',
+        'structured_log', 'log_record', 'best', 'previous_commit'}
+    if not isinstance(document, Mapping) or set(document) != fields \
+            or document['schema_version'] != 1 \
+            or document['completed_epoch'] != epoch:
+        raise FormalTrainingError('resume epoch commit fields are invalid')
+    identity = document['identity']
+    expected_identity = {
+        'run_id': expected.run_id, 'role': expected.role,
+        'seed': expected.seed,
+        'run_init_sha256': _sha256_file(output / 'run-init.json')}
+    if not isinstance(identity, Mapping) or set(identity) != set(
+            expected_identity):
+        raise FormalTrainingError('resume epoch commit identity fields invalid')
+    for field, value in expected_identity.items():
+        if identity[field] != value:
+            raise FormalTrainingError(
+                f'resume epoch commit {field.replace("_", " ")} mismatch')
+    checkpoint = document['checkpoint']
+    log = document['structured_log']
+    if checkpoint != {
+            'path': f'epoch_{epoch}.pth',
+            'sha256': checkpoint.get('sha256') if isinstance(
+                checkpoint, Mapping) else None} \
+            or not _is_sha(checkpoint['sha256']):
+        raise FormalTrainingError('resume epoch commit checkpoint is invalid')
+    if log != {
+            'path': 'training.jsonl',
+            'sha256': log.get('sha256') if isinstance(log, Mapping) else None} \
+            or not _is_sha(log['sha256']):
+        raise FormalTrainingError('resume epoch commit log is invalid')
+    previous = document['previous_commit']
+    if epoch == 1:
+        if previous is not None:
+            raise FormalTrainingError('first epoch commit has a predecessor')
+    else:
+        predecessor = _epoch_commit_path(output, epoch - 1)
+        if previous != {
+                'path': predecessor.name,
+                'sha256': _sha256_file(predecessor)}:
+            raise FormalTrainingError('resume epoch commit chain mismatch')
+    record = document['log_record']
+    if not isinstance(record, Mapping) or record != {
+            'schema_version': 1, 'run_id': expected.run_id,
+            'role': expected.role, 'seed': expected.seed, 'epoch': epoch,
+            'order_sha256': record.get('order_sha256'),
+            'resume_checkpoint': f'epoch_{epoch}.pth',
+            'resume_sha256': checkpoint['sha256']} \
+            or not _is_sha(record['order_sha256']):
+        raise FormalTrainingError('resume epoch commit log record is invalid')
+    return document, path, hashlib.sha256(payload).hexdigest()
+
+
+def _load_epoch_commit_chain(
+        output: Path, expected: FormalRunInit) -> _EpochCommitChain:
+    commits = output / 'epoch-commits'
+    if not commits.exists():
+        return _EpochCommitChain((), (), (), b'')
+    if commits.is_symlink() or not commits.is_dir():
+        raise FormalTrainingError('resume epoch commit root is unsafe')
+    epochs: list[int] = []
+    for child in commits.iterdir():
+        match = re.fullmatch(r'epoch_([1-9][0-9]*)\.json', child.name)
+        if match is None or child.is_symlink() or not child.is_file():
+            raise FormalTrainingError('resume epoch commit inventory is invalid')
+        epochs.append(int(match.group(1)))
+    epochs.sort()
+    if epochs and epochs != list(range(1, epochs[-1] + 1)):
+        raise FormalTrainingError('resume epoch commit sequence is incomplete')
+    documents: list[Mapping[str, Any]] = []
+    paths: list[Path] = []
+    sha256s: list[str] = []
+    structured_log = b''
+    previous_best: Mapping[str, Any] | None = None
+    for epoch in epochs:
+        document, path, sha256 = _load_epoch_commit(output, expected, epoch)
+        structured_log += _canonical_json_bytes(document['log_record'])
+        expected_log_sha = hashlib.sha256(structured_log).hexdigest()
+        if document['structured_log']['sha256'] != expected_log_sha:
+            raise FormalTrainingError(
+                'resume epoch commit structured log chain mismatch')
+        best = document['best']
+        if best is not None:
+            _validate_epoch_best_authority(
+                output, expected, epoch, best)
+            if previous_best is None or best != previous_best:
+                decision_epoch = _best_authority_decision_epoch(best)
+                if decision_epoch != epoch:
+                    raise FormalTrainingError(
+                        'new best decision does not match its epoch')
+                best_document, _, _ = _load_best_decision(
+                    output, expected, decision_epoch)
+                expected_previous = (
+                    None if previous_best is None
+                    else previous_best['decision'])
+                if best_document['previous_decision'] != expected_previous:
+                    raise FormalTrainingError(
+                        'epoch best decision chain mismatch')
+            previous_best = best
+        elif previous_best is not None:
+            raise FormalTrainingError('epoch best authority is not continuous')
+        documents.append(document)
+        paths.append(path)
+        sha256s.append(sha256)
+    return _EpochCommitChain(
+        tuple(documents), tuple(paths), tuple(sha256s), structured_log)
+
+
+def _resume_checkpoint_inventory(output: Path) -> Mapping[int, Path]:
+    checkpoints: dict[int, Path] = {}
+    for child in output.iterdir():
+        if not child.name.startswith('epoch_') or child.suffix != '.pth':
+            continue
+        match = re.fullmatch(r'epoch_([1-9][0-9]*)\.pth', child.name)
+        if match is None or child.is_symlink() or not child.is_file():
+            raise FormalTrainingError('resume checkpoint inventory is invalid')
+        epoch = int(match.group(1))
+        if epoch in checkpoints:
+            raise FormalTrainingError('duplicate resume checkpoint epoch')
+        checkpoints[epoch] = child
+    return MappingProxyType(checkpoints)
+
+
+def _validate_uncommitted_log_record(
+        line: bytes, *, expected: FormalRunInit, epoch: int,
+        checkpoint: Path) -> None:
+    try:
+        record = json.loads(line.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FormalTrainingError(
+            'uncommitted structured log record is malformed') from error
+    checkpoint_sha = _sha256_file(checkpoint)
+    if not isinstance(record, Mapping) or record != {
+            'schema_version': 1, 'run_id': expected.run_id,
+            'role': expected.role, 'seed': expected.seed, 'epoch': epoch,
+            'order_sha256': record.get('order_sha256'),
+            'resume_checkpoint': checkpoint.name,
+            'resume_sha256': checkpoint_sha} \
+            or not _is_sha(record['order_sha256']):
+        raise FormalTrainingError(
+            'uncommitted structured log record authority mismatch')
+
+
+def recover_training_lineage(
+        repository_root: Path, expected: FormalRunInit, *,
+        dataset_size: int = 118287) -> ResumeState | None:
+    """Recover only the exact next interrupted epoch transaction.
+
+    Epoch commit records are the durable authority.  A lone canonical next
+    checkpoint (and its complete atomic log record, when present) may be
+    rolled back.  Any other uncommitted or malformed inventory fails closed.
+    """
+    root = Path(repository_root).absolute()
+    output = root / expected.output_root
+    if output.is_symlink() or not output.is_dir():
+        raise FormalTrainingError('formal output root is unavailable')
+    chain = _load_epoch_commit_chain(output, expected)
+    committed = len(chain.documents)
+    checkpoints = dict(_resume_checkpoint_inventory(output))
+    for epoch in range(1, committed + 1):
+        checkpoint = checkpoints.get(epoch)
+        if checkpoint is not None and _sha256_file(checkpoint) \
+                != chain.documents[epoch - 1]['checkpoint']['sha256']:
+            raise FormalTrainingError('committed resume checkpoint drift')
+    if committed and committed not in checkpoints:
+        raise FormalTrainingError('latest committed checkpoint is unavailable')
+    uncommitted = sorted(set(checkpoints) - set(range(1, committed + 1)))
+    next_epoch = committed + 1
+    if uncommitted not in ([], [next_epoch]):
+        raise FormalTrainingError(
+            'resume inventory contains non-next uncommitted artifacts')
+
+    log = output / 'training.jsonl'
+    if log.exists() and (log.is_symlink() or not log.is_file()):
+        raise FormalTrainingError('resume training log is unsafe')
+    observed_log = log.read_bytes() if log.exists() else b''
+    if observed_log != chain.structured_log:
+        if uncommitted != [next_epoch] \
+                or not observed_log.startswith(chain.structured_log):
+            raise FormalTrainingError(
+                'resume structured log is not recoverable')
+        suffix = observed_log[len(chain.structured_log):]
+        if not suffix.endswith(b'\n') or suffix.count(b'\n') != 1:
+            raise FormalTrainingError(
+                'resume structured log has multiple incomplete records')
+        _validate_uncommitted_log_record(
+            suffix, expected=expected, epoch=next_epoch,
+            checkpoint=checkpoints[next_epoch])
+        if chain.structured_log:
+            _atomic_write_bytes(log, chain.structured_log)
+        else:
+            _durable_unlink(log)
+    _recover_best_lineage_state(root, expected, chain)
+    if uncommitted:
+        # The exact canonical next transaction is never loaded or resumed.
+        # Removing this already-authenticated regular child cannot affect any
+        # other path and permits a deterministic replay of the same epoch.
+        _durable_unlink(checkpoints[next_epoch])
+
+    if not committed:
+        return None
+    for epoch, checkpoint in sorted(checkpoints.items()):
+        if epoch <= committed - 2 and checkpoint.exists():
+            _durable_unlink(checkpoint)
+    latest = output / f'epoch_{committed}.pth'
+    return validate_resume_checkpoint(
+        latest, expected, repository_root=root, dataset_size=dataset_size)
 
 
 def write_resume_checkpoint(
@@ -1187,7 +1561,8 @@ def write_resume_checkpoint(
         optimizer_state: Mapping[str, Any],
         scheduler_state: Mapping[str, Any], scaler_state: Mapping[str, Any],
         order_hashes: Sequence[str], dataset_size: int = 118287,
-        validate_after_write: bool = True) -> Path:
+        validate_after_write: bool = True,
+        best_decision_path: Path | None = None) -> Path:
     if isinstance(completed_epoch, bool) or not isinstance(completed_epoch, int) \
             or completed_epoch < 1 or completed_epoch > expected.epochs:
         raise FormalTrainingError('completed epoch is invalid')
@@ -1201,6 +1576,14 @@ def write_resume_checkpoint(
     if len(order_hashes) != completed_epoch \
             or any(not _is_sha(value) for value in order_hashes):
         raise FormalTrainingError('order hash prefix is invalid')
+    if tuple(order_hashes) != trace_epoch_orders(
+            expected, completed_epoch, dataset_size=dataset_size):
+        raise FormalTrainingError('order hash prefix mismatch')
+    if validate_after_write:
+        prior_epoch = len(_load_epoch_commit_chain(output, expected).documents)
+        if completed_epoch != prior_epoch + 1:
+            raise FormalTrainingError(
+                'resume checkpoint does not extend the committed lineage')
     for label, state in (
             ('model', model_state), ('optimizer', optimizer_state),
             ('scheduler', scheduler_state), ('scaler', scaler_state)):
@@ -1216,42 +1599,60 @@ def write_resume_checkpoint(
         model_state=model_state, optimizer_state=optimizer_state,
         scheduler_state=scheduler_state, scaler_state=scaler_state)
     _atomic_torch_save(document, target)
-    try:
-        if validate_after_write:
-            validate_resume_checkpoint(
-                target, expected, repository_root=root,
-                dataset_size=dataset_size)
-    except Exception:
-        target.unlink(missing_ok=True)
-        raise
     if validate_after_write:
-        validated: list[tuple[int, Path]] = []
-        for candidate in output.glob('epoch_*.pth'):
-            try:
-                epoch = int(candidate.stem.removeprefix('epoch_'))
-                validate_resume_checkpoint(
-                    candidate, expected, repository_root=root,
-                    dataset_size=dataset_size)
-            except (ValueError, FormalTrainingError):
-                continue
-            validated.append((epoch, candidate))
-        for _epoch, stale in sorted(validated)[:-2]:
-            stale.unlink()
+        previous_commit = (
+            None if completed_epoch == 1
+            else _epoch_commit_path(output, completed_epoch - 1))
+        if previous_commit is not None and not previous_commit.is_file():
+            raise FormalTrainingError('previous epoch commit is unavailable')
+        log = output / 'training.jsonl'
+        prior = b'' if completed_epoch == 1 else log.read_bytes()
+        if len(prior.splitlines()) != completed_epoch - 1:
+            raise FormalTrainingError('prior structured log is incomplete')
+        record = _training_log_record(
+            expected, completed_epoch, order_hashes[-1], target)
+        _atomic_write_bytes(log, prior + _canonical_json_bytes(record))
+        commits = output / 'epoch-commits'
+        if not commits.exists():
+            commits.mkdir()
+            _fsync_directory(output)
+        commit = _epoch_commit_path(output, completed_epoch)
+        if commit.exists():
+            raise FormalTrainingError('resume epoch commit is immutable')
+        _atomic_write_bytes(commit, _canonical_json_bytes(
+            _epoch_commit_document(
+                expected=expected, completed_epoch=completed_epoch,
+                checkpoint=target, structured_log=log,
+                log_record=record, previous_commit=previous_commit,
+                best_decision=best_decision_path)))
+        validate_resume_checkpoint(
+            target, expected, repository_root=root,
+            dataset_size=dataset_size)
+        _recover_best_lineage_state(
+            root, expected, _load_epoch_commit_chain(output, expected))
+        committed_epochs = tuple(range(1, completed_epoch + 1))
+        for stale_epoch in committed_epochs[:-2]:
+            stale = output / f'epoch_{stale_epoch}.pth'
+            if stale.exists():
+                _durable_unlink(stale)
     return target
 
 
-def _load_resume_document(path: Path) -> Mapping[str, Any]:
-    if os.environ.get('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD') == '1':
-        raise FormalTrainingError(
-            'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD is forbidden')
+def _load_resume_document(
+        path: Path, *, expected_sha256: str) -> Mapping[str, Any]:
+    authority = FileAuthority(
+        authority_root=str(path.parent), path=path.name,
+        sha256=expected_sha256)
     try:
-        value = torch.load(path, map_location='cpu', weights_only=True)
-    except Exception as error:
+        with load_authenticated_tensor_document(path, authority) as value:
+            if not isinstance(value, Mapping):
+                raise FormalTrainingError(
+                    'resume checkpoint must be a mapping')
+            document = dict(value)
+    except FormalCheckpointError as error:
         raise FormalTrainingError(
             'resume checkpoint is not a weights-only document') from error
-    if not isinstance(value, Mapping):
-        raise FormalTrainingError('resume checkpoint must be a mapping')
-    return value
+    return document
 
 
 def validate_resume_checkpoint(
@@ -1267,7 +1668,23 @@ def validate_resume_checkpoint(
     run_init_path = output / 'run-init.json'
     if run_init_path.is_symlink() or not run_init_path.is_file():
         raise FormalTrainingError('resume run init is unavailable')
-    document = _load_resume_document(source)
+    match = re.fullmatch(r'epoch_([1-9][0-9]*)\.pth', source.name)
+    if match is None:
+        raise FormalTrainingError('resume checkpoint path is not canonical')
+    requested_epoch = int(match.group(1))
+    chain = _load_epoch_commit_chain(output, expected)
+    if requested_epoch > len(chain.documents):
+        raise FormalTrainingError('resume epoch commit is unavailable')
+    commit_document = chain.documents[requested_epoch - 1]
+    commit_path = chain.paths[requested_epoch - 1]
+    commit_sha256 = chain.sha256s[requested_epoch - 1]
+    checkpoint_sha256 = commit_document['checkpoint']['sha256']
+    log_path = output / 'training.jsonl'
+    if log_path.is_symlink() or not log_path.is_file() \
+            or log_path.read_bytes() != chain.structured_log:
+        raise FormalTrainingError('resume structured log authority mismatch')
+    document = _load_resume_document(
+        source, expected_sha256=checkpoint_sha256)
     fields = {
         'schema_version', 'run_init_sha256', 'identity', 'completed_epoch',
         'order_hashes', 'model', 'optimizer', 'scheduler', 'scaler', 'rng'}
@@ -1315,6 +1732,11 @@ def validate_resume_checkpoint(
     _validate_finite_tree(rng, 'RNG')
     return ResumeState(
         run_init_sha256=supplied_init_sha,
+        checkpoint_sha256=checkpoint_sha256,
+        commit_path=commit_path.relative_to(output).as_posix(),
+        commit_sha256=commit_sha256,
+        structured_log_sha256=hashlib.sha256(
+            chain.structured_log).hexdigest(),
         completed_epoch=epoch,
         order_hashes=tuple(order_hashes),
         model_state=MappingProxyType(dict(document['model'])),
@@ -1323,6 +1745,29 @@ def validate_resume_checkpoint(
         scaler_state=MappingProxyType(dict(document['scaler'])),
         rng_state=MappingProxyType(dict(rng)),
     )
+
+
+def _revalidate_resume_state_authority(
+        root: Path, init: FormalRunInit, source: Path,
+        state: ResumeState) -> None:
+    output = root / init.output_root
+    expected_source = output / f'epoch_{state.completed_epoch}.pth'
+    if Path(source).absolute() != expected_source:
+        raise FormalTrainingError('resume checkpoint is not the committed latest')
+    expected_commit = (
+        Path('epoch-commits') / f'epoch_{state.completed_epoch}.json')
+    if state.commit_path != expected_commit.as_posix():
+        raise FormalTrainingError('resume commit path authority mismatch')
+    for label, path, expected_sha in (
+            ('resume checkpoint', expected_source, state.checkpoint_sha256),
+            ('resume epoch commit', output / expected_commit,
+             state.commit_sha256),
+            ('resume structured log', output / 'training.jsonl',
+             state.structured_log_sha256)):
+        payload, _ = _read_absolute_regular_file_nofollow(
+            path, label=label)
+        if hashlib.sha256(payload).hexdigest() != expected_sha:
+            raise FormalTrainingError(f'{label} authority drift')
 
 
 _STATELESS_STAGES = frozenset(
@@ -1346,6 +1791,15 @@ class CooperativeStopRequest:
     issued_at_ns: int
     acknowledgement_path: str
     partial_staging_path: str
+    stage_output_root: str
+    control_path: str
+    control_sha256: str
+    root_device: int
+    root_inode: int
+    control_device: int
+    control_inode: int
+    input_device: int
+    input_inode: int
 
 
 @dataclass(frozen=True)
@@ -1436,8 +1890,161 @@ def run_synthetic_training_smoke(
         final_model_sha256=final_digest)
 
 
+_STOP_CONTROL_NAME = 'stop-request.json'
+_STOP_ACKNOWLEDGEMENT_NAME = 'stop-ack.json'
+_STOP_STAGING_NAME = 'partial-staging'
+_STOP_MAX_AGE_NS = 300 * 1_000_000_000
+_STOP_MAX_FUTURE_NS = 5 * 1_000_000_000
+
+
+def _canonical_absolute_path(value: Path | str, *, label: str) -> Path:
+    raw = os.fspath(value)
+    if not isinstance(raw, str) or not raw.startswith('/') \
+            or raw == '/' or raw.endswith('/') or '//' in raw:
+        raise FormalTrainingError(f'{label} is not a canonical absolute path')
+    components = raw.split('/')[1:]
+    if not components or any(part in {'', '.', '..'} for part in components):
+        raise FormalTrainingError(f'{label} is not a canonical absolute path')
+    path = Path(raw)
+    if str(path) != raw:
+        raise FormalTrainingError(f'{label} is not a canonical absolute path')
+    return path
+
+
+def _open_absolute_directory_nofollow(
+        path: Path, *, label: str = 'stage output root'
+        ) -> tuple[int, os.stat_result]:
+    canonical = _canonical_absolute_path(path, label=label)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open('/', flags)
+    try:
+        for component in canonical.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        observed = os.fstat(descriptor)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise FormalTrainingError('stage output root is not a directory')
+        return descriptor, observed
+    except OSError as error:
+        os.close(descriptor)
+        raise FormalTrainingError(f'{label} is unavailable or unsafe') from error
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _read_regular_file_at(
+        directory_fd: int, name: str, *, label: str
+        ) -> tuple[bytes, os.stat_result]:
+    if not isinstance(name, str) or not name or '/' in name \
+            or name in {'.', '..'}:
+        raise FormalTrainingError(f'{label} name is invalid')
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise FormalTrainingError(f'{label} is unavailable or unsafe') from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise FormalTrainingError(f'{label} is not a regular file')
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size) != (
+                after.st_dev, after.st_ino, after.st_size):
+            raise FormalTrainingError(f'{label} changed while reading')
+        payload = b''.join(chunks)
+        if len(payload) != before.st_size:
+            raise FormalTrainingError(f'{label} size changed while reading')
+        return payload, before
+    finally:
+        os.close(descriptor)
+
+
+def _read_absolute_regular_file_nofollow(
+        path: Path, *, label: str) -> tuple[bytes, os.stat_result]:
+    canonical = _canonical_absolute_path(path, label=label)
+    parent_fd, _parent_stat = _open_absolute_directory_nofollow(
+        canonical.parent, label=f'{label} parent')
+    try:
+        return _read_regular_file_at(
+            parent_fd, canonical.name, label=label)
+    finally:
+        os.close(parent_fd)
+
+
+def _stat_child_nofollow(directory_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _purge_directory_fd(directory_fd: int) -> None:
+    with os.scandir(directory_fd) as entries:
+        names = tuple(entry.name for entry in entries)
+    for name in names:
+        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(observed.st_mode):
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (
+                        observed.st_dev, observed.st_ino):
+                    raise FormalTrainingError(
+                        'partial staging changed during cleanup')
+                _purge_directory_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            current = os.stat(
+                name, dir_fd=directory_fd, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (
+                    observed.st_dev, observed.st_ino):
+                raise FormalTrainingError(
+                    'partial staging changed during cleanup')
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+
+
+def _write_atomic_file_at(
+        directory_fd: int, destination_name: str, payload: bytes,
+        *, temporary_name: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(
+            temporary_name, destination_name,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except Exception:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def poll_cooperative_stop(
-        control_path: Path, *, safe_boundary: StageSafeBoundary
+        control_path: Path, *, safe_boundary: StageSafeBoundary,
+        stage_output_root: Path | None = None
         ) -> CooperativeStopRequest | None:
     if not isinstance(safe_boundary, StageSafeBoundary) \
             or isinstance(safe_boundary.unit, bool) \
@@ -1449,15 +2056,28 @@ def poll_cooperative_stop(
                      else None)
     if safe_boundary.kind != expected_kind:
         raise FormalTrainingError('stage safe boundary kind is invalid')
-    source = Path(control_path)
-    if not source.exists():
-        return None
-    if source.is_symlink() or not source.is_file():
-        raise FormalTrainingError('stop request path is unsafe')
+    if stage_output_root is None:
+        raise FormalTrainingError('stage output root authority is required')
+    root = _canonical_absolute_path(
+        stage_output_root, label='stage output root')
+    source = _canonical_absolute_path(control_path, label='stop request path')
+    if source != root / _STOP_CONTROL_NAME:
+        raise FormalTrainingError('stop request path is not canonical')
+    root_fd, root_stat = _open_absolute_directory_nofollow(root)
     try:
-        document = json.loads(source.read_text(encoding='utf-8'))
-    except (OSError, json.JSONDecodeError) as error:
-        raise FormalTrainingError('stop request is malformed') from error
+        try:
+            payload, control_stat = _read_regular_file_at(
+                root_fd, _STOP_CONTROL_NAME, label='stop request')
+        except FormalTrainingError as error:
+            if _stat_child_nofollow(root_fd, _STOP_CONTROL_NAME) is None:
+                return None
+            raise error
+        try:
+            document = json.loads(payload.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise FormalTrainingError('stop request is malformed') from error
+    finally:
+        os.close(root_fd)
     fields = {
         'schema_version', 'request_id', 'stage', 'input_path',
         'input_sha256', 'issued_at_ns', 'acknowledgement_path',
@@ -1474,12 +2094,30 @@ def poll_cooperative_stop(
             or not isinstance(document['issued_at_ns'], int) \
             or document['issued_at_ns'] < 0:
         raise FormalTrainingError('stop request timestamp is invalid')
+    now = time.time_ns()
+    if document['issued_at_ns'] < now - _STOP_MAX_AGE_NS \
+            or document['issued_at_ns'] > now + _STOP_MAX_FUTURE_NS:
+        raise FormalTrainingError('stop request is stale')
     if not _is_sha(document['input_sha256']):
         raise FormalTrainingError('stop request input SHA-256 is invalid')
     for field in ('input_path', 'acknowledgement_path', 'partial_staging_path'):
-        if not isinstance(document[field], str) \
-                or not Path(document[field]).is_absolute():
+        if not isinstance(document[field], str):
             raise FormalTrainingError(f'stop request {field} is invalid')
+        _canonical_absolute_path(
+            document[field], label=f'stop request {field}')
+    if document['acknowledgement_path'] != str(
+            root / _STOP_ACKNOWLEDGEMENT_NAME) \
+            or document['partial_staging_path'] != str(
+                root / _STOP_STAGING_NAME):
+        raise FormalTrainingError('stop request output paths are not canonical')
+    if len(document['request_id']) > 128 or any(
+            not (character.isalnum() or character in {'-', '_'})
+            for character in document['request_id']):
+        raise FormalTrainingError('stop request identity is invalid')
+    input_bytes, input_stat = _read_absolute_regular_file_nofollow(
+        Path(document['input_path']), label='stop request input')
+    if hashlib.sha256(input_bytes).hexdigest() != document['input_sha256']:
+        raise FormalTrainingError('stop request input authority mismatch')
     acknowledgement = Path(document['acknowledgement_path'])
     if acknowledgement.exists():
         raise FormalTrainingError('stop request is stale or already acknowledged')
@@ -1491,7 +2129,13 @@ def poll_cooperative_stop(
         input_sha256=document['input_sha256'],
         issued_at_ns=document['issued_at_ns'],
         acknowledgement_path=document['acknowledgement_path'],
-        partial_staging_path=document['partial_staging_path'])
+        partial_staging_path=document['partial_staging_path'],
+        stage_output_root=str(root), control_path=str(source),
+        control_sha256=hashlib.sha256(payload).hexdigest(),
+        root_device=root_stat.st_dev, root_inode=root_stat.st_ino,
+        control_device=control_stat.st_dev,
+        control_inode=control_stat.st_ino,
+        input_device=input_stat.st_dev, input_inode=input_stat.st_ino)
 
 
 def write_stop_acknowledgement(
@@ -1499,60 +2143,118 @@ def write_stop_acknowledgement(
         resume: StopResumeAuthority) -> StopAcknowledgement:
     if not isinstance(request, CooperativeStopRequest):
         raise FormalTrainingError('stop request type is invalid')
-    input_path = Path(request.input_path)
-    if input_path.is_symlink() or not input_path.is_file() \
-            or _sha256_file(input_path) != request.input_sha256:
-        raise FormalTrainingError('stop request input authority changed')
-    if isinstance(resume, TrainingResumeAuthority):
-        if request.stage != 'training':
-            raise FormalTrainingError('training resume stage mismatch')
-        if isinstance(resume.completed_epoch, bool) \
-                or not isinstance(resume.completed_epoch, int) \
-                or resume.completed_epoch < 0:
-            raise FormalTrainingError('training resume epoch is invalid')
-    elif isinstance(resume, StatelessStageInputAuthority):
-        if request.stage != resume.stage or resume.stage not in _STATELESS_STAGES:
-            raise FormalTrainingError('stateless resume stage mismatch')
-        if resume.path != request.input_path \
-                or resume.sha256 != request.input_sha256:
-            raise FormalTrainingError('stateless resume input mismatch')
-    else:
-        raise FormalTrainingError('stop resume authority type is invalid')
-    resume_path = Path(resume.path)
-    if resume_path.is_symlink() or not resume_path.is_file() \
-            or not _is_sha(resume.sha256) \
-            or _sha256_file(resume_path) != resume.sha256:
-        raise FormalTrainingError('stop resume input authority changed')
-    acknowledgement = StopAcknowledgement(
-        request_id=request.request_id, stage=request.stage,
-        resume=resume, exit_code=75)
-    destination = Path(request.acknowledgement_path)
-    if destination.exists():
-        raise FormalTrainingError('stop acknowledgement already exists')
-    staging = Path(request.partial_staging_path)
-    if staging.exists():
-        if staging.is_symlink() or not staging.is_dir():
-            raise FormalTrainingError('partial staging authority is unsafe')
-        abandoned = staging.with_name(
-            f'.{staging.name}.abandoned-{request.request_id}')
-        if abandoned.exists():
-            raise FormalTrainingError('partial staging abandonment collides')
-        os.replace(staging, abandoned)
-        shutil.rmtree(abandoned)
-    resume_document = {
-        'kind': ('training' if isinstance(resume, TrainingResumeAuthority)
-                 else 'stateless'),
-        **resume.__dict__,
-    }
-    payload = _canonical_json_bytes({
-        'schema_version': 1,
-        'request_id': request.request_id,
-        'stage': request.stage,
-        'resume': resume_document,
-        'exit_code': 75,
-    })
-    _atomic_write_bytes(destination, payload)
-    return acknowledgement
+    root = _canonical_absolute_path(
+        request.stage_output_root, label='stage output root')
+    if request.control_path != str(root / _STOP_CONTROL_NAME) \
+            or request.acknowledgement_path != str(
+                root / _STOP_ACKNOWLEDGEMENT_NAME) \
+            or request.partial_staging_path != str(root / _STOP_STAGING_NAME):
+        raise FormalTrainingError('stop request path authority is invalid')
+    root_fd, root_stat = _open_absolute_directory_nofollow(root)
+    if (root_stat.st_dev, root_stat.st_ino) != (
+            request.root_device, request.root_inode):
+        os.close(root_fd)
+        raise FormalTrainingError('stage output root authority changed')
+    try:
+        control_bytes, control_stat = _read_regular_file_at(
+            root_fd, _STOP_CONTROL_NAME, label='stop request control')
+        if (control_stat.st_dev, control_stat.st_ino) != (
+                request.control_device, request.control_inode) \
+                or hashlib.sha256(control_bytes).hexdigest() \
+                != request.control_sha256:
+            raise FormalTrainingError('stop request control authority changed')
+        input_bytes, input_stat = _read_absolute_regular_file_nofollow(
+            Path(request.input_path), label='stop request input')
+        if (input_stat.st_dev, input_stat.st_ino) != (
+                request.input_device, request.input_inode) \
+                or hashlib.sha256(input_bytes).hexdigest() \
+                != request.input_sha256:
+            raise FormalTrainingError('stop request input authority changed')
+        if isinstance(resume, TrainingResumeAuthority):
+            if request.stage != 'training':
+                raise FormalTrainingError('training resume stage mismatch')
+            if isinstance(resume.completed_epoch, bool) \
+                    or not isinstance(resume.completed_epoch, int) \
+                    or resume.completed_epoch < 0:
+                raise FormalTrainingError('training resume epoch is invalid')
+            if resume.path != request.input_path \
+                    or resume.sha256 != request.input_sha256:
+                raise FormalTrainingError('training resume input mismatch')
+        elif isinstance(resume, StatelessStageInputAuthority):
+            if request.stage != resume.stage \
+                    or resume.stage not in _STATELESS_STAGES:
+                raise FormalTrainingError('stateless resume stage mismatch')
+            if resume.path != request.input_path \
+                    or resume.sha256 != request.input_sha256:
+                raise FormalTrainingError('stateless resume input mismatch')
+        else:
+            raise FormalTrainingError('stop resume authority type is invalid')
+        if not _is_sha(resume.sha256) \
+                or resume.sha256 != hashlib.sha256(input_bytes).hexdigest():
+            raise FormalTrainingError('stop resume input authority changed')
+        acknowledgement = StopAcknowledgement(
+            request_id=request.request_id, stage=request.stage,
+            resume=resume, exit_code=75)
+        if _stat_child_nofollow(
+                root_fd, _STOP_ACKNOWLEDGEMENT_NAME) is not None:
+            raise FormalTrainingError('stop acknowledgement already exists')
+        staging_stat = _stat_child_nofollow(root_fd, _STOP_STAGING_NAME)
+        if staging_stat is not None:
+            if not stat.S_ISDIR(staging_stat.st_mode):
+                raise FormalTrainingError('partial staging authority is unsafe')
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            staging_fd = os.open(_STOP_STAGING_NAME, flags, dir_fd=root_fd)
+            try:
+                opened = os.fstat(staging_fd)
+                if (opened.st_dev, opened.st_ino) != (
+                        staging_stat.st_dev, staging_stat.st_ino):
+                    raise FormalTrainingError(
+                        'partial staging authority changed')
+                abandoned_name = (
+                    f'.{_STOP_STAGING_NAME}.abandoned-{request.request_id}')
+                if _stat_child_nofollow(root_fd, abandoned_name) is not None:
+                    raise FormalTrainingError(
+                        'partial staging abandonment collides')
+                os.rename(
+                    _STOP_STAGING_NAME, abandoned_name,
+                    src_dir_fd=root_fd, dst_dir_fd=root_fd)
+                os.fsync(root_fd)
+                renamed = os.stat(
+                    abandoned_name, dir_fd=root_fd,
+                    follow_symlinks=False)
+                if (renamed.st_dev, renamed.st_ino) != (
+                        opened.st_dev, opened.st_ino):
+                    raise FormalTrainingError(
+                        'partial staging authority changed')
+                _purge_directory_fd(staging_fd)
+            finally:
+                os.close(staging_fd)
+            renamed = os.stat(
+                abandoned_name, dir_fd=root_fd, follow_symlinks=False)
+            if (renamed.st_dev, renamed.st_ino) != (
+                    staging_stat.st_dev, staging_stat.st_ino):
+                raise FormalTrainingError('partial staging authority changed')
+            os.rmdir(abandoned_name, dir_fd=root_fd)
+            os.fsync(root_fd)
+        resume_document = {
+            'kind': ('training' if isinstance(resume, TrainingResumeAuthority)
+                     else 'stateless'),
+            **resume.__dict__,
+        }
+        payload = _canonical_json_bytes({
+            'schema_version': 1,
+            'request_id': request.request_id,
+            'stage': request.stage,
+            'resume': resume_document,
+            'exit_code': 75,
+        })
+        _write_atomic_file_at(
+            root_fd, _STOP_ACKNOWLEDGEMENT_NAME, payload,
+            temporary_name=(
+                f'.{_STOP_ACKNOWLEDGEMENT_NAME}.tmp-{request.request_id}'))
+        return acknowledgement
+    finally:
+        os.close(root_fd)
 
 
 def _restore_rng_state(value: Mapping[str, Any]) -> None:
@@ -1609,9 +2311,14 @@ def _atomic_save_tensor_mapping(
                 or any(not isinstance(value, torch.Tensor)
                        for value in loaded.values()):
             raise FormalTrainingError('pose checkpoint roundtrip failed')
+        with temporary.open('rb') as stream:
+            os.fsync(stream.fileno())
         os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary.exists():
+            temporary.unlink()
+            _fsync_directory(destination.parent)
 
 
 def _file_binding(root: Path, path: Path) -> FileBinding:
@@ -1658,68 +2365,471 @@ def _train_result_document(result: FormalTrainResult) -> dict[str, Any]:
     }
 
 
-def _write_training_log(path: Path, record: Mapping[str, Any]) -> None:
-    payload = _canonical_json_bytes(record)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('ab') as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
+def _best_decision_path(output: Path, epoch: int) -> Path:
+    return output / 'best-lineages' / f'epoch_{epoch}.json'
+
+
+def _best_pointer_bytes(output: Path, decision: Path) -> bytes:
+    payload, _ = _read_absolute_regular_file_nofollow(
+        decision, label='best decision')
+    return _canonical_json_bytes({
+        'schema_version': 1,
+        'decision': {
+            'path': decision.relative_to(output).as_posix(),
+            'sha256': hashlib.sha256(payload).hexdigest(),
+        },
+    })
+
+
+def _load_best_decision(
+        output: Path, init: FormalRunInit, epoch: int
+        ) -> tuple[Mapping[str, Any], Path, str]:
+    path = _best_decision_path(output, epoch)
+    try:
+        payload, authority = _read_absolute_regular_file_nofollow(
+            path, label='best decision')
+        document = json.loads(payload.decode('utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FormalTrainingError('best decision is malformed') from error
+    fields = {
+        'schema_version', 'identity', 'completed_epoch', 'metric',
+        'checkpoint', 'previous_decision'}
+    if not isinstance(document, Mapping) or set(document) != fields \
+            or document['schema_version'] != 1 \
+            or document['identity'] != {
+                'run_id': init.run_id, 'role': init.role, 'seed': init.seed} \
+            or document['completed_epoch'] != epoch:
+        raise FormalTrainingError('best decision identity is invalid')
+    metric = document['metric']
+    if isinstance(metric, bool) or not isinstance(metric, (int, float)) \
+            or not math.isfinite(metric):
+        raise FormalTrainingError('best decision metric is invalid')
+    checkpoint = document['checkpoint']
+    if not isinstance(checkpoint, Mapping) or set(checkpoint) != {
+            'path', 'sha256'} or not isinstance(checkpoint['path'], str) \
+            or re.fullmatch(
+                r'best_coco_AP_epoch_[1-9][0-9]*\.pth',
+                checkpoint['path']) is None or not _is_sha(
+                    checkpoint['sha256']):
+        raise FormalTrainingError('best decision checkpoint is invalid')
+    previous = document['previous_decision']
+    if previous is not None:
+        if not isinstance(previous, Mapping) or set(previous) != {
+                'path', 'sha256'} or not isinstance(previous['path'], str) \
+                or not _is_sha(previous['sha256']):
+            raise FormalTrainingError('best decision predecessor is invalid')
+        match = re.fullmatch(
+            r'best-lineages/epoch_([1-9][0-9]*)\.json', previous['path'])
+        if match is None or int(match.group(1)) >= epoch:
+            raise FormalTrainingError('best decision predecessor is invalid')
+        predecessor = output / previous['path']
+        predecessor_payload, _ = _read_absolute_regular_file_nofollow(
+            predecessor, label='best decision predecessor')
+        if hashlib.sha256(predecessor_payload).hexdigest() \
+                != previous['sha256']:
+            raise FormalTrainingError('best decision chain mismatch')
+    observed, observed_stat = _read_absolute_regular_file_nofollow(
+        path, label='best decision')
+    if observed != payload or (observed_stat.st_dev, observed_stat.st_ino) != (
+            authority.st_dev, authority.st_ino):
+        raise FormalTrainingError('best decision authority changed')
+    return document, path, hashlib.sha256(payload).hexdigest()
+
+
+def _parse_best_pointer(
+        payload: bytes, output: Path, *, completed_epoch: int
+        ) -> tuple[Mapping[str, Any], Path, int]:
+    try:
+        document = json.loads(payload.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FormalTrainingError(
+            'best checkpoint pointer is malformed') from error
+    if not isinstance(document, Mapping) or set(document) != {
+            'schema_version', 'decision'} or document['schema_version'] != 1 \
+            or not isinstance(document['decision'], Mapping) \
+            or set(document['decision']) != {'path', 'sha256'} \
+            or not isinstance(document['decision']['path'], str) \
+            or not _is_sha(document['decision']['sha256']):
+        raise FormalTrainingError('best checkpoint pointer fields are invalid')
+    match = re.fullmatch(
+        r'best-lineages/epoch_([1-9][0-9]*)\.json',
+        document['decision']['path'])
+    if match is None or int(match.group(1)) > completed_epoch:
+        raise FormalTrainingError('best checkpoint pointer authority mismatch')
+    decision = output / document['decision']['path']
+    return document, decision, int(match.group(1))
+
+
+def _read_optional_output_child(
+        output: Path, name: str, *, label: str
+        ) -> tuple[bytes, os.stat_result] | None:
+    output_fd, _ = _open_absolute_directory_nofollow(
+        output, label='formal output root')
+    try:
+        if _stat_child_nofollow(output_fd, name) is None:
+            return None
+        return _read_regular_file_at(output_fd, name, label=label)
+    finally:
+        os.close(output_fd)
+
+
+def _replace_output_child(
+        output: Path, name: str, payload: bytes | None) -> None:
+    output_fd, output_stat = _open_absolute_directory_nofollow(
+        output, label='formal output root')
+    try:
+        if payload is None:
+            observed = _stat_child_nofollow(output_fd, name)
+            if observed is not None:
+                if not stat.S_ISREG(observed.st_mode):
+                    raise FormalTrainingError(
+                        'best checkpoint pointer is unsafe')
+                os.unlink(name, dir_fd=output_fd)
+                os.fsync(output_fd)
+        else:
+            _write_atomic_file_at(
+                output_fd, name, payload,
+                temporary_name=(
+                    f'.{name}.tmp-{os.getpid()}-{time.time_ns()}'))
+    finally:
+        os.close(output_fd)
+    reopened, reopened_stat = _open_absolute_directory_nofollow(
+        output, label='formal output root')
+    os.close(reopened)
+    if (reopened_stat.st_dev, reopened_stat.st_ino) != (
+            output_stat.st_dev, output_stat.st_ino):
+        raise FormalTrainingError('formal output root authority changed')
+
+
+def _best_epoch_authority(
+        output: Path, init: FormalRunInit, epoch: int,
+        decision: Path) -> dict[str, Any]:
+    supplied = Path(decision).absolute()
+    try:
+        relative = supplied.relative_to(output.absolute()).as_posix()
+    except ValueError as error:
+        raise FormalTrainingError(
+            'best decision path is not canonical') from error
+    match = re.fullmatch(
+        r'best-lineages/epoch_([1-9][0-9]*)\.json', relative)
+    if match is None or int(match.group(1)) > epoch:
+        raise FormalTrainingError('best decision path is not canonical')
+    decision_epoch = int(match.group(1))
+    expected_path = _best_decision_path(output, decision_epoch)
+    if supplied != expected_path.absolute():
+        raise FormalTrainingError('best decision path is not canonical')
+    document, path, decision_sha = _load_best_decision(
+        output, init, decision_epoch)
+    return {
+        'decision': {
+            'path': path.relative_to(output).as_posix(),
+            'sha256': decision_sha,
+        },
+        'checkpoint': dict(document['checkpoint']),
+    }
+
+
+def _validate_epoch_best_authority(
+        output: Path, init: FormalRunInit, epoch: int,
+        authority: object) -> None:
+    if not isinstance(authority, Mapping) or set(authority) != {
+            'decision', 'checkpoint'}:
+        raise FormalTrainingError('epoch best authority fields are invalid')
+    decision = authority['decision']
+    if not isinstance(decision, Mapping) or set(decision) != {
+            'path', 'sha256'} or not isinstance(decision['path'], str):
+        raise FormalTrainingError('epoch best decision authority is invalid')
+    expected = _best_epoch_authority(
+        output, init, epoch, output / decision['path'])
+    if authority != expected:
+        raise FormalTrainingError('epoch best authority mismatch')
+
+
+def _best_authority_decision_epoch(authority: Mapping[str, Any]) -> int:
+    try:
+        path = authority['decision']['path']
+    except (KeyError, TypeError) as error:
+        raise FormalTrainingError(
+            'epoch best decision authority is invalid') from error
+    match = re.fullmatch(
+        r'best-lineages/epoch_([1-9][0-9]*)\.json', path)
+    if match is None:
+        raise FormalTrainingError('epoch best decision path is invalid')
+    return int(match.group(1))
+
+
+def _write_best_decision(
+        root: Path, init: FormalRunInit, *, completed_epoch: int,
+        metric: float, checkpoint: Path) -> Path:
+    output = root / init.output_root
+    decisions = output / 'best-lineages'
+    destination = _best_decision_path(output, completed_epoch)
+    previous = None
+    pointer = output / 'best-lineage.json'
+    output_fd, output_stat = _open_absolute_directory_nofollow(
+        output, label='formal output root')
+    pointer_payload = None
+    pointer_stat = None
+    try:
+        observed_pointer = _stat_child_nofollow(
+            output_fd, 'best-lineage.json')
+        if observed_pointer is not None:
+            pointer_payload, pointer_stat = _read_regular_file_at(
+                output_fd, 'best-lineage.json',
+                label='best checkpoint pointer')
+            pointer_document, predecessor, predecessor_epoch = \
+                _parse_best_pointer(
+                    pointer_payload, output,
+                    completed_epoch=completed_epoch - 1)
+            _document, _path, predecessor_sha = _load_best_decision(
+                output, init, predecessor_epoch)
+            if pointer_document['decision']['sha256'] != predecessor_sha:
+                raise FormalTrainingError(
+                    'best checkpoint pointer authority mismatch')
+            previous = dict(pointer_document['decision'])
+        observed_decisions = _stat_child_nofollow(
+            output_fd, 'best-lineages')
+        if observed_decisions is None:
+            os.mkdir('best-lineages', 0o700, dir_fd=output_fd)
+            os.fsync(output_fd)
+        elif not stat.S_ISDIR(observed_decisions.st_mode):
+            raise FormalTrainingError('best decision root is unsafe')
+        decision_fd = os.open(
+            'best-lineages', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            | os.O_CLOEXEC, dir_fd=output_fd)
+        try:
+            opened_decisions = os.fstat(decision_fd)
+            current_decisions = os.stat(
+                'best-lineages', dir_fd=output_fd, follow_symlinks=False)
+            if (opened_decisions.st_dev, opened_decisions.st_ino) != (
+                    current_decisions.st_dev, current_decisions.st_ino):
+                raise FormalTrainingError('best decision root changed')
+            if _stat_child_nofollow(decision_fd, destination.name) is not None:
+                raise FormalTrainingError('best decision is immutable')
+        finally:
+            os.close(decision_fd)
+    except Exception:
+        os.close(output_fd)
+        raise
+    payload = _canonical_json_bytes({
+        'schema_version': 1,
+        'identity': {
+            'run_id': init.run_id, 'role': init.role, 'seed': init.seed},
+        'completed_epoch': completed_epoch,
+        'metric': metric,
+        'checkpoint': {
+            'path': checkpoint.name, 'sha256': _sha256_file(checkpoint)},
+        'previous_decision': previous,
+    })
+    try:
+        decision_fd = os.open(
+            'best-lineages', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            | os.O_CLOEXEC, dir_fd=output_fd)
+        try:
+            _write_atomic_file_at(
+                decision_fd, destination.name, payload,
+                temporary_name=(
+                    f'.{destination.name}.tmp-{os.getpid()}-'
+                    f'{time.time_ns()}'))
+        finally:
+            os.close(decision_fd)
+        current_pointer = _stat_child_nofollow(
+            output_fd, 'best-lineage.json')
+        if pointer_stat is None:
+            if current_pointer is not None:
+                raise FormalTrainingError(
+                    'best checkpoint pointer authority changed')
+        else:
+            current_payload, current_stat = _read_regular_file_at(
+                output_fd, 'best-lineage.json',
+                label='best checkpoint pointer')
+            if current_payload != pointer_payload or (
+                    current_stat.st_dev, current_stat.st_ino) != (
+                        pointer_stat.st_dev, pointer_stat.st_ino):
+                raise FormalTrainingError(
+                    'best checkpoint pointer authority changed')
+        _write_atomic_file_at(
+            output_fd, 'best-lineage.json',
+            _best_pointer_bytes(output, destination),
+            temporary_name=(
+                f'.best-lineage.json.tmp-{os.getpid()}-{time.time_ns()}'))
+        reopened_fd, reopened_stat = _open_absolute_directory_nofollow(
+            output, label='formal output root')
+        os.close(reopened_fd)
+        if (reopened_stat.st_dev, reopened_stat.st_ino) != (
+                output_stat.st_dev, output_stat.st_ino):
+            raise FormalTrainingError('formal output root authority changed')
+    finally:
+        os.close(output_fd)
+    return destination
+
+
+def publish_best_checkpoint(
+        root: Path, init: FormalRunInit, *, completed_epoch: int,
+        metric: float, tensors: Mapping[str, torch.Tensor]) -> Path:
+    output = Path(root).absolute() / init.output_root
+    prior_metric, _ = _load_best_lineage(
+        Path(root).absolute(), init, completed_epoch=completed_epoch - 1)
+    if not math.isfinite(metric) or metric <= prior_metric:
+        raise FormalTrainingError('new best metric is not an improvement')
+    checkpoint = output / f'best_coco_AP_epoch_{completed_epoch}.pth'
+    if checkpoint.exists():
+        raise FormalTrainingError('versioned best checkpoint is immutable')
+    _atomic_save_tensor_mapping(tensors, checkpoint)
+    return _write_best_decision(
+        Path(root).absolute(), init, completed_epoch=completed_epoch,
+        metric=metric, checkpoint=checkpoint)
+
+
+def inherit_best_checkpoint(
+        root: Path, init: FormalRunInit, *, completed_epoch: int) -> Path:
+    _metric, checkpoint = _load_best_lineage(
+        Path(root).absolute(), init, completed_epoch=completed_epoch - 1)
+    if checkpoint is None:
+        raise FormalTrainingError('best checkpoint cannot be inherited')
+    output = Path(root).absolute() / init.output_root
+    captured = _read_optional_output_child(
+        output, 'best-lineage.json', label='best checkpoint pointer')
+    if captured is None:
+        raise FormalTrainingError('best checkpoint lineage is unavailable')
+    pointer_payload, pointer_stat = captured
+    _document, decision, _epoch = _parse_best_pointer(
+        pointer_payload, output, completed_epoch=completed_epoch - 1)
+    observed = _read_optional_output_child(
+        output, 'best-lineage.json', label='best checkpoint pointer')
+    if observed is None or observed[0] != pointer_payload or (
+            observed[1].st_dev, observed[1].st_ino) != (
+                pointer_stat.st_dev, pointer_stat.st_ino):
+        raise FormalTrainingError('best checkpoint pointer authority changed')
+    return decision
 
 
 def _load_best_lineage(
         root: Path, init: FormalRunInit, *, completed_epoch: int
         ) -> tuple[float, Path | None]:
     output = root / init.output_root
-    lineage = output / 'best-lineage.json'
-    checkpoint = output / 'best_coco_AP.pth'
-    if not lineage.exists():
-        if checkpoint.exists():
-            raise FormalTrainingError('best checkpoint has no lineage authority')
+    pointer = output / 'best-lineage.json'
+    captured_pointer = _read_optional_output_child(
+        output, 'best-lineage.json', label='best checkpoint pointer')
+    if captured_pointer is None:
         return -math.inf, None
-    if lineage.is_symlink() or not lineage.is_file() \
-            or checkpoint.is_symlink() or not checkpoint.is_file():
-        raise FormalTrainingError('best checkpoint lineage is unsafe')
-    try:
-        document = json.loads(lineage.read_text(encoding='utf-8'))
-    except (OSError, json.JSONDecodeError) as error:
-        raise FormalTrainingError('best checkpoint lineage is malformed') from error
-    if not isinstance(document, Mapping) or set(document) != {
-            'schema_version', 'run_id', 'role', 'seed', 'completed_epoch',
-            'metric', 'path', 'sha256'}:
-        raise FormalTrainingError('best checkpoint lineage fields are invalid')
-    if document['schema_version'] != 1 \
-            or document['run_id'] != init.run_id \
-            or document['role'] != init.role or document['seed'] != init.seed:
-        raise FormalTrainingError('best checkpoint lineage identity mismatch')
-    epoch = document['completed_epoch']
-    metric = document['metric']
-    if isinstance(epoch, bool) or not isinstance(epoch, int) \
-            or epoch < 1 or epoch > completed_epoch:
-        raise FormalTrainingError('best checkpoint lineage epoch is invalid')
-    if isinstance(metric, bool) or not isinstance(metric, (int, float)) \
-            or not math.isfinite(metric):
-        raise FormalTrainingError('best checkpoint lineage metric is invalid')
-    if document['path'] != (init.output_root / checkpoint.name).as_posix() \
-            or document['sha256'] != _sha256_file(checkpoint):
+    pointer_payload, pointer_stat = captured_pointer
+    document, expected_decision, decision_epoch = _parse_best_pointer(
+        pointer_payload, output, completed_epoch=completed_epoch)
+    decision, _, decision_sha = _load_best_decision(
+        output, init, decision_epoch)
+    if document['decision']['sha256'] != decision_sha:
         raise FormalTrainingError('best checkpoint lineage authority drift')
-    return float(metric), checkpoint
+    checkpoint = output / decision['checkpoint']['path']
+    if checkpoint.is_symlink() or not checkpoint.is_file() \
+            or _sha256_file(checkpoint) != decision['checkpoint']['sha256']:
+        raise FormalTrainingError('best checkpoint authority drift')
+    observed_pointer = _read_optional_output_child(
+        output, 'best-lineage.json', label='best checkpoint pointer')
+    if observed_pointer is None or observed_pointer[0] != pointer_payload or (
+            observed_pointer[1].st_dev, observed_pointer[1].st_ino) != (
+                pointer_stat.st_dev, pointer_stat.st_ino):
+        raise FormalTrainingError('best checkpoint pointer authority changed')
+    return float(decision['metric']), checkpoint
 
 
-def _write_best_lineage(
-        root: Path, init: FormalRunInit, *, completed_epoch: int,
-        metric: float, checkpoint: Path) -> None:
-    destination = root / init.output_root / 'best-lineage.json'
-    payload = _canonical_json_bytes({
-        'schema_version': 1, 'run_id': init.run_id, 'role': init.role,
-        'seed': init.seed, 'completed_epoch': completed_epoch,
-        'metric': metric,
-        'path': (init.output_root / checkpoint.name).as_posix(),
-        'sha256': _sha256_file(checkpoint),
-    })
-    # This is the one mutable pointer: replacement is atomic and every target
-    # tensor file is rehashed by the public reader above.
-    _atomic_write_bytes(destination, payload)
+def _recover_best_lineage_state(
+        root: Path, init: FormalRunInit,
+        chain: _EpochCommitChain) -> tuple[float, Path | None]:
+    output = root / init.output_root
+    committed = len(chain.documents)
+    committed_best = [document['best'] for document in chain.documents]
+    has_best = [item is not None for item in committed_best]
+    if any(has_best):
+        first_best = has_best.index(True)
+        if not all(has_best[first_best:]):
+            raise FormalTrainingError('epoch best authority is not continuous')
+
+    decision_root = output / 'best-lineages'
+    decision_epochs: list[int] = []
+    if decision_root.exists():
+        if decision_root.is_symlink() or not decision_root.is_dir():
+            raise FormalTrainingError('best decision root is unsafe')
+        for child in decision_root.iterdir():
+            match = re.fullmatch(r'epoch_([1-9][0-9]*)\.json', child.name)
+            if match is None or child.is_symlink() or not child.is_file():
+                raise FormalTrainingError('best decision inventory is invalid')
+            decision_epochs.append(int(match.group(1)))
+    decision_epochs.sort()
+    expected_committed = []
+    for authority in committed_best:
+        if authority is None:
+            continue
+        epoch = _best_authority_decision_epoch(authority)
+        if not expected_committed or expected_committed[-1] != epoch:
+            expected_committed.append(epoch)
+    if decision_epochs[:len(expected_committed)] != expected_committed:
+        raise FormalTrainingError('committed best decision sequence is incomplete')
+    extras = decision_epochs[len(expected_committed):]
+    if extras not in ([], [committed + 1]):
+        raise FormalTrainingError(
+            'best inventory contains non-next uncommitted decisions')
+
+    decisions: dict[int, Mapping[str, Any]] = {}
+    for epoch in decision_epochs:
+        document, _, _ = _load_best_decision(output, init, epoch)
+        decisions[epoch] = document
+
+    tensor_paths: dict[str, Path] = {}
+    for child in output.iterdir():
+        if not child.name.startswith('best_coco_AP_epoch_'):
+            continue
+        if re.fullmatch(
+                r'best_coco_AP_epoch_[1-9][0-9]*\.pth', child.name) is None \
+                or child.is_symlink() or not child.is_file():
+            raise FormalTrainingError('best checkpoint inventory is invalid')
+        tensor_paths[child.name] = child
+    referenced_names = {
+        document['checkpoint']['path'] for document in decisions.values()}
+    unknown = set(tensor_paths) - referenced_names
+    allowed_orphan = f'best_coco_AP_epoch_{committed + 1}.pth'
+    if unknown not in (set(), {allowed_orphan}):
+        raise FormalTrainingError(
+            'best inventory contains non-next uncommitted checkpoints')
+
+    pointer = output / 'best-lineage.json'
+    latest_checkpoint: Path | None = None
+    if committed_best and committed_best[-1] is not None:
+        latest = committed_best[-1]
+        latest_decision = output / latest['decision']['path']
+        expected_pointer = _best_pointer_bytes(output, latest_decision)
+        captured_pointer = _read_optional_output_child(
+            output, 'best-lineage.json', label='best checkpoint pointer')
+        if captured_pointer is None or captured_pointer[0] != expected_pointer:
+            _replace_output_child(
+                output, 'best-lineage.json', expected_pointer)
+        latest_checkpoint = output / latest['checkpoint']['path']
+        if latest_checkpoint.is_symlink() or not latest_checkpoint.is_file() \
+                or _sha256_file(latest_checkpoint) \
+                != latest['checkpoint']['sha256']:
+            raise FormalTrainingError('latest committed best checkpoint drift')
+    elif _read_optional_output_child(
+            output, 'best-lineage.json',
+            label='best checkpoint pointer') is not None:
+        _replace_output_child(output, 'best-lineage.json', None)
+
+    if extras:
+        extra_document = decisions[extras[0]]
+        extra_checkpoint = output / extra_document['checkpoint']['path']
+        _durable_unlink(_best_decision_path(output, extras[0]))
+        if latest_checkpoint is None or extra_checkpoint != latest_checkpoint:
+            if extra_checkpoint.exists():
+                _durable_unlink(extra_checkpoint)
+    orphan = output / allowed_orphan
+    if orphan.exists():
+        _durable_unlink(orphan)
+
+    for name, checkpoint in tensor_paths.items():
+        if checkpoint.exists() and checkpoint != latest_checkpoint:
+            _durable_unlink(checkpoint)
+    if latest_checkpoint is None:
+        return -math.inf, None
+    return _load_best_lineage(root, init, completed_epoch=committed)
 
 
 def _validate_training_log(
@@ -1776,9 +2886,9 @@ def _build_training_hook(
             completed = 0 if resume is None else resume.completed_epoch
             self.best_metric, best_path = _load_best_lineage(
                 root, init, completed_epoch=completed)
-            self.best_path = (root / init.output_root / 'best_coco_AP.pth'
-                              if best_path is None else best_path)
+            self.best_path = best_path
             self.log_path = root / init.output_root / 'training.jsonl'
+            self.pending_checkpoint: dict[str, Any] | None = None
 
         def before_train_epoch(self, runner) -> None:
             sampler = runner.train_dataloader.sampler
@@ -1799,7 +2909,7 @@ def _build_training_hook(
                 return
             torch.cuda.synchronize()
             request = poll_cooperative_stop(
-                control,
+                control, stage_output_root=root / init.output_root,
                 safe_boundary=StageSafeBoundary(
                     'training', 'optimizer', batch_idx, True))
             if request is None:
@@ -1829,21 +2939,44 @@ def _build_training_hook(
             loss_scaler = getattr(runner.optim_wrapper, 'loss_scaler', None)
             if loss_scaler is not None:
                 scaler = loss_scaler.state_dict()
+            self.pending_checkpoint = {
+                'completed_epoch': completed,
+                'model_state': _unwrap_runner_model(runner).state_dict(),
+                'optimizer_state': runner.optim_wrapper.state_dict(),
+                'scheduler_state': schedulers, 'scaler_state': scaler,
+                'dataset_size': len(runner.train_dataloader.dataset),
+            }
+            train_loop = runner.train_loop
+            will_validate = runner.val_loop is not None \
+                and completed >= train_loop.val_begin \
+                and (completed % train_loop.val_interval == 0
+                     or completed == train_loop.max_epochs)
+            if not will_validate:
+                decision = None
+                if self.best_path is not None:
+                    decision = inherit_best_checkpoint(
+                        root, init, completed_epoch=completed)
+                self._commit_pending(runner, decision)
+
+        def _commit_pending(self, runner, decision: Path | None) -> None:
+            if self.pending_checkpoint is None:
+                raise FormalTrainingError(
+                    'epoch checkpoint transaction is unavailable')
+            pending = self.pending_checkpoint
             self.last_checkpoint = write_resume_checkpoint(
                 repository_root=root, expected=init,
-                completed_epoch=completed,
-                model_state=_unwrap_runner_model(runner).state_dict(),
-                optimizer_state=runner.optim_wrapper.state_dict(),
-                scheduler_state=schedulers, scaler_state=scaler,
+                completed_epoch=pending['completed_epoch'],
+                model_state=pending['model_state'],
+                optimizer_state=pending['optimizer_state'],
+                scheduler_state=pending['scheduler_state'],
+                scaler_state=pending['scaler_state'],
                 order_hashes=tuple(self.order_hashes),
-                dataset_size=len(runner.train_dataloader.dataset))
-            _write_training_log(self.log_path, {
-                'schema_version': 1, 'run_id': init.run_id,
-                'role': init.role, 'seed': init.seed,
-                'epoch': completed, 'order_sha256': self.order_hashes[-1],
-                'resume_checkpoint': self.last_checkpoint.name,
-                'resume_sha256': _sha256_file(self.last_checkpoint),
-            })
+                dataset_size=pending['dataset_size'],
+                best_decision_path=decision)
+            self.pending_checkpoint = None
+            if decision is not None:
+                self.best_metric, self.best_path = _load_best_lineage(
+                    root, init, completed_epoch=len(self.order_hashes))
 
         def after_val_epoch(self, runner, metrics=None) -> None:
             if not isinstance(metrics, Mapping) or 'coco/AP' not in metrics:
@@ -1851,13 +2984,15 @@ def _build_training_hook(
             metric = float(metrics['coco/AP'])
             if not math.isfinite(metric):
                 raise FormalTrainingError('formal validation AP is non-finite')
+            completed = runner.epoch
             if metric > self.best_metric:
-                _atomic_save_tensor_mapping(
-                    _unwrap_runner_model(runner).state_dict(), self.best_path)
-                self.best_metric = metric
-                _write_best_lineage(
-                    root, init, completed_epoch=runner.epoch,
-                    metric=metric, checkpoint=self.best_path)
+                decision = publish_best_checkpoint(
+                    root, init, completed_epoch=completed, metric=metric,
+                    tensors=_unwrap_runner_model(runner).state_dict())
+            else:
+                decision = inherit_best_checkpoint(
+                    root, init, completed_epoch=completed)
+            self._commit_pending(runner, decision)
 
     return FormalTrainingHook()
 
@@ -1943,6 +3078,20 @@ def train_formal_candidate(
     init_default_scope(config.get('default_scope', 'mmpose'))
     runner = Runner.from_cfg(config)
     model = _prepare_runner_for_authenticated_load(runner)
+    recovered = recover_training_lineage(
+        root, init, dataset_size=len(runner.train_dataloader.dataset))
+    if resume_path is None and recovered is not None:
+        raise FormalTrainingError(
+            'existing training lineage requires an explicit resume')
+    if resume_path is not None:
+        if recovered is None:
+            raise FormalTrainingError('resume has no committed lineage')
+        canonical_resume = (
+            root / init.output_root /
+            f'epoch_{recovered.completed_epoch}.pth')
+        if Path(resume_path).absolute() != canonical_resume:
+            raise FormalTrainingError(
+                'resume checkpoint is not the committed latest')
     canonical = canonical_main_root(root)
     asset = init.initialization.asset
     load_formal_backbone_initialization(
@@ -1952,11 +3101,9 @@ def train_formal_candidate(
             path=asset.asset_relative_path.as_posix(), sha256=asset.sha256),
         model.backbone, minimum_compatible_tensors=100)
 
-    resume = None
+    resume = recovered
     if resume_path is not None:
-        resume = validate_resume_checkpoint(
-            resume_path, init, repository_root=root,
-            dataset_size=len(runner.train_dataloader.dataset))
+        _revalidate_resume_state_authority(root, init, resume_path, resume)
         model.load_state_dict(dict(resume.model_state), strict=True)
         runner.optim_wrapper.load_state_dict(dict(resume.optimizer_state))
         for index, scheduler in enumerate(runner.param_schedulers):
@@ -1971,19 +3118,15 @@ def train_formal_candidate(
             loss_scaler.load_state_dict(dict(resume.scaler_state))
         runner.train_loop._epoch = resume.completed_epoch
         _restore_rng_state(resume.rng_state)
+        _revalidate_resume_state_authority(root, init, resume_path, resume)
         _validate_training_log(
             root / init.output_root / 'training.jsonl', init,
             resume.order_hashes)
-        existing_epochs = tuple(sorted(
-            int(path.stem.removeprefix('epoch_'))
-            for path in (root / init.output_root).glob('epoch_*.pth')
-            if path.stem.removeprefix('epoch_').isdigit()))
-        if not existing_epochs or existing_epochs[-1] != resume.completed_epoch:
-            raise FormalTrainingError('resume checkpoint is not the latest')
     elif any((root / init.output_root).glob('epoch_*.pth')) \
             or (root / init.output_root / 'training.jsonl').exists() \
             or (root / init.output_root / 'best-lineage.json').exists() \
-            or (root / init.output_root / 'best_coco_AP.pth').exists():
+            or any((root / init.output_root).glob(
+                'best_coco_AP_epoch_*.pth')):
         raise FormalTrainingError(
             'existing training lineage requires an explicit resume')
     hook = _build_training_hook(
@@ -1993,7 +3136,8 @@ def train_formal_candidate(
     _mark_authenticated_state_loaded(runner)
     _run_authenticated_training_loop(runner)
     if len(hook.order_hashes) != 300 or hook.last_checkpoint is None \
-            or not hook.best_path.is_file() or not hook.log_path.is_file():
+            or hook.best_path is None or not hook.best_path.is_file() \
+            or not hook.log_path.is_file():
         raise FormalTrainingError('formal training completion is incomplete')
     resume_paths = (
         root / init.output_root / 'epoch_299.pth',

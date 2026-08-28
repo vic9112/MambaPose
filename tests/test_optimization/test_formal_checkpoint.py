@@ -35,6 +35,29 @@ def test_tensor_only_loader_accepts_exact_finite_state(tmp_path):
     assert torch.equal(loaded['weight'], torch.arange(6).reshape(2, 3))
 
 
+def test_tensor_loader_uses_captured_authorized_bytes_during_transient_swap(
+        tmp_path, monkeypatch):
+    path, authority, expected = _fixture(tmp_path)
+    alternate = tmp_path / 'alternate.pth'
+    torch.save({'weight': torch.full((2, 3), 999.0)}, alternate)
+    approved = path.read_bytes()
+    hostile = alternate.read_bytes()
+    original_load = torch.load
+
+    def transient_swap(source, *args, **kwargs):
+        if Path(source).absolute() == path.absolute():
+            path.write_bytes(hostile)
+            try:
+                return original_load(source, *args, **kwargs)
+            finally:
+                path.write_bytes(approved)
+        return original_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(torch, 'load', transient_swap)
+    loaded = load_formal_tensor_checkpoint(path, authority, expected)
+    assert torch.equal(loaded['weight'], torch.arange(6).reshape(2, 3))
+
+
 @pytest.mark.parametrize('mutation', ['path', 'sha', 'key', 'shape', 'dtype', 'finite'])
 def test_tensor_only_loader_rejects_authority_or_tensor_drift(tmp_path, mutation):
     path, authority, expected = _fixture(tmp_path)
@@ -125,6 +148,41 @@ def test_backbone_initialization_uses_safe_model_projection(tmp_path):
     assert report.compatible_tensors == 2
     assert all(torch.equal(target.state_dict()[key], source.state_dict()[key])
                for key in source.state_dict())
+
+
+def test_backbone_loader_uses_captured_authorized_bytes_during_transient_swap(
+        tmp_path, monkeypatch):
+    approved_model = torch.nn.Linear(3, 2)
+    approved_path = tmp_path / 'upstream.pth'
+    torch.save({'model': approved_model.state_dict()}, approved_path)
+    alternate_model = torch.nn.Linear(3, 2)
+    with torch.no_grad():
+        alternate_model.weight.fill_(999)
+        alternate_model.bias.fill_(999)
+    alternate_path = tmp_path / 'alternate.pth'
+    torch.save({'model': alternate_model.state_dict()}, alternate_path)
+    authority = FileAuthority(
+        str(tmp_path), approved_path.name, _sha256(approved_path))
+    approved = approved_path.read_bytes()
+    hostile = alternate_path.read_bytes()
+    original_load = torch.load
+
+    def transient_swap(source, *args, **kwargs):
+        if Path(source).absolute() == approved_path.absolute():
+            approved_path.write_bytes(hostile)
+            try:
+                return original_load(source, *args, **kwargs)
+            finally:
+                approved_path.write_bytes(approved)
+        return original_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(torch, 'load', transient_swap)
+    target = torch.nn.Linear(3, 2)
+    load_formal_backbone_initialization(
+        approved_path, authority, target, minimum_compatible_tensors=2)
+    assert all(torch.equal(
+        target.state_dict()[key], approved_model.state_dict()[key])
+        for key in approved_model.state_dict())
 
 
 def test_backbone_initialization_rejects_hostile_bundle(tmp_path):

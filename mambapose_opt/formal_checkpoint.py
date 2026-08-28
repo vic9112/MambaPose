@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import stat
+import tempfile
 from types import MappingProxyType
-from typing import Mapping
+from typing import Any, Iterator, Mapping
 
 import torch
 
@@ -77,6 +79,173 @@ class FileAuthority:
         return root, cursor
 
 
+def _open_directory_nofollow(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open('/', flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise FormalCheckpointError(
+                'checkpoint authority root is not a directory')
+        return descriptor
+    except OSError as error:
+        os.close(descriptor)
+        raise FormalCheckpointError(
+            'checkpoint authority root changed or is unsafe') from error
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _capture_authority_bytes(
+        authority: FileAuthority
+        ) -> tuple[bytes, tuple[int, int, int]]:
+    root, _canonical = authority.validate()
+    relative = _relative(authority.path)
+    directory_fd = _open_directory_nofollow(root)
+    try:
+        for component in relative.parts[:-1]:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            child = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        descriptor = os.open(relative.name, flags, dir_fd=directory_fd)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise FormalCheckpointError(
+                    'checkpoint authority is not a regular file')
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            if (before.st_dev, before.st_ino, before.st_size) != (
+                    after.st_dev, after.st_ino, after.st_size):
+                raise FormalCheckpointError(
+                    'checkpoint changed during authenticated capture')
+            payload = b''.join(chunks)
+            if len(payload) != before.st_size:
+                raise FormalCheckpointError(
+                    'checkpoint changed during authenticated capture')
+            return payload, (before.st_dev, before.st_ino, before.st_size)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise FormalCheckpointError(
+            'checkpoint path changed or is unsafe') from error
+    finally:
+        os.close(directory_fd)
+
+
+def _remove_private_tensor_copy(directory: Path, source: Path) -> None:
+    if directory.is_symlink() or not directory.is_dir():
+        raise FormalCheckpointError(
+            'private checkpoint directory is unsafe during cleanup')
+    directory.chmod(0o700)
+    if source.exists():
+        if source.is_symlink() or not source.is_file():
+            raise FormalCheckpointError(
+                'private checkpoint copy is unsafe during cleanup')
+        source.chmod(0o600)
+        source.unlink()
+    directory.rmdir()
+
+
+@contextmanager
+def load_authenticated_tensor_document(
+        path: Path, authority: FileAuthority
+        ) -> Iterator[Mapping[str, Any]]:
+    """Yield one weights-only document from captured authenticated bytes.
+
+    The live authority is opened without following symlinks, copied to a
+    private read-only file, and revalidated after the consumer finishes.
+    """
+    if os.environ.get('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD') == '1':
+        raise FormalCheckpointError(
+            'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD is forbidden')
+    if not isinstance(authority, FileAuthority):
+        raise FormalCheckpointError('checkpoint authority type is invalid')
+    _root, canonical = authority.validate()
+    supplied = Path(path)
+    if not supplied.is_absolute():
+        supplied = Path.cwd() / supplied
+    if supplied.absolute() != canonical.absolute():
+        raise FormalCheckpointError('checkpoint path differs from authority')
+    captured, identity = _capture_authority_bytes(authority)
+    captured_sha256 = hashlib.sha256(captured).hexdigest()
+    if captured_sha256 != authority.sha256:
+        raise FormalCheckpointError('checkpoint SHA-256 differs from authority')
+    temporary_root = Path('/tmp')
+    if temporary_root.is_symlink() or not temporary_root.is_dir():
+        raise FormalCheckpointError('private checkpoint root is unsafe')
+    directory = Path(tempfile.mkdtemp(
+        prefix='mambapose-formal-tensor-', dir=temporary_root))
+    source = directory / 'checkpoint.pth'
+    document: Mapping[str, Any] | None = None
+    use_error: Exception | None = None
+    try:
+        descriptor = os.open(
+            source, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600)
+        try:
+            view = memoryview(captured)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        source.chmod(0o400)
+        directory.chmod(0o500)
+        try:
+            loaded = torch.load(
+                source, map_location='cpu', weights_only=True)
+        except Exception as error:
+            raise FormalCheckpointError(
+                'checkpoint could not be loaded in weights-only mode') from error
+        if not isinstance(loaded, Mapping):
+            raise FormalCheckpointError('checkpoint must be a mapping')
+        document = loaded
+        yield document
+    except Exception as error:
+        use_error = error
+    finally:
+        authority_error: Exception | None = None
+        try:
+            if source.is_symlink() or not source.is_file() \
+                    or stat.S_IMODE(source.stat().st_mode) != 0o400 \
+                    or stat.S_IMODE(directory.stat().st_mode) != 0o500 \
+                    or _sha256(source) != captured_sha256:
+                raise FormalCheckpointError(
+                    'private checkpoint copy changed during use')
+            observed, observed_identity = _capture_authority_bytes(authority)
+            if observed_identity != identity \
+                    or hashlib.sha256(observed).hexdigest() != captured_sha256:
+                raise FormalCheckpointError(
+                    'checkpoint live authority changed after use')
+        except Exception as error:
+            authority_error = error
+        try:
+            _remove_private_tensor_copy(directory, source)
+        except Exception as error:
+            if authority_error is None:
+                authority_error = error
+        if authority_error is not None:
+            if isinstance(authority_error, FormalCheckpointError):
+                raise authority_error
+            raise FormalCheckpointError(
+                'checkpoint authority failed after use') from authority_error
+    if use_error is not None:
+        raise use_error
+
+
 @dataclass(frozen=True)
 class TensorShape:
     shape: tuple[int, ...]
@@ -121,53 +290,35 @@ def load_formal_tensor_checkpoint(
     A checkpoint may be the tensor mapping itself or a single ``model`` /
     ``state_dict`` wrapper.  No metadata leaf is admitted.
     """
-    if os.environ.get('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD') == '1':
-        raise FormalCheckpointError(
-            'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD is forbidden')
-    if not isinstance(authority, FileAuthority):
-        raise FormalCheckpointError('checkpoint authority type is invalid')
-    _root, canonical = authority.validate()
-    supplied = Path(path)
-    if not supplied.is_absolute():
-        supplied = Path.cwd() / supplied
-    if supplied.absolute() != canonical.absolute():
-        raise FormalCheckpointError('checkpoint path differs from authority')
-    if _sha256(canonical) != authority.sha256:
-        raise FormalCheckpointError('checkpoint SHA-256 differs from authority')
     if not isinstance(expected_keys, Mapping) or not expected_keys \
             or any(not isinstance(key, str)
                    or not isinstance(value, TensorShape)
                    for key, value in expected_keys.items()):
         raise FormalCheckpointError('expected tensor contract is invalid')
-    try:
-        document = torch.load(
-            canonical, map_location='cpu', weights_only=True)
-    except Exception as error:
-        raise FormalCheckpointError(
-            'checkpoint could not be loaded in weights-only mode') from error
-    _check_tensor_tree(document)
-    if not isinstance(document, Mapping):
-        raise FormalCheckpointError('checkpoint must be a tensor mapping')
-    if set(document) in ({'model'}, {'state_dict'}):
-        document = document[next(iter(document))]
-    if not isinstance(document, Mapping):
-        raise FormalCheckpointError('checkpoint tensor wrapper is invalid')
-    if set(document) != set(expected_keys):
-        raise FormalCheckpointError('checkpoint tensor keys differ from contract')
-    result: dict[str, torch.Tensor] = {}
-    for key in sorted(expected_keys):
-        tensor = document[key]
-        contract = expected_keys[key]
-        if not isinstance(tensor, torch.Tensor):
-            raise FormalCheckpointError(f'{key} is not a tensor')
-        if tuple(tensor.shape) != contract.shape:
-            raise FormalCheckpointError(f'{key} shape differs from contract')
-        if str(tensor.dtype) != contract.dtype:
-            raise FormalCheckpointError(f'{key} dtype differs from contract')
-        if (tensor.is_floating_point() or tensor.is_complex()) \
-                and not torch.isfinite(tensor).all().item():
-            raise FormalCheckpointError(f'{key} is non-finite')
-        result[key] = tensor.detach().cpu()
+    with load_authenticated_tensor_document(path, authority) as raw_document:
+        _check_tensor_tree(raw_document)
+        document: object = raw_document
+        if set(raw_document) in ({'model'}, {'state_dict'}):
+            document = raw_document[next(iter(raw_document))]
+        if not isinstance(document, Mapping):
+            raise FormalCheckpointError('checkpoint tensor wrapper is invalid')
+        if set(document) != set(expected_keys):
+            raise FormalCheckpointError(
+                'checkpoint tensor keys differ from contract')
+        result: dict[str, torch.Tensor] = {}
+        for key in sorted(expected_keys):
+            tensor = document[key]
+            contract = expected_keys[key]
+            if not isinstance(tensor, torch.Tensor):
+                raise FormalCheckpointError(f'{key} is not a tensor')
+            if tuple(tensor.shape) != contract.shape:
+                raise FormalCheckpointError(f'{key} shape differs from contract')
+            if str(tensor.dtype) != contract.dtype:
+                raise FormalCheckpointError(f'{key} dtype differs from contract')
+            if (tensor.is_floating_point() or tensor.is_complex()) \
+                    and not torch.isfinite(tensor).all().item():
+                raise FormalCheckpointError(f'{key} is non-finite')
+            result[key] = tensor.detach().cpu()
     return MappingProxyType(result)
 
 
@@ -189,50 +340,35 @@ def load_formal_backbone_initialization(
     every tensor below ``model`` is recursively finite before the backbone's
     standard key-translation method sees it.  No generic loader is called.
     """
-    if os.environ.get('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD') == '1':
-        raise FormalCheckpointError(
-            'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD is forbidden')
-    _root, canonical = authority.validate()
-    supplied = Path(path)
-    if not supplied.is_absolute():
-        supplied = Path.cwd() / supplied
-    if supplied.absolute() != canonical.absolute() \
-            or _sha256(canonical) != authority.sha256:
-        raise FormalCheckpointError(
-            'backbone initialization differs from authority')
     if isinstance(minimum_compatible_tensors, bool) \
             or not isinstance(minimum_compatible_tensors, int) \
             or minimum_compatible_tensors < 1:
         raise FormalCheckpointError('minimum compatible tensor count is invalid')
-    try:
-        document = torch.load(canonical, map_location='cpu', weights_only=True)
-    except Exception as error:
-        raise FormalCheckpointError(
-            'backbone initialization failed weights-only loading') from error
-    if not isinstance(document, Mapping) or 'model' not in document \
-            or not isinstance(document['model'], Mapping):
-        raise FormalCheckpointError(
-            'backbone initialization has no model tensor mapping')
-    model = document['model']
-    _check_tensor_tree(model, 'checkpoint.model')
-    before = tuple(backbone.state_dict())
-    try:
-        incompatible = backbone.load_state_dict(dict(model), strict=False)
-    except (RuntimeError, TypeError, ValueError) as error:
-        raise FormalCheckpointError(
-            'backbone initialization tensors are incompatible') from error
-    missing = tuple(incompatible.missing_keys)
-    compatible = tuple(sorted(set(before) - set(missing)))
-    if len(compatible) < minimum_compatible_tensors:
-        raise FormalCheckpointError(
-            'backbone initialization compatible tensor count is too small')
-    state = backbone.state_dict()
-    for key in compatible:
-        tensor = state[key]
-        if (tensor.is_floating_point() or tensor.is_complex()) \
-                and not torch.isfinite(tensor).all().item():
+    with load_authenticated_tensor_document(path, authority) as document:
+        if 'model' not in document \
+                or not isinstance(document['model'], Mapping):
             raise FormalCheckpointError(
-                'backbone initialization produced a non-finite tensor')
+                'backbone initialization has no model tensor mapping')
+        model = document['model']
+        _check_tensor_tree(model, 'checkpoint.model')
+        before = tuple(backbone.state_dict())
+        try:
+            incompatible = backbone.load_state_dict(dict(model), strict=False)
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise FormalCheckpointError(
+                'backbone initialization tensors are incompatible') from error
+        missing = tuple(incompatible.missing_keys)
+        compatible = tuple(sorted(set(before) - set(missing)))
+        if len(compatible) < minimum_compatible_tensors:
+            raise FormalCheckpointError(
+                'backbone initialization compatible tensor count is too small')
+        state = backbone.state_dict()
+        for key in compatible:
+            tensor = state[key]
+            if (tensor.is_floating_point() or tensor.is_complex()) \
+                    and not torch.isfinite(tensor).all().item():
+                raise FormalCheckpointError(
+                    'backbone initialization produced a non-finite tensor')
     return BackboneLoadReport(
         compatible_tensors=len(compatible),
         missing_tensors=len(missing),

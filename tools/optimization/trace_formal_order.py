@@ -16,6 +16,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mambapose_opt.formal_schema import load_formal_manifest  # noqa: E402
+from mambapose_opt.formal_training import (  # noqa: E402
+    load_authenticated_trace_config,
+)
 
 
 def main() -> int:
@@ -40,12 +43,11 @@ def main() -> int:
     # Root determinism precedes config, registry, and dataset construction.
     from mambapose_opt.formal_determinism import configure_root_determinism
     configure_root_determinism(spec.seed)
-    from mmengine.config import Config
     from mmengine.registry import init_default_scope
     from mmpose.registry import DATASETS
     from mmpose.utils import register_all_modules
     register_all_modules(init_default_scope=False)
-    config = Config.fromfile(ROOT / spec.config)
+    config = load_authenticated_trace_config(manifest, spec.run_id, ROOT)
     init_default_scope(config.get('default_scope', 'mmpose'))
     dataset = DATASETS.build(config.train_dataloader.dataset)
     dataset_size = len(dataset)
