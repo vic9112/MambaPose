@@ -426,6 +426,28 @@ def _reject_parent_symlinks(path: Path, field: str) -> None:
             raise PriorBundleError(f'{field} parent must not be a symlink')
 
 
+def _validate_lexical_authority_path(
+        path: Path, field: str, *, require_directory: bool) -> None:
+    """Validate every existing lexical component without following links."""
+    if not path.is_absolute():
+        raise PriorBundleError(f'{field} must be an absolute authority path')
+    current = Path(path.anchor)
+    try:
+        mode = os.lstat(current).st_mode
+        for part in path.parts[1:]:
+            current = current / part
+            mode = os.lstat(current).st_mode
+            if stat.S_ISLNK(mode):
+                raise PriorBundleError(
+                    f'{field} must not traverse a symlink')
+    except OSError as error:
+        raise PriorBundleError(f'{field} is unavailable') from error
+    expected = stat.S_ISDIR(mode) if require_directory else stat.S_ISREG(mode)
+    if not expected:
+        kind = 'directory' if require_directory else 'regular file'
+        raise PriorBundleError(f'{field} must be an exact {kind}')
+
+
 def _preflight_link(link: Path, destination: Path) -> None:
     if os.path.lexists(link):
         if not link.is_symlink():
@@ -468,6 +490,10 @@ def _prepare_prior_bundle(
     audit = Path(audit_report).absolute()
     if target == source or target == link or source in target.parents:
         raise PriorBundleError('bundle paths overlap source or link authority')
+    _validate_lexical_authority_path(
+        source, 'source root', require_directory=True)
+    _validate_lexical_authority_path(
+        audit, 'audit report', require_directory=False)
     _reject_parent_symlinks(target, 'bundle destination')
     _reject_parent_symlinks(link, 'logical link')
     _verify_source(source, expected_source_commit)
@@ -518,12 +544,16 @@ def _check_prior_bundle(
     source = Path(source_root).absolute()
     target = Path(destination).absolute()
     link = Path(logical_link).absolute()
+    audit = Path(audit_report).absolute()
+    _validate_lexical_authority_path(
+        source, 'source root', require_directory=True)
+    _validate_lexical_authority_path(
+        audit, 'audit report', require_directory=False)
     _reject_parent_symlinks(target, 'bundle destination')
     _reject_parent_symlinks(link, 'logical link')
     _verify_source(source, expected_source_commit)
     entries, _sources = _collect_entries(
-        source, Path(audit_report).absolute(), expected_source_commit,
-        expected_hashes)
+        source, audit, expected_source_commit, expected_hashes)
     expected = _canonical_bytes(_bundle_document(
         expected_source_commit, entries, unpruned_parent_sha256))
     _preflight_link(link, target)

@@ -254,6 +254,52 @@ def test_prepare_bundle_rejects_symlinked_logical_parent(tmp_path):
     assert not (outside / 'optimization/prior-stage-b').exists()
 
 
+def test_prepare_bundle_rejects_symlinked_source_parent_before_mutation(
+        tmp_path):
+    tool = _load_tool()
+    real_parent = tmp_path / 'real-source-parent'
+    real_parent.mkdir()
+    source, audit, commit, hashes = _fake_source(real_parent)
+    alias_parent = tmp_path / 'source-parent-alias'
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    destination = tmp_path / 'canonical/no-pif-seed0'
+
+    with pytest.raises(tool.PriorBundleError, match='source root.*symlink'):
+        tool._prepare_prior_bundle(
+            source_root=alias_parent / source.name,
+            destination=destination,
+            logical_link=tmp_path / 'runtime/prior-stage-b',
+            audit_report=audit,
+            expected_source_commit=commit,
+            expected_hashes=hashes,
+            unpruned_parent_sha256='1' * 64)
+
+    assert not destination.exists()
+
+
+def test_prepare_bundle_rejects_symlinked_audit_parent_before_mutation(
+        tmp_path):
+    tool = _load_tool()
+    real_parent = tmp_path / 'real-audit-parent'
+    real_parent.mkdir()
+    source, audit, commit, hashes = _fake_source(real_parent)
+    alias_parent = tmp_path / 'audit-parent-alias'
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    destination = tmp_path / 'canonical/no-pif-seed0'
+
+    with pytest.raises(tool.PriorBundleError, match='audit report.*symlink'):
+        tool._prepare_prior_bundle(
+            source_root=source,
+            destination=destination,
+            logical_link=tmp_path / 'runtime/prior-stage-b',
+            audit_report=alias_parent / audit.name,
+            expected_source_commit=commit,
+            expected_hashes=hashes,
+            unpruned_parent_sha256='1' * 64)
+
+    assert not destination.exists()
+
+
 def test_existing_bundle_rejects_writable_root(tmp_path):
     tool = _load_tool()
     source, audit, commit, hashes = _fake_source(tmp_path)
