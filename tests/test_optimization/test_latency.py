@@ -313,6 +313,9 @@ def test_pwl_latency_producer_serializes_exact_stage_a_binding(
     monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
     monkeypatch.setattr(tool, 'resolve_numeric_runtime',
                         lambda *args, **kwargs: runtime)
+    monkeypatch.setattr(
+        tool, 'authorize_pwl_runtime_config',
+        lambda *_args, **_kwargs: SimpleNamespace(load_config=lambda: config))
     monkeypatch.setattr(tool, '_latency_admission', lambda *args, **kwargs: {
         'git_commit': 'd' * 40,
         'checkpoint_sha256': candidate.checkpoint_sha256,

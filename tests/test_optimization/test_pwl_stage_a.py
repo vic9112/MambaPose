@@ -267,9 +267,15 @@ def test_production_dependencies_reads_canonical_calibration_envelope(
     monkeypatch.setattr(
         checkpoints, 'authorize_manifest_candidate',
         lambda *unused, **ignored: authorized)
+    tracked_config = SimpleNamespace(
+        numeric_optimization=SimpleNamespace(pwl=_policy()))
     monkeypatch.setattr(
-        Config, 'fromfile', staticmethod(lambda unused: SimpleNamespace(
-            numeric_optimization=SimpleNamespace(pwl=_policy()))))
+        checkpoints, 'authorize_tracked_config',
+        lambda *unused, **ignored: SimpleNamespace(
+            load_config=lambda: tracked_config))
+    monkeypatch.setattr(
+        Config, 'fromfile', staticmethod(lambda unused: (_ for _ in ()).throw(
+            AssertionError('tracked PWL config bypassed ConfigAuthority'))))
     monkeypatch.setattr(
         pwl_smoke, 'load_pwl_fit_reference',
         lambda *unused, **ignored: fit)

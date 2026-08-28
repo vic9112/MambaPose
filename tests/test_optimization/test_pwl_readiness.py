@@ -797,6 +797,13 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
     checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     config = tmp_path / 'configs/pwl.py'
     config.write_text(
+        "model = dict(type='Fixture', test_cfg=dict(flip_test=False))\n"
+        "train_dataloader = dict(batch_size=1, num_workers=0, "
+        "persistent_workers=False)\n"
+        "val_dataloader = dict(batch_size=1, num_workers=0, "
+        "persistent_workers=False)\n"
+        "test_dataloader = dict(batch_size=1, num_workers=0, "
+        "persistent_workers=False)\n"
         "numeric_optimization = dict(\n"
         "    candidate_kind='pwl',\n"
         "    calibration=dict(artifact_schema_version=3),\n"
@@ -908,3 +915,34 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
     assert len({item['pwl_stage_a']['sha256'] for item in runtimes}) == 1
     assert all(item['pwl_installation'] == produced['result']['installation']
                for item in runtimes)
+
+    from mambapose_opt.checkpoints import (
+        authorize_pwl_runtime_config,
+        load_materialized_config_authority,
+        materialize_evaluation_config_authority)
+    authority = authorize_pwl_runtime_config(
+        tmp_path, manifest, candidate, conversion_path=output)
+    assert authority.path == output.parent / 'resolved-runtime.py'
+    assert authority.sha256 == produced['result']['runtime_config']['sha256']
+    assert authority.load_config().numeric_optimization.pwl.candidate_id == (
+        candidate.id)
+
+    materialized_path = output.parent.parent / 'evaluate/resolved-flip.py'
+    authority_path = output.parent.parent / (
+        'evaluate/resolved-flip.config-authority.json')
+    materialized = materialize_evaluation_config_authority(
+        authority, flip_test=True, config_path=materialized_path,
+        authority_path=authority_path)
+    loaded = load_materialized_config_authority(
+        tmp_path, manifest, candidate, authority_path)
+    assert loaded.sha256 == materialized.sha256
+    assert loaded.load_config().model.test_cfg.flip_test is True
+
+    original = materialized_path.read_bytes()
+    materialized_path.write_text(
+        "model = dict(type='Fixture', test_cfg=dict(flip_test=False))\n",
+        encoding='utf-8')
+    with pytest.raises(ValueError, match='materialized|authority|changed'):
+        loaded.verify()
+    materialized_path.write_bytes(original)
+    loaded.verify()

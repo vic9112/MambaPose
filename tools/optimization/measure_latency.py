@@ -52,7 +52,8 @@ from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 from mambapose_opt.numeric_conversion import NumericRuntimeHook
 from mambapose_opt.source import clean_git_commit
 from mambapose_opt.numeric_runtime import resolve_numeric_runtime
-from mambapose_opt.checkpoints import build_manifest_authorized_model
+from mambapose_opt.checkpoints import (
+    authorize_pwl_runtime_config, build_manifest_authorized_model)
 
 
 LEASE_MAX_AGE = timedelta(seconds=LEASE_MAX_AGE_SECONDS)
@@ -208,7 +209,14 @@ def measure_candidate(
         repository_root=REPO_ROOT, candidate=candidate,
         manifest_path=manifest,
         git_commit=admission['git_commit'])
-    config = Config.fromfile(config_path)
+    config_authority = None
+    if candidate.features.get('numeric_kind') == 'pwl':
+        config_authority = authorize_pwl_runtime_config(
+            REPO_ROOT, manifest, candidate,
+            conversion_path=config_path.parent / 'convert.json')
+        config = config_authority.load_config()
+    else:
+        config = Config.fromfile(config_path)
     data_protocol = validate_coco_val_protocol(
         config, repository_root=REPO_ROOT)
     config.randomness = dict(seed=candidate.seed, deterministic=True)
@@ -223,7 +231,8 @@ def measure_candidate(
 
     if candidate.features.get('numeric_kind') == 'pwl':
         model = build_manifest_authorized_model(
-            REPO_ROOT, manifest, candidate, config=config, device='cuda:0')
+            REPO_ROOT, manifest, candidate,
+            config_authority=config_authority, device='cuda:0')
     else:
         from mmpose.apis import init_model
         model = init_model(config, str(checkpoint), device='cuda:0')

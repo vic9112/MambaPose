@@ -33,6 +33,9 @@ from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 from mambapose_opt.source import clean_git_commit
 from mambapose_opt.numeric_runtime import resolve_numeric_runtime
 from mambapose_opt.process_environment import deterministic_child_environment
+from mambapose_opt.checkpoints import (
+    authorize_pwl_runtime_config,
+    materialize_evaluation_config_authority)
 
 
 def _sha256(path: Path) -> str:
@@ -100,18 +103,34 @@ def _evaluate_mode(
         checkpoint: Path,
         config_path: Path | None = None,
         checkpoint_name: str | None = None,
-        manifest_path: Path | None = None) -> dict:
+        manifest_path: Path | None = None,
+        config_authority=None) -> dict:
     config_path = config_path or REPO_ROOT / candidate.config
-    config = _deterministic_config(candidate, flip_test, config_path)
-    protocol = validate_coco_val_protocol(config, repository_root=REPO_ROOT)
     mode = 'flip' if flip_test else 'no-flip'
     resolved = output.parent / f'resolved-{mode}.py'
+    materialized_authority_path = (
+        output.parent / f'resolved-{mode}.config-authority.json')
+    materialized = None
+    if candidate.features.get('numeric_kind') == 'pwl':
+        if manifest_path is None or config_authority is None:
+            raise ValueError(
+                'PWL evaluation requires manifest and runtime ConfigAuthority')
+        materialized = materialize_evaluation_config_authority(
+            config_authority, flip_test=flip_test, config_path=resolved,
+            authority_path=materialized_authority_path)
+        config = materialized.load_config()
+        resolved = materialized.path
+    else:
+        config = _deterministic_config(candidate, flip_test, config_path)
+        _dump_config(config, resolved)
+    protocol = validate_coco_val_protocol(config, repository_root=REPO_ROOT)
     raw_metrics = output.parent / f'raw-{mode}-mmpose-metrics.json'
     work_dir = output.parent / f'mmpose-{mode}'
-    _dump_config(config, resolved)
     provenance = {
         'checkpoint_sha256': checkpoint_sha256,
-        'config_sha256': _sha256(resolved),
+        'config_sha256': (
+            materialized.sha256 if materialized is not None
+            else _sha256(resolved)),
         'data_inventory_sha256': protocol['inventory_projection'][
             'inventory_sha256'],
         'git_commit': git_commit,
@@ -134,9 +153,14 @@ def _evaluate_mode(
         command.extend([
             '--safe-manifest', str(manifest_path),
             '--safe-candidate', candidate.id,
+            '--safe-config-authority', str(materialized_authority_path),
         ])
-    subprocess.run(
-        command, cwd=REPO_ROOT, env=environment, check=True, shell=False)
+    try:
+        subprocess.run(
+            command, cwd=REPO_ROOT, env=environment, check=True, shell=False)
+    finally:
+        if materialized is not None:
+            materialized.verify()
     metrics = load_coco_metrics(raw_metrics, provenance=provenance)
     determinism = build_determinism_record(
         seed=candidate.seed,
@@ -183,13 +207,19 @@ def evaluate(
         repository_root=REPO_ROOT, candidate=candidate,
         manifest_path=manifest,
         git_commit=git_commit)
+    config_authority = (
+        authorize_pwl_runtime_config(
+            REPO_ROOT, manifest, candidate,
+            conversion_path=config_path.parent / 'convert.json')
+        if candidate.features.get('numeric_kind') == 'pwl' else None)
     rows = {
         mode: _evaluate_mode(
             candidate, output, flip_test=mode == 'flip',
             checkpoint_sha256=checkpoint_sha256, git_commit=git_commit,
             checkpoint=checkpoint, config_path=config_path,
             checkpoint_name=runtime['checkpoint_name'],
-            manifest_path=manifest)
+            manifest_path=manifest,
+            config_authority=config_authority)
         for mode in modes
     }
     if (candidate.route == 'ssm-quant-pwl'

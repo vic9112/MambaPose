@@ -25,7 +25,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.checkpoints import (
-    authorize_manifest_candidate, build_manifest_authorized_model)
+    authorize_manifest_candidate, authorize_tracked_config,
+    build_manifest_authorized_model)
 from mambapose_opt.determinism import seed_deterministic_root
 from mambapose_opt.numeric_calibration import (
     CalibrationTargets, calibration_identity, discover_calibration_targets,
@@ -111,8 +112,14 @@ def audit(
         raise ValueError('calibration candidate differs from authorized manifest')
     identity = _identity(candidate, policy)
     if getattr(target, 'features', {}).get('numeric_kind') == 'pwl':
+        model_config_authority = authorize_tracked_config(
+            REPOSITORY_ROOT, manifest, candidate)
+        policy_config_authority = authorize_tracked_config(
+            REPOSITORY_ROOT, manifest, target)
         model = build_manifest_authorized_model(
-            REPOSITORY_ROOT, manifest, candidate, device='cpu')
+            REPOSITORY_ROOT, manifest, candidate,
+            config_authority=model_config_authority, device='cpu')
+        policy_config_authority.verify()
     else:
         from mmpose.apis import init_model
         model = init_model(
@@ -363,7 +370,18 @@ def calibrate(
     identity_before = _identity(candidate, policy)
     from mmengine.config import Config
     from mmengine.runner import Runner
-    config = Config.fromfile(authorized.config_path)
+    model_config_authority = (
+        authorize_tracked_config(REPOSITORY_ROOT, manifest, candidate)
+        if getattr(target, 'features', {}).get('numeric_kind') == 'pwl'
+        else None)
+    policy_config_authority = (
+        authorize_tracked_config(REPOSITORY_ROOT, manifest, target)
+        if getattr(target, 'features', {}).get('numeric_kind') == 'pwl'
+        else None)
+    config = (
+        model_config_authority.load_config()
+        if model_config_authority is not None
+        else Config.fromfile(authorized.config_path))
     loader_config = dict(config.train_dataloader)
     loader_config.update(batch_size=1, num_workers=0, persistent_workers=False)
     loader_config['sampler'] = dict(type='DefaultSampler', shuffle=False)
@@ -371,7 +389,7 @@ def calibrate(
     if getattr(target, 'features', {}).get('numeric_kind') == 'pwl':
         model = build_manifest_authorized_model(
             REPOSITORY_ROOT, manifest, candidate,
-            config=config, device=device)
+            config_authority=model_config_authority, device=device)
     else:
         from mmpose.apis import init_model
         model = init_model(
@@ -385,7 +403,10 @@ def calibrate(
                                          diff_rank_seed=False)
     order = hashlib.sha256()
     observed = 0
-    target_config = Config.fromfile(policy)
+    target_config = (
+        policy_config_authority.load_config()
+        if policy_config_authority is not None
+        else Config.fromfile(policy))
     target_numeric = target_config.numeric_optimization
     target_features = getattr(target, 'features', {})
     raw_pwl_policy = (

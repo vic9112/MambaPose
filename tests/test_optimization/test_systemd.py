@@ -116,6 +116,21 @@ def test_pwl_installer_renders_exact_offline_conditional_campaign(tmp_path):
     assert not (tmp_path / '.config/systemd/user').exists()
 
 
+def test_pwl_installer_freshness_rejects_symlinked_parent_component(tmp_path):
+    runtime = tmp_path / 'runtime'
+    effective = runtime / 'alternate/work_dirs/optimization'
+    effective.mkdir(parents=True)
+    (runtime / 'work_dirs').symlink_to(effective.parent)
+
+    result = subprocess.run(
+        ['bash', 'tools/optimization/install_pwl_user_service.sh',
+         '--fixture-freshness', str(runtime)],
+        cwd=ROOT, capture_output=True, text=True, check=False)
+
+    assert result.returncode == 78
+    assert 'symlink' in result.stderr
+
+
 def test_pwl_stage_environment_scrubs_unsafe_checkpoint_fallback(monkeypatch):
     from tools.optimization.run_campaign import SubprocessStageRunner
 

@@ -24,7 +24,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.checkpoints import (
-    authorize_manifest_candidate, build_manifest_authorized_model)
+    authorize_manifest_candidate, authorize_tracked_config,
+    build_manifest_authorized_model)
 from mambapose_opt.numeric_conversion import (
     bind_numeric_inputs, install_pwl_fit, quant_policy_from_config,
     verify_numeric_inputs)
@@ -120,7 +121,13 @@ def convert(
         manifest_path=manifest_path, policy_path=config_path,
         git_commit=commit)
     checkpoint_path = authorized.checkpoint_path
-    config = Config.fromfile(config_path)
+    config_authority = (
+        authorize_tracked_config(
+            REPOSITORY_ROOT, manifest_path, candidate)
+        if kind == 'pwl' else None)
+    config = (
+        config_authority.load_config() if config_authority is not None
+        else Config.fromfile(config_path))
     calibration = None
     selection_reference = None
     if kind == 'pwl':
@@ -176,7 +183,7 @@ def convert(
     if kind == 'pwl':
         model = build_manifest_authorized_model(
             REPOSITORY_ROOT, manifest_path, candidate,
-            config=config, device='cpu')
+            config_authority=config_authority, device='cpu')
     else:
         from mmpose.apis import init_model
         model = init_model(str(config_path), str(checkpoint_path), device='cpu')

@@ -30,6 +30,32 @@ cleanup_rendered_units() {
 }
 trap cleanup_rendered_units EXIT
 
+validate_fresh_campaign_root() {
+    local runtime_root="$1"
+    local cursor="${runtime_root}"
+    local component
+    if [[ -L "${cursor}" ]]; then
+        echo "frozen PWL runtime path must not use a symlink: ${cursor}" >&2
+        return 78
+    fi
+    for component in work_dirs optimization; do
+        cursor="${cursor}/${component}"
+        if [[ -L "${cursor}" ]]; then
+            echo "frozen PWL campaign path must not use a symlink: ${cursor}" >&2
+            return 78
+        fi
+    done
+    if [[ -e "${cursor}" ]] && [[ ! -d "${cursor}" ]]; then
+        echo "frozen PWL campaign root must be a local directory" >&2
+        return 78
+    fi
+    if [[ -e "${cursor}" ]] && \
+            [[ -n "$(find "${cursor}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+        echo "frozen PWL campaign root must be fresh" >&2
+        return 78
+    fi
+}
+
 mkdir -p "${RENDER_DIR}"
 for name in \
         mambapose-pwl.service \
@@ -46,6 +72,11 @@ systemd-analyze --user verify \
 if [[ "${FIXTURE_MODE}" == "--fixture-smoke" ]]; then
     echo "rendered_repo_root=${PWL_RUNTIME_ROOT}"
     echo "fixture systemd verification passed"
+    exit 0
+fi
+if [[ "${FIXTURE_MODE}" == "--fixture-freshness" && -n "${2:-}" ]]; then
+    validate_fresh_campaign_root "${2}"
+    echo "fixture campaign freshness verification passed"
     exit 0
 fi
 
@@ -65,16 +96,7 @@ if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain)" ]] || \
     echo "installer source and frozen PWL runtime must be clean; runtime detached" >&2
     exit 78
 fi
-if [[ -L "${CAMPAIGN_ROOT}" ]] || \
-        { [[ -e "${CAMPAIGN_ROOT}" ]] && [[ ! -d "${CAMPAIGN_ROOT}" ]]; }; then
-    echo "frozen PWL campaign root must be a local directory" >&2
-    exit 78
-fi
-if [[ -e "${CAMPAIGN_ROOT}" ]] && \
-        [[ -n "$(find "${CAMPAIGN_ROOT}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-    echo "frozen PWL campaign root must be fresh" >&2
-    exit 78
-fi
+validate_fresh_campaign_root "${PWL_RUNTIME_ROOT}"
 
 mkdir -p "${USER_UNIT_DIR}" "${EVIDENCE_DIR}"
 for name in \

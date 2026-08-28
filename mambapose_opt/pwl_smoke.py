@@ -408,9 +408,8 @@ def _policy(config) -> dict[str, Any]:
 def _production_dependencies(
         *, value: Mapping[str, Any], repository_root: Path,
         manifest_path: Path) -> dict[str, Any]:
-    from mmengine.config import Config
-
-    from .checkpoints import authorize_manifest_candidate
+    from .checkpoints import (
+        authorize_manifest_candidate, authorize_tracked_config)
 
     root = Path(repository_root).resolve(strict=True)
     candidate_id = value.get('candidate_id')
@@ -419,7 +418,8 @@ def _production_dependencies(
     candidate = authorized.candidate
     if candidate.features.get('numeric_kind') != 'pwl':
         raise ValueError('PWL Stage-A candidate kind is invalid')
-    config = Config.fromfile(authorized.config_path)
+    config = authorize_tracked_config(
+        root, manifest_path, candidate).load_config()
     policy = _policy(config)
     fit_reference = _binding(value.get('fit_artifact'), label='PWL fit')
     expected_fit_path = (
@@ -787,14 +787,18 @@ def _smoke_dataloader(value: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _build_model(config, state, device, *, install: bool):
+def _build_model(config_authority, state, device, *, install: bool):
     from mmengine.registry import init_default_scope
     from mmpose.registry import MODELS
 
     from .checkpoints import (
-        load_tensor_state_strict, neutralize_model_initializers)
+        ConfigAuthority, load_tensor_state_strict,
+        neutralize_model_initializers)
     from .numeric_conversion import NumericRuntimeHook
 
+    if not isinstance(config_authority, ConfigAuthority):
+        raise TypeError('PWL Stage-A requires sealed config authority')
+    config = config_authority.load_config()
     init_default_scope(config.get('default_scope', 'mmpose'))
     safe_config = neutralize_model_initializers(config)
     model = MODELS.build(safe_config.model)
@@ -831,10 +835,11 @@ def run_pwl_stage_a_smoke(
             or relative.name != 'smoke-stage-a'):
         raise ValueError('PWL smoke output path is invalid')
     output = root / relative
-    from mmengine.config import Config
     from mmengine.runner import Runner
 
-    from .checkpoints import authorize_manifest_candidate, tensor_state
+    from .checkpoints import (
+        authorize_manifest_candidate, authorize_pwl_runtime_config,
+        tensor_state)
     from .numeric_runtime import validate_numeric_convert_artifact
 
     authorized = authorize_manifest_candidate(root, manifest_path, candidate_id)
@@ -852,8 +857,9 @@ def run_pwl_stage_a_smoke(
     validate_numeric_convert_artifact(
         conversion, candidate=candidate, repository_root=root,
         manifest_path=manifest_path, artifact_path=conversion_path)
-    config_path = root / conversion['result']['runtime_config']['path']
-    config = Config.fromfile(config_path)
+    config_authority = authorize_pwl_runtime_config(
+        root, manifest_path, candidate, conversion_path=conversion_path)
+    config = config_authority.load_config()
     policy = _policy(config)
     fit_reference = conversion['result']['runtime_bindings']['calibration']
     fit = load_pwl_fit_reference(
@@ -884,7 +890,8 @@ def run_pwl_stage_a_smoke(
         torch.cuda.manual_seed_all(candidate.seed)
         torch.use_deterministic_algorithms(True)
         device = torch.device('cuda:0')
-        model = _build_model(config, state, device, install=True)
+        model = _build_model(
+            config_authority, state, device, install=True)
         loader = Runner.build_dataloader(
             loader_config, seed=candidate.seed, diff_rank_seed=False)
         batch = next(iter(loader))
@@ -899,13 +906,13 @@ def run_pwl_stage_a_smoke(
             empty = {name: torch.empty_like(value)
                      for name, value in state.items()}
             return _build_model(
-                config, empty, torch.device('cpu'), install=True)
+                config_authority, empty, torch.device('cpu'), install=True)
 
         def identity_factory():
             empty = {name: torch.empty_like(value)
                      for name, value in state.items()}
             return _build_model(
-                config, empty, torch.device('cpu'), install=False)
+                config_authority, empty, torch.device('cpu'), install=False)
 
         execution = execute_pwl_stage_a_model(
             model=model, inputs=inputs, data_samples=samples,

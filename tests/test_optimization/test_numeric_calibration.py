@@ -623,6 +623,9 @@ def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
         'numeric_optimization = dict()\n', encoding='utf-8')
     monkeypatch.setattr(tool, 'authorize_manifest_candidate',
                         lambda *_args: authorized)
+    monkeypatch.setattr(
+        tool, 'authorize_tracked_config',
+        lambda *_args: SimpleNamespace(load_config=lambda: config))
     monkeypatch.setattr(tool, '_identity', identity)
     monkeypatch.setattr(tool, 'seed_deterministic_root', deterministic_root)
     monkeypatch.setattr(tool, 'discover_calibration_targets', lambda _model:

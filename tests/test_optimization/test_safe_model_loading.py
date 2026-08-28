@@ -26,7 +26,9 @@ def _git(*args, cwd):
                    capture_output=True)
 
 
-def _authorized_repo(tmp_path, payload):
+def _authorized_repo(
+        tmp_path, payload,
+        config_text='model = dict(type="Fixture")\n'):
     _git('init', '-q', cwd=tmp_path)
     (tmp_path / 'data').mkdir()
     checkpoint = tmp_path / 'work_dirs/reproduction/model.pth'
@@ -34,7 +36,7 @@ def _authorized_repo(tmp_path, payload):
     torch.save(payload, checkpoint)
     config = tmp_path / 'configs/model.py'
     config.parent.mkdir()
-    config.write_text('model = dict(type="Fixture")\n', encoding='utf-8')
+    config.write_text(config_text, encoding='utf-8')
     authority = tmp_path / 'optimization/coco_val2017_authority.json'
     authority.parent.mkdir()
     authority.write_text('{}\n', encoding='utf-8')
@@ -67,14 +69,21 @@ def _authorized_repo(tmp_path, payload):
 
 def test_manifest_authorized_builder_neutralizes_initializers_and_loads_state(
         tmp_path, monkeypatch):
-    from mambapose_opt.checkpoints import build_manifest_authorized_model
+    from mambapose_opt.checkpoints import (
+        authorize_tracked_config, build_manifest_authorized_model)
 
-    manifest, checkpoint = _authorized_repo(tmp_path, {
-        'state_dict': {
-            'weight': torch.tensor([1.5, -2.0], dtype=torch.float32),
-            'counter': torch.tensor([7], dtype=torch.int64),
+    manifest, checkpoint = _authorized_repo(
+        tmp_path, {
+            'state_dict': {
+                'weight': torch.tensor([1.5, -2.0], dtype=torch.float32),
+                'counter': torch.tensor([7], dtype=torch.int64),
+            },
         },
-    })
+        'model = dict(\n'
+        '    type="Fixture", pretrained="implicit.pth",\n'
+        '    init_cfg=dict(type="Pretrained", checkpoint="implicit.pth"),\n'
+        '    nested=(dict(pretrained="tuple.pth"),\n'
+        '            [dict(init_cfg=dict(type="Pretrained"))]))\n')
     captured = {}
 
     def init_model(config, checkpoint_value, *, device):
@@ -84,14 +93,11 @@ def test_manifest_authorized_builder_neutralizes_initializers_and_loads_state(
         return _ToyModel()
 
     monkeypatch.setattr('mmpose.apis.init_model', init_model)
-    config = Config(dict(model=dict(
-        type='Fixture', pretrained='implicit.pth',
-        init_cfg=dict(type='Pretrained', checkpoint='implicit.pth'),
-        nested=(dict(pretrained='tuple.pth'),
-                [dict(init_cfg=dict(type='Pretrained'))]))))
-
+    authority = authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
     model = build_manifest_authorized_model(
-        tmp_path, manifest, 'pwl-silu-s-v1', config=config, device='cpu')
+        tmp_path, manifest, 'pwl-silu-s-v1',
+        config_authority=authority, device='cpu')
 
     assert captured['checkpoint'] is None
     assert captured['device'] == 'cpu'
@@ -127,7 +133,8 @@ def test_strict_tensor_injection_rejects_incompatible_state(state, message):
 
 def test_manifest_authorized_builder_rejects_hostile_pickle_without_execution(
         tmp_path, monkeypatch):
-    from mambapose_opt.checkpoints import build_manifest_authorized_model
+    from mambapose_opt.checkpoints import (
+        authorize_tracked_config, build_manifest_authorized_model)
 
     marker = tmp_path / 'executed'
 
@@ -142,12 +149,52 @@ def test_manifest_authorized_builder_rejects_hostile_pickle_without_execution(
         lambda *_args, **_kwargs: _ToyModel())
     monkeypatch.setenv('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
 
+    authority = authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
     with pytest.raises(ValueError, match='weights-only|restricted|checkpoint'):
         build_manifest_authorized_model(
             tmp_path, manifest, 'pwl-silu-s-v1',
-            config=Config(dict(model=dict(type='Fixture'))), device='cpu')
+            config_authority=authority, device='cpu')
 
     assert not marker.exists()
+
+
+def test_manifest_authorized_builder_rejects_naked_alternate_config(
+        tmp_path, monkeypatch):
+    from mambapose_opt.checkpoints import build_manifest_authorized_model
+
+    manifest, _checkpoint = _authorized_repo(tmp_path, {
+        'state_dict': {
+            'weight': torch.tensor([1.0, 2.0], dtype=torch.float32),
+            'counter': torch.tensor([3], dtype=torch.int64),
+        },
+    })
+    monkeypatch.setattr(
+        'mmpose.apis.init_model', lambda *_args, **_kwargs: _ToyModel())
+    alternate = Config(dict(model=dict(
+        type='Fixture', authority_tag='alternate')))
+
+    with pytest.raises(TypeError, match='config_authority|unexpected'):
+        build_manifest_authorized_model(
+            tmp_path, manifest, 'pwl-silu-s-v1',
+            config=alternate, device='cpu')
+
+
+def test_config_authority_rejects_in_memory_config_tampering(tmp_path):
+    from mambapose_opt.checkpoints import authorize_tracked_config
+
+    manifest, _checkpoint = _authorized_repo(tmp_path, {
+        'state_dict': {
+            'weight': torch.tensor([1.0, 2.0], dtype=torch.float32),
+            'counter': torch.tensor([3], dtype=torch.int64),
+        },
+    })
+    authority = authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    authority._config.model.authority_tag = 'alternate'
+
+    with pytest.raises(ValueError, match='ConfigAuthority.*changed|tamper'):
+        authority.verify()
 
 
 def test_test_cli_injects_safe_model_and_disables_runner_checkpoint(
@@ -163,6 +210,19 @@ def test_test_cli_injects_safe_model_and_disables_runner_checkpoint(
     manifest.write_text('{}\n', encoding='utf-8')
     model = _ToyModel()
     captured = {}
+    authority_path = tmp_path / 'config-authority.json'
+    authority_path.write_text('{}\n', encoding='utf-8')
+
+    class Authority:
+        path = config_path.resolve()
+
+        def load_config(self):
+            return Config(dict(model=dict(type='Fixture')))
+
+        def verify(self):
+            captured['verified'] = captured.get('verified', 0) + 1
+
+    authority = Authority()
 
     monkeypatch.setattr(
         tool.Config, 'fromfile',
@@ -171,8 +231,12 @@ def test_test_cli_injects_safe_model_and_disables_runner_checkpoint(
         checkpoints, 'authorize_manifest_candidate',
         lambda *_args: SimpleNamespace(checkpoint_path=checkpoint.resolve()))
     monkeypatch.setattr(
+        checkpoints, 'load_materialized_config_authority',
+        lambda *_args: authority)
+    monkeypatch.setattr(
         checkpoints, 'build_manifest_authorized_model',
-        lambda repository_root, manifest_path, candidate, *, config, device:
+        lambda repository_root, manifest_path, candidate, *,
+        config_authority, device:
         model)
 
     class FakeRunner:
@@ -191,9 +255,85 @@ def test_test_cli_injects_safe_model_and_disables_runner_checkpoint(
     monkeypatch.setattr(sys, 'argv', [
         'tools/test.py', str(config_path), str(checkpoint),
         '--safe-manifest', str(manifest),
-        '--safe-candidate', 'pwl-silu-s-v1'])
+        '--safe-candidate', 'pwl-silu-s-v1',
+        '--safe-config-authority', str(authority_path)])
 
     tool.main()
 
     assert captured == {
-        'load_from': None, 'model': model, 'tested': True}
+        'load_from': None, 'model': model, 'tested': True, 'verified': 1}
+
+
+def test_test_cli_postverifies_materialized_config_after_runner(
+        tmp_path, monkeypatch):
+    import tools.test as tool
+    import mambapose_opt.checkpoints as checkpoints
+
+    config_path = tmp_path / 'resolved.py'
+    config_path.write_text('model = dict(type="Fixture")\n')
+    checkpoint = tmp_path / 'model.pth'
+    checkpoint.write_bytes(b'fixture')
+    manifest = tmp_path / 'candidates.json'
+    manifest.write_text('{}\n')
+    authority_path = tmp_path / 'authority.json'
+    authority_path.write_text('{}\n')
+
+    class Authority:
+        path = config_path.resolve()
+
+        def load_config(self):
+            return Config(dict(model=dict(type='Fixture')))
+
+        def verify(self):
+            if config_path.read_text() != 'model = dict(type="Fixture")\n':
+                raise ValueError('materialized evaluation config changed')
+
+    authority = Authority()
+    monkeypatch.setattr(
+        checkpoints, 'authorize_manifest_candidate',
+        lambda *_args: SimpleNamespace(checkpoint_path=checkpoint.resolve()))
+    monkeypatch.setattr(
+        checkpoints, 'load_materialized_config_authority',
+        lambda *_args: authority)
+    monkeypatch.setattr(
+        checkpoints, 'build_manifest_authorized_model',
+        lambda *_args, **_kwargs: _ToyModel())
+
+    class FakeRunner:
+        def register_hook(self, *_args, **_kwargs):
+            raise AssertionError('no output hook expected')
+
+        def test(self):
+            config_path.write_text(
+                'model = dict(type="Alternate")\n', encoding='utf-8')
+
+    monkeypatch.setattr(tool.Runner, 'from_cfg', lambda _cfg: FakeRunner())
+    monkeypatch.setattr(sys, 'argv', [
+        'tools/test.py', str(config_path), str(checkpoint),
+        '--safe-manifest', str(manifest),
+        '--safe-candidate', 'pwl-silu-s-v1',
+        '--safe-config-authority', str(authority_path)])
+
+    with pytest.raises(ValueError, match='materialized.*changed'):
+        tool.main()
+
+
+def test_test_cli_rejects_cfg_options_in_safe_authority_mode(
+        tmp_path, monkeypatch):
+    import tools.test as tool
+
+    config_path = tmp_path / 'resolved.py'
+    checkpoint = tmp_path / 'model.pth'
+    manifest = tmp_path / 'candidates.json'
+    authority = tmp_path / 'authority.json'
+    for path in (config_path, checkpoint, manifest, authority):
+        path.write_text('{}\n', encoding='utf-8')
+    monkeypatch.setattr(sys, 'argv', [
+        'tools/test.py', str(config_path), str(checkpoint),
+        '--safe-manifest', str(manifest),
+        '--safe-candidate', 'pwl-silu-s-v1',
+        '--safe-config-authority', str(authority),
+        '--cfg-options', 'model.authority_tag="alternate"'])
+
+    with pytest.raises(ValueError, match='cfg-options'):
+        tool.main()

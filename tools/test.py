@@ -22,6 +22,9 @@ def parse_args():
         '--safe-candidate',
         help='candidate id required for restricted checkpoint loading')
     parser.add_argument(
+        '--safe-config-authority',
+        help='verified materialized Config authority required in safe mode')
+    parser.add_argument(
         '--work-dir', help='the directory to save evaluation results')
     parser.add_argument('--out', help='the file to save metric results.')
     parser.add_argument(
@@ -148,17 +151,21 @@ def merge_args(cfg, args):
 def main():
     args = parse_args()
 
-    # load config
-    cfg = Config.fromfile(args.config)
-    cfg = merge_args(cfg, args)
-
-    safe_requested = bool(args.safe_manifest or args.safe_candidate)
+    safe_requested = bool(
+        args.safe_manifest or args.safe_candidate
+        or args.safe_config_authority)
+    config_authority = None
     if safe_requested:
-        if not args.safe_manifest or not args.safe_candidate:
+        if (not args.safe_manifest or not args.safe_candidate
+                or not args.safe_config_authority):
             raise ValueError(
-                'safe checkpoint loading requires manifest and candidate')
+                'safe checkpoint loading requires manifest, candidate, '
+                'and config authority')
+        if args.cfg_options:
+            raise ValueError('safe checkpoint loading rejects --cfg-options')
         from mambapose_opt.checkpoints import (
-            authorize_manifest_candidate, build_manifest_authorized_model)
+            authorize_manifest_candidate, build_manifest_authorized_model,
+            load_materialized_config_authority)
 
         repository_root = Path(__file__).resolve().parents[1]
         authorized = authorize_manifest_candidate(
@@ -167,10 +174,23 @@ def main():
                 authorized.checkpoint_path:
             raise ValueError(
                 'checkpoint argument differs from manifest-authorized path')
+        config_authority = load_materialized_config_authority(
+            repository_root, Path(args.safe_manifest), args.safe_candidate,
+            Path(args.safe_config_authority))
+        if Path(args.config).resolve(strict=True) != config_authority.path:
+            raise ValueError(
+                'config argument differs from materialized ConfigAuthority')
+        cfg = config_authority.load_config()
+    else:
+        cfg = Config.fromfile(args.config)
+
+    cfg = merge_args(cfg, args)
+
+    if safe_requested:
         cfg.load_from = None
         cfg.model = build_manifest_authorized_model(
             repository_root, Path(args.safe_manifest), args.safe_candidate,
-            config=cfg, device='cpu')
+            config_authority=config_authority, device='cpu')
 
     # build the runner from config
     runner = Runner.from_cfg(cfg)
@@ -186,7 +206,11 @@ def main():
         runner.register_hook(SaveMetricHook(), 'LOWEST')
 
     # start testing
-    runner.test()
+    try:
+        runner.test()
+    finally:
+        if config_authority is not None:
+            config_authority.verify()
 
 
 if __name__ == '__main__':

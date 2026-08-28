@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -808,6 +809,9 @@ def test_formal_evaluation_runs_flip_and_no_flip_before_envelope(
     monkeypatch.setattr(
         tool, 'build_source_binding',
         lambda **unused: {'manifest_path': 'optimization/candidates.json'})
+    monkeypatch.setattr(
+        tool, 'authorize_pwl_runtime_config',
+        lambda *_args, **_kwargs: SimpleNamespace(load_config=lambda: None))
     seen = []
 
     def fake_mode(candidate, output, *, flip_test, **unused):
@@ -915,6 +919,22 @@ def test_pwl_evaluation_child_requires_manifest_safe_checkpoint_path(
         lambda **kwargs: {'provenance': kwargs})
     monkeypatch.setenv('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
     captured = {}
+    authority_path = tmp_path / 'resolved-flip.config-authority.json'
+    base_authority = SimpleNamespace(load_config=lambda: config)
+
+    class Materialized:
+        path = tmp_path / 'resolved-flip.py'
+        sha256 = 'e' * 64
+
+        def load_config(self):
+            return config
+
+        def verify(self):
+            captured['post_verified'] = True
+
+    monkeypatch.setattr(
+        tool, 'materialize_evaluation_config_authority',
+        lambda *_args, **_kwargs: Materialized())
 
     def capture_run(argv, **kwargs):
         captured['argv'] = argv
@@ -926,12 +946,14 @@ def test_pwl_evaluation_child_requires_manifest_safe_checkpoint_path(
         candidate, tmp_path / 'evaluate.json', flip_test=True,
         checkpoint_sha256=candidate.checkpoint_sha256,
         git_commit='d' * 40, checkpoint=checkpoint,
-        manifest_path=manifest)
+        manifest_path=manifest, config_authority=base_authority)
 
-    assert captured['argv'][-4:] == [
+    assert captured['argv'][-6:] == [
         '--safe-manifest', str(manifest),
-        '--safe-candidate', candidate.id]
+        '--safe-candidate', candidate.id,
+        '--safe-config-authority', str(authority_path)]
     assert 'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD' not in captured['environment']
+    assert captured['post_verified'] is True
 
 
 def _coco_fixture(tmp_path):

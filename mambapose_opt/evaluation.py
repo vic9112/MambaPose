@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -243,7 +244,8 @@ def build_source_binding(
 
 
 def build_deterministic_evaluation_config(
-        candidate: CandidateSpec, flip_test: bool, config_path: Path):
+        candidate: CandidateSpec, flip_test: bool,
+        config_path: Path | None = None, *, config=None):
     """Reconstruct the exact config serialized by the evaluation producer."""
     if flip_test is not True and flip_test is not False:
         raise MetricError('flip_test must be a boolean')
@@ -251,7 +253,12 @@ def build_deterministic_evaluation_config(
 
     from mambapose_opt.determinism import deterministic_dataloader_config
 
-    config = Config.fromfile(config_path)
+    if (config_path is None) == (config is None):
+        raise MetricError(
+            'evaluation config requires exactly one path or authorized Config')
+    config = (
+        Config.fromfile(config_path) if config is None
+        else copy.deepcopy(config))
     config.randomness = dict(seed=candidate.seed, deterministic=True)
     configured_imports = list(
         config.get('custom_imports', {}).get('imports', ()))

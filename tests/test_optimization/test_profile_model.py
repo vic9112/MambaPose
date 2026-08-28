@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -74,6 +75,10 @@ def test_formal_numeric_profile_places_model_and_input_on_logical_cuda(
 
     monkeypatch.setattr(tool, 'REPOSITORY_ROOT', root)
     monkeypatch.setattr(tool, 'resolve_numeric_runtime', lambda *a, **k: runtime)
+    monkeypatch.setattr(
+        tool, 'authorize_pwl_runtime_config',
+        lambda *_args, **_kwargs: SimpleNamespace(
+            load_config=lambda: tool.Config.fromfile(config_path)))
     monkeypatch.setattr(tool, 'clean_git_commit', lambda _root: 'a' * 40)
     monkeypatch.setattr(
         tool, 'build_numeric_source_binding', lambda **kwargs: {'bound': True})
