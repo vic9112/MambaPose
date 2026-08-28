@@ -16,7 +16,7 @@
 - The approved structural reference is exact commit `a6adf6d84f9b51b133b0fca7272c51f728bfb7ac`; the approved numeric W8 reference is exact frozen W8 commit `5794d0abdea64757b95b3eaf6f5a925cbc65ac3a`. Transplant only reviewed no-PIF export and W8 weight-only behavior. Do not import W8A8, PWL, Binary Q/K, observer, or calibration behavior.
 - The common initialization is `pretrained/vssm_tiny_0230_ckpt_epoch_262.pth`, SHA-256 `09739f6d95638e5caf0d33fcbca85b7cff62b8ca16ec2926d781109939c6b201`. It is a backbone initialization, never a trained pose checkpoint.
 - Tracked source, configs, manifests, and produced outputs must remain inside the implementation or frozen runtime worktree. Read-only runtime assets are a separate authority: only lexical canonical relative paths below `pretrained`, `data`, and `work_dirs/reproduction` may traverse the exact declared links into the canonical main-checkout asset roots. Bind the link target root, asset-relative path, and file SHA; reject arbitrary external links, traversal, alternate same-byte trees, link-target drift, primary-link drift, and hash drift. A relocated frozen worktree must reconstruct and revalidate these same declared asset bindings.
-- The bounded W8 screen receives its historical input only through a read-only repository-relative `prior-stage-b` link to the exact detached structural artifact bundle. The manifest binds structural commit `a6adf6d...`, train/profile/evaluation/latency artifacts, pruned runtime checkpoint `5797ce...`, the unpruned `28cd024...` parent lineage, and independent audit SHA `b7382d...`; runtime validation rehashes the bundle and rejects an alternate same-byte location or link drift. The fresh formal campaign never links the whole historical `work_dirs/optimization` tree.
+- The bounded W8 screen receives its historical input only through a read-only repository-relative `prior-stage-b` link to the exact detached structural artifact bundle. Before copying, the producer compares the source against tracked approved constants: train `ea276713...`, pruned checkpoint `5797ceaf...`, runtime metadata `99e75ff3...`, profile `cb0c9332...`, evaluation `9bcf3264...`, latency `9e7448a6...`, structural candidates manifest `1081b546...`, COCO authority `5d5945c3...`, deployment config `e2a84676...`, unpruned parent config `706eaa31...`, and independent audit `b7382dba...`, all under structural commit `a6adf6d...`; full 64-hex values come from the approved Task-4 audit and are encoded in tests/code, not learned from the current source. It also validates cross-artifact source/config/checkpoint roles before writing the bundle. Runtime validation rehashes the bundle and rejects an alternate same-byte location or link drift. The fresh formal campaign never links the whole historical `work_dirs/optimization` tree.
 - The primary formal arms are `baseline` and `no_pif`, with fixed seeds `0, 1, 2`; both train for 300 epochs from the same initialization authority. Seeds `3, 4` are predeclared and dormant unless the three-seed paired 95% confidence interval intersects `0.1` AP.
 - Run one bounded seed-0 no-PIF+W8 conversion/export/full-val screen before any of the six primary trainings. A failed W8 screen disables only the derivative and does not remove the mandatory no-PIF formal arm.
 - All CUDA-consuming work uses the existing canonical main-checkout lock at `/home/vicchen/workspace/MambaPose/work_dirs/optimization/gpu.lock`. No route-specific or frozen-worktree-local GPU lock is permitted.
@@ -66,7 +66,7 @@
 
 - [ ] **Step 1: Write strict failing schema tests**
 
-Add tests proving that the parser rejects unknown or missing keys, duplicate run IDs, duplicate `(role, seed)` rows, duplicate output roots/configs, absolute/traversing paths, non-hex hashes, booleans as seeds, duplicate values inside either protocol seed list, any primary set other than `(0, 1, 2)`, any conditional set other than `(3, 4)`, epochs other than 300, persistent workers, baseline/no-PIF config asymmetry outside the declared PIF mode and run identity, and an initialization path placed in an output field. Each seed 0-4 must appear exactly once in each role; the required baseline/no-PIF pairing is not a duplicate-seed error. Effective batch must be derived as `per_device_batch_size * world_size * accumulation_steps` and is fixed to `128 * 1 * 1 = 128`; reject accumulation, world-size, auto-scale-LR, or pair asymmetry. Path tests must also admit the exact declared `pretrained`, `data`, and `work_dirs/reproduction` links into the canonical main-checkout asset roots, while rejecting an alternate same-byte tree, changed link targets, primary-link drift, hash drift, traversal, and every unapproved external root. The `prior-stage-b` fixture must bind the exact structural commit, train/profile/evaluation/latency artifacts, pruned and unpruned checkpoint roles, and audit SHA; reject a missing artifact, alternate same-byte bundle, swapped checkpoint roles, or changed link target. Builder tests must prove that the tracked manifest is stable across the commit that adds it: it contains closure content hashes and asset authorities but never its own containing Git commit, so `--check` has no self-referential commit/SHA cycle.
+Add tests proving that the parser rejects unknown or missing keys, duplicate run IDs, duplicate `(role, seed)` rows, duplicate output roots/configs, absolute/traversing paths, non-hex hashes, booleans as seeds, duplicate values inside either protocol seed list, any primary set other than `(0, 1, 2)`, any conditional set other than `(3, 4)`, epochs other than 300, persistent workers, baseline/no-PIF config asymmetry outside the declared PIF mode and run identity, and an initialization path placed in an output field. Each seed 0-4 must appear exactly once in each role; the required baseline/no-PIF pairing is not a duplicate-seed error. Effective batch must be derived as `per_device_batch_size * world_size * accumulation_steps` and is fixed to `128 * 1 * 1 = 128`; reject accumulation, world-size, auto-scale-LR, or pair asymmetry. Path tests must also admit the exact declared `pretrained`, `data`, and `work_dirs/reproduction` links into the canonical main-checkout asset roots, while rejecting an alternate same-byte tree, changed link targets, primary-link drift, hash drift, traversal, and every unapproved external root. The `prior-stage-b` fixture must bind the exact structural commit and full predeclared Task-4 hash inventory, train/profile/evaluation/latency artifacts, pruned and unpruned checkpoint roles, and audit SHA; reject a missing artifact, alternate same-byte bundle, swapped checkpoint roles, changed link target, or a compound substitution performed before bundle/manifest creation with every generated hash recomputed. Builder tests must prove that the tracked manifest is stable across the commit that adds it: it contains closure content hashes and asset authorities but never its own containing Git commit, so `--check` has no self-referential commit/SHA cycle.
 
 ```python
 def test_manifest_requires_exact_paired_seed_matrix(valid_document, repo):
@@ -75,17 +75,17 @@ def test_manifest_requires_exact_paired_seed_matrix(valid_document, repo):
     with pytest.raises(FormalManifestError, match='paired seed matrix'):
         FormalStageCManifest.from_dict(document, repository_root=repo)
 
-def test_train_result_cannot_rebind_initialization(valid_result):
+def test_train_result_cannot_rebind_initialization(valid_result, repo):
     document = copy.deepcopy(valid_result)
     document['initialization']['sha256'] = '0' * 64
     with pytest.raises(FormalManifestError, match='initialization authority'):
-        FormalTrainResult.from_dict(document)
+        FormalTrainResult.from_dict(document, repository_root=repo)
 ```
 
 - [ ] **Step 2: Run the schema test and verify RED**
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 .venv/bin/python -B -m pytest -p no:cacheprovider tests/test_optimization/test_formal_schema.py -q
+PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 .venv/bin/python -B -m pytest -p no:cacheprovider tests/test_optimization/test_formal_prior.py tests/test_optimization/test_formal_schema.py -q
 ```
 
 Expected: collection fails because `mambapose_opt.formal_schema` does not exist.
@@ -100,7 +100,7 @@ Use frozen dataclasses and explicit key sets. Lexically normalize every relative
 
 The common base inherits `configs/reproduction/coco_s_v1.py`, fixes `deterministic=True`, worker count `2`, `persistent_workers=False`, the seeded sampler/worker-init contracts, 300 epochs, per-device batch `128`, world size `1`, accumulation `1`, derived effective batch `128`, no auto-scale LR, evaluator, detections, and TTA. Each leaf overrides only seed, experiment/run ID, work directory, and `pif_mode` (`full` or `disabled`). Seeds 3-4 exist in Git but remain conditional in the manifest.
 
-First, a standard-library-only bundle producer copies the exact approved structural train/runtime checkpoint/profile/evaluation/latency files, source config/manifest, and `task-4-final-artifact-audit.md` into `/home/vicchen/workspace/MambaPose/work_dirs/optimization/formal-stage-c-prior/no-pif-seed0`. It writes a canonical `bundle.json` with every source path/hash/role and source commit through atomic staging-to-rename, refuses an existing mismatch, never deserializes the checkpoint, and makes the completed files read-only. The active worktree exposes only `work_dirs/optimization/prior-stage-b` as an ignored read-only link to that bundle; it never links the whole historical optimization tree.
+First, a standard-library-only bundle producer compares every source file against the full exact hash constants from the approved Task-4 audit and verifies the JSON cross-links name source commit `a6adf6d...`, the expected source/config/COCO authorities, the pruned runtime checkpoint, and the unpruned parent only in its parent-lineage role. It then copies the approved structural train/runtime checkpoint/profile/evaluation/latency files, source configs/manifest/COCO authority, and `task-4-final-artifact-audit.md` into `/home/vicchen/workspace/MambaPose/work_dirs/optimization/formal-stage-c-prior/no-pif-seed0`. It writes a canonical `bundle.json` with every source path/hash/role and source commit through atomic staging-to-rename, refuses an existing mismatch, never deserializes the checkpoint, and makes the completed files read-only. The active worktree exposes only `work_dirs/optimization/prior-stage-b` as an ignored read-only link to that bundle; it never links the whole historical optimization tree. The producer may not derive its expected inventory from the source it is validating.
 
 The builder hashes the entire config inheritance closure, dataset/annotation/detection files, initialization, and the exact files exposed through `prior-stage-b`. The tracked manifest deliberately does not contain its own source commit: doing so would become stale at the commit that adds the manifest. It may build deterministically from the current tracked/staged file contents while the Task-1 tree is dirty, and atomically writes canonical sorted JSON. After the implementation is reviewed and frozen, `FormalRunInit` binds the clean runtime HEAD, tracked manifest SHA, and recomputed config closure. Neither bundle producer nor manifest builder may import Torch or load a checkpoint.
 
@@ -136,6 +136,7 @@ Review gate: independently verify exact schema rejection probes, ten-row seed ma
 - Create: `mambapose_opt/formal_determinism.py`
 - Create: `mambapose_opt/formal_training.py`
 - Create: `tools/optimization/capture_formal_environment.py`
+- Create: `tools/optimization/build_formal_run_init.py`
 - Create: `tools/optimization/formal_stage_c_entrypoint.py`
 - Create: `tools/optimization/trace_formal_order.py`
 - Create: `tools/optimization/preflight_formal_model.py`
@@ -150,6 +151,8 @@ Review gate: independently verify exact schema rejection probes, ten-row seed ma
 - `EnvironmentAuthority.capture(repository_root: Path) -> EnvironmentAuthority`
 - `validate_environment_authority(authority: EnvironmentAuthority, repository_root: Path) -> None`
 - `load_formal_tensor_checkpoint(path: Path, authority: FileAuthority, expected_keys: Mapping[str, TensorShape]) -> Mapping[str, Tensor]`
+- `build_formal_run_init(manifest: FormalStageCManifest, run_id: str, environment: EnvironmentAuthority, frozen_root: Path) -> FormalRunInit`
+- `write_formal_run_init(init: FormalRunInit, destination: Path) -> FileAuthority`
 - `configure_root_determinism(seed: int) -> RootDeterminism`
 - `seed_worker(worker_id: int) -> None`
 - `build_seeded_sampler(dataset: Sized, seed: int, epoch: int) -> Sampler[int]`
@@ -157,6 +160,8 @@ Review gate: independently verify exact schema rejection probes, ten-row seed ma
 - `trace_epoch_orders(spec: FormalRunSpec, epochs: int) -> tuple[str, ...]`
 - `run_formal_model_preflight(pair_seed: int, role: str) -> FormalRepeatabilityResult`
 - `compare_paired_initial_state(baseline: FormalRepeatabilityResult, no_pif: FormalRepeatabilityResult) -> PairedInitializationResult`
+- `poll_cooperative_stop(control_path: Path, *, at_optimizer_boundary: bool) -> CooperativeStopRequest | None`
+- `write_stop_acknowledgement(request: CooperativeStopRequest, last_valid_resume: FileAuthority) -> StopAcknowledgement`
 - `validate_resume_checkpoint(path: Path, expected: FormalRunInit) -> ResumeState`
 - `train_formal_candidate(init_path: Path, resume_path: Path | None) -> FormalTrainResult`
 - Standard-library-only `formal_stage_c_entrypoint.py` sets process environment and then uses `os.execve` to invoke the requested worker module.
@@ -165,11 +170,11 @@ Review gate: independently verify exact schema rejection probes, ten-row seed ma
 
 Tests must prove legal seeds include 0 and reject bool/negative/out-of-range values; root configuration sets Python/NumPy/Torch/CUDA seeds, deterministic algorithms, `cudnn.deterministic=True`, `cudnn.benchmark=False`; candidate seed is never hard-coded to zero; worker and sampler order changes by seed/epoch but repeats exactly for the same pair; two fresh subprocesses emit identical trace hashes; and no Torch-bearing module is imported before the launcher sets `CUBLAS_WORKSPACE_CONFIG`.
 
-Environment tests bind the `.venv` link root, resolved interpreter, interpreter SHA, lock/requirements evidence, exact package inventory, and native CUDA-extension files. They reject an alternate same-byte environment, executable/package/native-module drift, traversal, a symlink swap, and any stage whose fresh observation differs from `FormalRunInit`. Safe-loader tests include a hostile-pickle fixture and require `weights_only=True` or a stricter tensor-only format, exact path/SHA/key/shape/dtype validation, recursive finite tensors, and rejection of symlink or source-authority drift. No supported profile/evaluation/training path may fall back to `Backbone_VSSM.load_pretrained` or generic unsafe `init_model` checkpoint loading.
+Environment tests bind the `.venv` link root, resolved interpreter, interpreter SHA, lock/requirements evidence, exact package inventory, and native CUDA-extension files. They reject an alternate same-byte environment, executable/package/native-module drift, traversal, a symlink swap, and any stage whose fresh observation differs from `FormalRunInit`. Run-init tests atomically produce and publicly reload all ten documents only from a clean detached reviewed root, binding clean HEAD, manifest/config closure, environment, data/detections/initialization, role/seed/protocol, and output root. They reject branch-attached/dirty/wrong commits, any authority drift, overwrite mismatch, path escape, or re-entry with changed content; an identical replay is idempotent. Safe-loader tests include a hostile-pickle fixture and require `weights_only=True` or a stricter tensor-only format, exact path/SHA/key/shape/dtype validation, recursive finite tensors, and rejection of symlink or source-authority drift. No supported profile/evaluation/training path may fall back to `Backbone_VSSM.load_pretrained` or generic unsafe `init_model` checkpoint loading.
 
 Repeatability unit tests are mock-based but require a public artifact with role/seed/config/source/environment/custom-scan identity, complete initial-state tensor digest, common-tensor digest, forward/loss/backward/gradient/optimizer-update digests, and predeclared numeric tolerances. A baseline/no-PIF pair must have equal common-tensor digests; each role's complete digest must repeat across fresh processes. Missing custom-scan evidence, unexpected drift, a changed tolerance, non-finite gradients, or a digest from a different source fails admission.
 
-Resume tests use synthetic, source-attested tensors only. They reject mismatched manifest/init/config/seed/role/order prefix, non-finite optimizer state, missing RNG state, unvalidated checkpoint, and a fourth retained checkpoint.
+Resume tests use synthetic, source-attested tensors only. They reject mismatched manifest/init/config/seed/role/order prefix, non-finite optimizer state, missing RNG state, unvalidated checkpoint, and a fourth retained checkpoint. Cooperative-stop tests inject a request mid-iteration and require the worker to acknowledge it only after the next safe optimizer/CUDA synchronization boundary, discard all uncommitted partial-epoch effects, name the last already validated epoch checkpoint (or run init before epoch 0), and exit transiently. Unsafe-boundary acknowledgement, a changed/invalid checkpoint SHA, stale request, timeout, or continuing into another batch fails closed; resume replays from the named pre-contention authority rather than a partial mid-epoch state.
 
 ```python
 def test_trace_repeats_but_seed_changes_order(tmp_path):
@@ -195,7 +200,7 @@ Expected: collection fails because the formal determinism/training modules do no
 
 - [ ] **Step 3: Implement process-first determinism**
 
-The launcher must be import-safe with standard library only. Before every stage it reconstructs and rehashes `EnvironmentAuthority`, validates the exact approved `.venv` link/interpreter/package/native-module inventory, validates exact environment values, sets them if absent, rejects conflicting values, and then execs the authority-bound `.venv/bin/python -B -m <worker> ...`. Inside the worker, call `configure_root_determinism(spec.seed)` before config loading, model construction, or dataloader construction.
+The launcher must be import-safe with standard library only. Before every stage it reconstructs and rehashes `EnvironmentAuthority`, validates the exact approved `.venv` link/interpreter/package/native-module inventory, validates exact environment values, sets them if absent, rejects conflicting values, and then execs the authority-bound `.venv/bin/python -B -m <worker> ...`. After the implementation is frozen, the run-init CLI atomically creates/public-validates all ten immutable `FormalRunInit` documents from clean HEAD + manifest/config/environment/data/init authorities; it never invents output checkpoint hashes. Inside a model worker, call `configure_root_determinism(spec.seed)` before config loading, model construction, or dataloader construction.
 
 Create a 2-epoch preflight that traces the complete sampler order twice in separate processes. Admission requires byte-identical per-epoch hashes. The real trainer records all 300 hashes and checks each runtime epoch against its preflight-derived deterministic rule.
 
@@ -205,7 +210,7 @@ After implementation review and before any 300-epoch run, execute a real MambaPo
 
 Use the manifest/init schema from Task 1. Implement a formal checkpoint loader rather than calling the current `Backbone_VSSM.load_pretrained`, which uses plain `torch.load`. Load the exact VMamba initialization with `weights_only=True` (or a stricter tensor-only representation), verify path/SHA/key/shape/dtype/finite tensors, construct with implicit `pretrained`/`init_cfg` neutralized, and inject only validated compatible backbone tensors. The same safe interface loads produced pose tensors for profile/evaluation; generic checkpoint initialization is not an allowed fallback. Never enable broad unsafe deserialization. Save optimizer, scheduler, scaler if used, Python/NumPy/Torch/CUDA RNG states, completed epoch, order-hash prefix, init-document SHA, and config/source identities.
 
-Write checkpoints atomically. Retain best plus the two newest validated resume checkpoints. A resume may continue only the same run ID at the next epoch. On completion, emit one strict `FormalTrainResult`; downstream stages consume its best-checkpoint path/hash from this result rather than a manifest placeholder.
+Write checkpoints atomically at validated epoch boundaries. Retain best plus the two newest validated resume checkpoints. A normal resume may continue only the same run ID at the next epoch. The trainer also polls a controller-owned authenticated stop request around each optimizer/CUDA synchronization boundary. On contention, it performs no further batch, discards the incomplete epoch, atomically acknowledges the request with the last pre-contention validated epoch checkpoint (or the run init before epoch 0), and exits 75; it never advertises a partial mid-epoch checkpoint. On completion, emit one strict `FormalTrainResult`; downstream stages consume its best-checkpoint path/hash from this result rather than a manifest placeholder.
 
 Add a CPU synthetic 2-epoch smoke mode for tests; production configs remain exactly 300 epochs and cannot use smoke flags.
 
@@ -222,7 +227,7 @@ Expected: tests pass; the two fresh trace documents have identical order hashes 
 - [ ] **Step 6: Commit and determinism review**
 
 ```bash
-git add mambapose_opt/formal_environment.py mambapose_opt/formal_checkpoint.py mambapose_opt/formal_determinism.py mambapose_opt/formal_training.py tools/optimization/capture_formal_environment.py tools/optimization/formal_stage_c_entrypoint.py tools/optimization/trace_formal_order.py tools/optimization/preflight_formal_model.py tools/optimization/train_formal_candidate.py tests/test_optimization/test_formal_environment.py tests/test_optimization/test_formal_checkpoint.py tests/test_optimization/test_formal_determinism.py tests/test_optimization/test_formal_repeatability.py tests/test_optimization/test_formal_training.py
+git add mambapose_opt/formal_environment.py mambapose_opt/formal_checkpoint.py mambapose_opt/formal_determinism.py mambapose_opt/formal_training.py tools/optimization/capture_formal_environment.py tools/optimization/build_formal_run_init.py tools/optimization/formal_stage_c_entrypoint.py tools/optimization/trace_formal_order.py tools/optimization/preflight_formal_model.py tools/optimization/train_formal_candidate.py tests/test_optimization/test_formal_environment.py tests/test_optimization/test_formal_checkpoint.py tests/test_optimization/test_formal_determinism.py tests/test_optimization/test_formal_repeatability.py tests/test_optimization/test_formal_training.py
 git commit -m "feat: add deterministic formal training producer"
 ```
 
@@ -257,9 +262,9 @@ Review gate: independently inspect environment authority and per-stage drift rej
 
 - [ ] **Step 1: Write controller/state/unit RED tests**
 
-Tests assert one immutable DAG/SHA predeclares bounded W8, exactly six primary baseline/no-PIF seed0-2 trainings, both indivisible seed3/4 pairs, W8 derivatives, comparison, and final audit; runtime results change activation/disposition state, never the plan. Task 3 does not fabricate the Task-4 screen schemas or producers: until Task 4 registers those exact validators/runners, attempting the screen returns permanent protocol failure and cannot activate W8. Dormant seed3/4 stages cannot run without a validated escalation admission. One non-blocking canonical controller lock prevents CLI/service or two services from mutating the campaign concurrently. The observer is read-only. State/event writes are atomic and append-only. Exit 75 is transient contention; exit 78 is permanent protocol failure; retry counters and deadlines persist across systemd restarts. Every stage revalidates the Task-2 `EnvironmentAuthority`; drift stops before process launch.
+Tests assert one immutable DAG/SHA begins by capturing/revalidating environment authority and atomically building/public-validating all ten run-init documents, then predeclares bounded W8, exactly six primary baseline/no-PIF seed0-2 trainings, both indivisible seed3/4 pairs, W8 derivatives, comparison, and final audit; runtime results change activation/disposition state, never the plan. Task 3 does not fabricate the Task-4 screen schemas or producers: until Task 4 registers those exact validators/runners, attempting the screen returns permanent protocol failure and cannot activate W8. Dormant seed3/4 stages cannot run without a validated escalation admission. One non-blocking canonical controller lock prevents CLI/service or two services from mutating the campaign concurrently. The observer is read-only. State/event writes are atomic and append-only. Exit 75 is transient contention; exit 78 is permanent protocol failure; retry counters and deadlines persist across systemd restarts. Every stage revalidates the Task-2 `EnvironmentAuthority` and exact run-init authority; drift stops before process launch.
 
-Contention tests introduce a foreign GPU owner after admission. The controller must revalidate the lease on every heartbeat, signal the worker to stop cooperatively, accept only an atomic validated resume checkpoint at a safe boundary, record the pre-contention lineage, exit transiently, and later resume from that checkpoint. A worker that cannot produce a valid resume stops permanently rather than continuing contaminated training. Any latency interval overlapping contention is invalid. Tests also cover controller-lock overlap, restart-persistent retry counters, immutable-DAG mutation, and activation of only predeclared branches.
+Contention tests introduce a foreign GPU owner after admission. The controller must revalidate the lease on every heartbeat, write an authenticated stop request, and require the Task-2 worker to acknowledge only after the next safe optimizer/CUDA synchronization boundary. The acknowledgement must name the last already validated pre-contention epoch checkpoint (or run init before epoch 0); partial-epoch work is discarded and never published as resume state. The controller exits transiently and later resumes from that authority. An unsafe/invalid/stale acknowledgement or timeout fails closed and terminates the worker rather than continuing contaminated training. Any latency interval overlapping contention is invalid. Tests also cover controller-lock overlap, restart-persistent retry counters, immutable-DAG mutation, and activation of only predeclared branches.
 
 Unit tests parse files and require exact frozen-root substitution, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, no `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD`, network denial after preflight, `Restart=on-failure`, `RestartPreventExitStatus=78`, `KillMode=control-group`, bounded `TimeoutStopSec`, `UMask=0077`, timer `Persistent=true`, and the canonical shared GPU-lock and controller-lock arguments.
 
@@ -286,7 +291,7 @@ Expected: collection fails because the formal controller and units do not exist.
 
 Keep this controller separate from the Stage A/B six-stage generic runner. Every CUDA stage acquires `/home/vicchen/workspace/MambaPose/work_dirs/optimization/gpu.lock` through `canonical_gpu_lock_path`; admission also rejects foreign live GPU owners. No stage may pass a route-local lock.
 
-The immutable DAG order is: W8 bounded screen, its independent disposition gate, primary order/full-model repeatability preflights, six interleaved trainings, exports/profiles/evaluations, three-seed comparison, dormant seed3/4 pair trainings, final comparison, and audit. Task 3 owns immutable stage/dependency names and explicit unregistered-runner failure only; Task 4 supplies and wires the strict screen result/disposition producers and validators before launch. A validated candidate failure marks W8 `disabled` and proceeds to no-PIF formal training, while a missing runner/schema/provenance failure is permanent and cannot be reclassified as a candidate result. A primary deterministic/provenance failure stops the campaign. Hold one canonical campaign-controller lock for every state mutation. During CUDA work, revalidate the GPU lease/foreign owners on every heartbeat and cooperatively stop at an atomic validated resume point if contention appears; invalidate affected latency. Before each stage, rehash the exact `.venv`/interpreter/package/native-module authority and refuse any environment drift.
+The immutable DAG order is: environment capture, all ten run-init documents, W8 bounded screen, its independent disposition gate, primary order/full-model repeatability preflights, six interleaved trainings, exports/profiles/evaluations, three-seed comparison, dormant seed3/4 pair trainings, final comparison, and audit. Task 3 invokes the Task-2 run-init producer and requires all documents to bind the same frozen clean HEAD/manifest/environment before any candidate stage. Task 3 owns immutable stage/dependency names and explicit unregistered-runner failure only; Task 4 supplies and wires the strict screen result/disposition producers and validators before launch. A validated candidate failure marks W8 `disabled` and proceeds to no-PIF formal training, while a missing runner/schema/provenance failure is permanent and cannot be reclassified as a candidate result. A primary deterministic/provenance failure stops the campaign. Hold one canonical campaign-controller lock for every state mutation. During CUDA work, revalidate the GPU lease/foreign owners on every heartbeat; on contention use the Task-2 cooperative-stop channel, discard the incomplete epoch, and resume only from the acknowledged pre-contention checkpoint authority. Invalidate affected latency. Before each stage, rehash the exact `.venv`/interpreter/package/native-module and run-init authorities and refuse any drift.
 
 - [ ] **Step 4: Implement durable service and read-only observer**
 
@@ -323,6 +328,7 @@ Review gate: verify immutable full DAG, one controller and one shared GPU lock, 
 - Create: `mambapose_opt/formal_w8.py`
 - Create: `configs/optimization/formal_stage_c/no_pif_pruned.py`
 - Create: `configs/optimization/formal_stage_c/no_pif_w8.py`
+- Create: `tools/optimization/export_formal_no_pif.py`
 - Create: `tools/optimization/convert_formal_w8.py`
 - Create: `tools/optimization/export_formal_w8.py`
 - Create: `tools/optimization/smoke_formal_w8.py`
@@ -343,25 +349,32 @@ Review gate: verify immutable full DAG, one controller and one shared GPU lock, 
 
 **Interfaces:**
 - `export_pruned_no_pif(model: nn.Module, destination_factory: Callable[[], nn.Module]) -> nn.Module`
+- `produce_formal_no_pif_export(parent: FormalTrainResult, destination: Path) -> FormalNoPIFExportResult`
 - `build_no_pif_w8_policy(model: nn.Module) -> QuantPolicy`
 - `convert_no_pif_w8(model: nn.Module, parent_result: FormalTrainResult) -> NoPIFW8Result`
 - `export_complete_no_pif_w8(model, conversion, destination: Path) -> CompleteW8Export`
 - `load_complete_no_pif_w8(export: Path, destination_factory) -> nn.Module`
 - `FormalNoPIFExportResult.from_dict(...) -> FormalNoPIFExportResult`
 - `FormalW8StageAResult.from_dict(...) -> FormalW8StageAResult`
-- `FormalProfileResult.from_dict(...) -> FormalProfileResult`
+- `FormalProfileResult.from_dict(...) -> FormalProfileResult`, including range and operation authority
+- `FormalEvaluationResult.from_dict(...) -> FormalEvaluationResult`
+- `FormalLatencyResult.from_dict(...) -> FormalLatencyResult`
 - `FormalW8ScreenResult.from_dict(...) -> FormalW8ScreenResult`
 - `FormalW8Disposition.from_dict(...) -> FormalW8Disposition`
-- `run_formal_w8_stage_a(parent: PriorArtifactAuthority, policy: QuantPolicy) -> FormalW8StageAResult`
+- `FormalW8ParentAuthority = PriorArtifactAuthority | FormalTrainResult`
+- `run_formal_w8_stage_a(parent: FormalW8ParentAuthority, policy: QuantPolicy) -> FormalW8StageAResult`
+- `produce_formal_profile(runtime: FormalRuntimeAuthority, sample_authority: SampleAuthority) -> FormalProfileResult`
+- `evaluate_formal_runtime(runtime: FormalRuntimeAuthority, coco: CocoAuthority) -> FormalEvaluationResult`
+- `measure_formal_latency(runtime: FormalRuntimeAuthority, protocol: LatencyProtocol) -> FormalLatencyResult`
 - `decide_formal_w8_screen(screen: FormalW8ScreenResult) -> FormalW8Disposition`
 
 - [ ] **Step 1: Write structural and W8 RED tests**
 
-Structural tests require bit-exact disabled-to-pruned heatmaps, no `PoseInteraction` child, no `pose_interaction.*` state, strict reachable-state equality, and rejection of full-mode sources. W8 tests require exact live-role discovery after pruning, zero PIF roles, per-output-channel symmetric int8 weights, `>=0.8` coverage of all live Linear/Conv MAC-bearing weights, deterministic conversion, and no activation QDQ.
+Structural tests require bit-exact disabled-to-pruned heatmaps, no `PoseInteraction` child, no `pose_interaction.*` state, strict reachable-state equality, and rejection of full-mode sources. A formal float-export CLI must consume the exact `FormalTrainResult` best checkpoint through the Task-2 safe loader, emit a pruned tensor-only runtime plus `FormalNoPIFExportResult`, and publicly bind input/result/source/config/environment/checkpoint SHAs; controller profile/evaluation may consume only its reconstructed output. Baseline has no structural transform and is evaluated from its safely loaded formal best-checkpoint authority, which serves as the floating baseline export. W8 tests require exact live-role discovery after pruning, zero PIF roles, per-output-channel symmetric int8 weights, `>=0.8` coverage of all live Linear/Conv MAC-bearing weights, deterministic conversion, and no activation QDQ.
 
 Complete-export tests require every tensor to appear exactly once as packed int8 weight+FP32 scale/bias or remaining FP32 tensor; total file bytes and tensor-payload bytes are measured separately; all files and the canonical manifest have SHA-256; reconstruction is numerically identical to the fake-W8 runtime; relative paths only; parent train result/config/policy/source hashes must match.
 
-Stage-A tests use a mockable producer plus a real-model contract: exact authenticated pruned parent and W8 policy/source/environment, `[1,3,256,192] -> [1,17,64,48]`, finite forward/loss/backward, finite nonzero gradients for every W8 target, Adam parameter/state update, identity-mode equivalence, tensor-only serialization/resume, and clean export/reload. Tampering with parent/policy/role/hash/path/tensor/shape/gradient/optimizer/export must fail closed. Screen tests require strict schemas and public validators for profile/range/operation inventory, dual-mode full-val evaluation, latency, reconstruction, disposition, and the transitive SHA of the exact Stage-A result. They verify 5,000-image COCO/detection authority and controller activation only from an admitted disposition. Profile tests require an authenticated fixed train2017-only sample list/order/count, tensor/operator roles, shapes/dtypes, min/max and declared range statistics, precision/accumulator semantics, unsupported-operator inventory, and claim limits; compound source/order/range/runtime tampering fails closed.
+Stage-A tests use a mockable producer plus a real-model contract: exact authenticated pruned parent and W8 policy/source/environment, `[1,3,256,192] -> [1,17,64,48]`, finite forward/loss/backward, finite nonzero gradients for every W8 target, Adam parameter/state update, identity-mode equivalence, tensor-only serialization/resume, and clean export/reload. The parent may be the historical `PriorArtifactAuthority` only for the bounded seed-0 screen, or an exact completed no-PIF `FormalTrainResult` for a per-seed derivative; every distinct parent requires its own Stage-A artifact. Tampering with parent/policy/role/seed/hash/path/tensor/shape/gradient/optimizer/export must fail closed. Screen tests require strict schemas, producer signatures, and public from-dict/load validators for profile/range/operation inventory, dual-mode full-val evaluation, latency, reconstruction, disposition, and the transitive SHA of the exact Stage-A result. Evaluation mutation tests bind path/SHA/source/environment/config/runtime checkpoint or complete export, full 5,000-image COCO/detection/order authority, evaluator and both TTA modes; latency mutation tests bind the same runtime plus lease/protocol/interval. They verify controller activation only from an admitted disposition. Profile tests require an authenticated fixed train2017-only sample list/order/count, tensor/operator roles, shapes/dtypes, min/max and declared range statistics, precision/accumulator semantics, unsupported-operator inventory, and claim limits; compound source/order/range/runtime tampering fails closed.
 
 ```python
 def test_no_pif_w8_policy_contains_no_removed_roles(pruned_model):
@@ -404,7 +417,7 @@ Extend the approved partial packing into a complete deployment package: packed i
 
 - [ ] **Step 5: Implement and validate the integrated full-model Stage A**
 
-Run the authenticated pruned no-PIF+W8 model through a real one-batch forward/loss/backward/Adam step under the shared launcher/lock contract. Prove every target gradient and optimizer update, identity mode, restricted tensor-only save/resume, clean export/reload, exact tensor shapes, and parent/policy/source/environment binding. `convert`, export, profile, evaluation, latency, and disposition validators must all require the exact Stage-A path/SHA; a different later valid smoke cannot retroactively validate an earlier result.
+Run the authenticated pruned no-PIF+W8 model through a real one-batch forward/loss/backward/Adam step under the shared launcher/lock contract. Prove every target gradient and optimizer update, identity mode, restricted tensor-only save/resume, clean export/reload, exact tensor shapes, and parent/policy/source/environment binding. Execute this once against the historical parent for the bounded screen and once for each completed formal no-PIF parent before deriving that seed's W8 row. `convert`, export, profile, evaluation, latency, disposition, and formal comparison validators must all require the exact parent-specific Stage-A path/SHA; a different later valid smoke or a different seed's smoke cannot retroactively validate an earlier result.
 
 - [ ] **Step 6: Implement bounded screen producers, validators, and admission**
 
@@ -423,7 +436,7 @@ Expected: all tests pass; no PIF, W8A8, PWL, Binary, observer, or activation-sca
 - [ ] **Step 8: Commit and dual-route review**
 
 ```bash
-git add mambapose_opt/export.py mambapose_opt/formal_runtime.py mambapose_opt/formal_w8.py configs/optimization/formal_stage_c/no_pif_pruned.py configs/optimization/formal_stage_c/no_pif_w8.py tools/optimization/convert_formal_w8.py tools/optimization/export_formal_w8.py tools/optimization/smoke_formal_w8.py tools/optimization/profile_formal_candidate.py tools/optimization/evaluate_formal_candidate.py tools/optimization/measure_formal_latency.py tools/optimization/decide_formal_w8_screen.py tests/test_optimization/test_formal_no_pif_export.py tests/test_optimization/test_formal_no_pif_w8.py tests/test_optimization/test_formal_w8_stage_a.py tests/test_optimization/test_formal_w8_screen.py mmpose/models/utils/hardware_friendly/fake_quant.py mmpose/models/utils/hardware_friendly/__init__.py mmpose/models/heads/heatmap_heads/mamba_token_head.py mmpose/models/heads/heatmap_heads/tokenbase.py mambapose_opt/formal_controller.py tests/test_optimization/test_formal_controller.py
+git add mambapose_opt/export.py mambapose_opt/formal_runtime.py mambapose_opt/formal_w8.py configs/optimization/formal_stage_c/no_pif_pruned.py configs/optimization/formal_stage_c/no_pif_w8.py tools/optimization/export_formal_no_pif.py tools/optimization/convert_formal_w8.py tools/optimization/export_formal_w8.py tools/optimization/smoke_formal_w8.py tools/optimization/profile_formal_candidate.py tools/optimization/evaluate_formal_candidate.py tools/optimization/measure_formal_latency.py tools/optimization/decide_formal_w8_screen.py tests/test_optimization/test_formal_no_pif_export.py tests/test_optimization/test_formal_no_pif_w8.py tests/test_optimization/test_formal_w8_stage_a.py tests/test_optimization/test_formal_w8_screen.py mmpose/models/utils/hardware_friendly/fake_quant.py mmpose/models/utils/hardware_friendly/__init__.py mmpose/models/heads/heatmap_heads/mamba_token_head.py mmpose/models/heads/heatmap_heads/tokenbase.py mambapose_opt/formal_controller.py tests/test_optimization/test_formal_controller.py
 git commit -m "feat: integrate pruned no-pif weight-only export"
 ```
 
@@ -441,7 +454,7 @@ Review gate: structural reviewer proves exact deletion/export semantics; numeric
 - Create: `tests/test_optimization/test_formal_compare.py`
 
 **Interfaces:**
-- `PairedSeedResult(seed: int, baseline: MetricsAuthority, candidate: MetricsAuthority, drop: float)`
+- `PairedSeedResult(seed: int, baseline: FormalEvaluationResult, candidate: FormalEvaluationResult, drop: float)`
 - `PairedComparison(seeds, drops, mean_drop, sample_stddev, ci95_lower, ci95_upper, max_drop, accuracy_pass, needs_escalation)`
 - `compare_formal_pairs(manifest, result_paths) -> PairedComparison`
 - `build_escalation_admission(comparison: PairedComparison) -> EscalationAdmission`
@@ -479,7 +492,7 @@ The primary paired point estimate is full S-V1 AP minus no-PIF AP in paper-compa
 
 For three seeds, emit exactly one of: `formal_pass`, `formal_fail`, or `needs_seed3_4`. If the CI intersects 0.1, the controller validates the comparison SHA and activates both predeclared seed3/4 pairs. It may not choose one seed, retry for favorable metrics, or discard a completed seed. Recompute the same strict mean/max rules over all five seeds.
 
-If W8 passed its bounded screen, derive and evaluate W8 from each completed no-PIF checkpoint and report a separate paired derivative row. No additional 300-epoch W8 training arm is created.
+If W8 passed its bounded screen, run the parent-specific Task-4 Stage-A admission, then derive and evaluate W8 from each completed no-PIF checkpoint and report a separate paired derivative row. No additional 300-epoch W8 training arm is created. Reject any derivative whose Stage-A parent, role, seed, checkpoint SHA, or train-result SHA differs from its own no-PIF row.
 
 - [ ] **Step 4: Run synthetic statistics, mutation, and adjacent GREEN tests**
 
@@ -520,7 +533,7 @@ Review gate: independently recompute fixture statistics, verify inclusive CI int
 
 - [ ] **Step 1: Write audit/handoff RED tests**
 
-Audit tests reject dirty/wrong source, missing stages, nonzero/restarted service result, held shared lock, incomplete/non-validated 300-epoch results, wrong checkpoint retention, missing order hashes, different paired initialization/protocol, incomplete COCO authority, missing flip mode, malformed comparison/escalation, derivative without admission, missing or drifted formal profile/range/operation authority for any evaluated runtime, and any absolute public artifact path.
+Audit tests reject dirty/wrong source, missing stages, terminal nonzero service result, unexplained or unbounded restarts, held shared lock, incomplete/non-validated 300-epoch results, wrong checkpoint retention, missing order hashes, different paired initialization/protocol, incomplete COCO authority, missing flip mode, malformed comparison/escalation, derivative without admission, missing or drifted formal profile/range/operation authority for any evaluated runtime, and any absolute public artifact path. A restart is admissible only when it maps one-to-one to a recorded exit-75 contention event, authenticated cooperative-stop acknowledgement, exact last pre-contention checkpoint authority, persistent retry counter/deadline, lease/foreign-owner chronology, and eventual success; protocol/permanent failures and any unmatched restart remain forbidden.
 
 Handoff tests require tensor names/shapes/dtypes/ranges, input/output shapes, precision by operator, static absence of PIF, W8 scales/accumulator declaration where applicable, remaining Transformer softmax/nonlinearities, VMamba custom scan hazards, unsupported operation inventory, model bytes, and explicit claim limits. It must reject FPGA resource, latency, throughput, power, integer-kernel, or external-paper speedup claims without measured hardware evidence.
 
