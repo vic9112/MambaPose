@@ -1191,7 +1191,8 @@ def _public_coco_protocol(*, source, source_config, checkpoint):
 
 def _pareto_fixture(
         tmp_path, monkeypatch, drops, *, baseline_id='full-s-v1',
-        candidate_epoch_override_seed=None, omit_formal_run=None):
+        candidate_epoch_override_seed=None, omit_formal_run=None,
+        strict_adapter=True, synchronized_protocol_drift=False):
     from mmengine.config import Config
     from mambapose_opt.numeric_source import validate_numeric_config_closure
 
@@ -1206,12 +1207,51 @@ def _pareto_fixture(
     initialization.parent.mkdir(parents=True)
     initialization.write_bytes(b'vmamba-t-imagenet-initialization')
     paired_base.parent.mkdir(parents=True)
+    optimizer = "dict(type='Adam', lr=1e-3)"
+    milestones = '[200, 260]'
+    evaluator_type = 'CocoMetric'
+    flip_test = 'True'
+    if synchronized_protocol_drift:
+        optimizer = "dict(type='AdamW', lr=0.5)"
+        milestones = '[1]'
+        evaluator_type = 'evil.CocoMetric'
+        flip_test = 'False'
     paired_base.write_text(
-        'train_cfg = dict(max_epochs=300)\n'
+        'train_cfg = dict(max_epochs=300, val_interval=5)\n'
         'train_dataloader = dict(batch_size=128, num_workers=2, '
-        'persistent_workers=False)\n'
-        'randomness = dict(deterministic=True)\n'
-        "val_evaluator = dict(type='mmpose.CocoMetric')\n",
+        'persistent_workers=False, '
+        "worker_init_fn=dict(type='mambapose_seed_worker'), "
+        "sampler=dict(type='DefaultSampler', shuffle=True, "
+        'round_up=True, seed=0))\n'
+        'randomness = dict(seed=0, deterministic=True)\n'
+        f'optim_wrapper = dict(optimizer={optimizer})\n'
+        'param_scheduler = [dict(type=\'LinearLR\', begin=0, end=500, '
+        'start_factor=0.001, by_epoch=False), '
+        'dict(type=\'MultiStepLR\', begin=0, end=300, '
+        f'milestones={milestones}, gamma=0.1, by_epoch=True)]\n'
+        "data_root = 'data/coco/'\n"
+        'val_dataloader = dict(batch_size=64, num_workers=2, '
+        'persistent_workers=False, drop_last=False, '
+        "worker_init_fn=dict(type='mambapose_seed_worker'), "
+        "sampler=dict(type='DefaultSampler', shuffle=False, "
+        'round_up=False, seed=0), dataset=dict('
+        "ann_file='annotations/person_keypoints_val2017.json', "
+        "bbox_file='data/coco/person_detection_results/"
+        "COCO_val2017_detections_AP_H_56_person.json'))\n"
+        'test_dataloader = dict(batch_size=64, num_workers=2, '
+        'persistent_workers=False, drop_last=False, '
+        "worker_init_fn=dict(type='mambapose_seed_worker'), "
+        "sampler=dict(type='DefaultSampler', shuffle=False, "
+        'round_up=False, seed=0), dataset=dict('
+        "ann_file='annotations/person_keypoints_val2017.json', "
+        "bbox_file='data/coco/person_detection_results/"
+        "COCO_val2017_detections_AP_H_56_person.json'))\n"
+        f"val_evaluator = dict(type='{evaluator_type}', "
+        "ann_file='data/coco/annotations/person_keypoints_val2017.json')\n"
+        f"test_evaluator = dict(type='{evaluator_type}', "
+        "ann_file='data/coco/annotations/person_keypoints_val2017.json')\n"
+        f'model = dict(test_cfg=dict(flip_test={flip_test}, '
+        "flip_mode='heatmap', shift_heatmap=True))\n",
         encoding='utf-8')
 
     def formal_config_text(kind, seed):
@@ -1222,6 +1262,10 @@ def _pareto_fixture(
         return (
             "_base_ = ['./paired_base.py']\n"
             f"formal_role = '{kind}'\nseed = {seed}\n"
+            f'randomness = dict(seed={seed}, deterministic=True)\n'
+            'train_dataloader = dict(sampler=dict(seed=seed))\n'
+            'val_dataloader = dict(sampler=dict(seed=seed))\n'
+            'test_dataloader = dict(sampler=dict(seed=seed))\n'
             f'{epoch_override}')
 
     formal_runs = []
@@ -1542,6 +1586,26 @@ def _pareto_fixture(
 
     monkeypatch.setattr(
         'mambapose_opt.pareto.CandidateResult.from_artifacts', load_result)
+    if strict_adapter:
+        def strict_test_adapter(
+                *, repository_root, manifest_path, artifact_root, role, seed):
+            del repository_root
+            value = json.loads(Path(manifest_path).read_text(encoding='utf-8'))
+            matches = [
+                row for row in value['runs']
+                if row['role'] == role and row['seed'] == seed]
+            if len(matches) != 1:
+                raise ValueError(
+                    'strict public Stage-C schema v2 run authority is missing')
+            if matches[0]['output_root'] != artifact_root.relative_to(
+                    tmp_path).as_posix():
+                raise ValueError(
+                    'strict public Stage-C schema v2 output authority mismatch')
+            return matches[0]
+
+        monkeypatch.setattr(
+            'mambapose_opt.pareto._strict_public_stage_c_run_authority',
+            strict_test_adapter)
     roots['results'] = results
     return roots
 
@@ -1578,6 +1642,142 @@ def test_final_pareto_rules_include_binary_without_speedup_overclaim(
     assert all(
         len(row['paired_formal_authority_sha256']) == 64
         for row in record['seeds'])
+
+
+def test_final_pareto_rejects_partial_counterfeit_without_strict_schema_v2(
+        tmp_path, monkeypatch):
+    """A rehashed three-field lookalike is not a public Stage-C manifest."""
+    from mambapose_opt.pareto import build_final_pareto_record
+
+    roots = _pareto_fixture(
+        tmp_path, monkeypatch, [0.05, 0.06, 0.04], strict_adapter=False)
+
+    with pytest.raises(
+            ValueError, match='strict public Stage-C schema v2 integration'):
+        build_final_pareto_record(
+            candidate_id='binary-qk-s-v1', repository_root=tmp_path,
+            baseline_roots=roots['baseline'],
+            candidate_roots=roots['candidate'])
+
+
+def test_canonical_protocol_rejects_synchronized_both_arm_semantic_drift():
+    """Pair equality cannot authorize a jointly rehashed protocol rewrite."""
+    from copy import deepcopy
+
+    from mambapose_opt.pareto import (
+        _paired_resolved_config, _resolved_protocol_semantics)
+
+    canonical = {
+        'train_cfg': {'max_epochs': 300, 'val_interval': 5},
+        'train_dataloader': {
+            'batch_size': 128, 'num_workers': 2,
+            'persistent_workers': False,
+            'worker_init_fn': {'type': 'mambapose_seed_worker'},
+            'sampler': {
+                'type': 'DefaultSampler', 'shuffle': True,
+                'round_up': True, 'seed': 0,
+            },
+        },
+        'randomness': {'seed': 0, 'deterministic': True},
+        'optim_wrapper': {'optimizer': {'type': 'Adam', 'lr': 1e-3}},
+        'param_scheduler': [
+            {
+                'type': 'LinearLR', 'begin': 0, 'end': 500,
+                'start_factor': 0.001, 'by_epoch': False,
+            },
+            {
+                'type': 'MultiStepLR', 'begin': 0, 'end': 300,
+                'milestones': [200, 260], 'gamma': 0.1,
+                'by_epoch': True,
+            },
+        ],
+        'data_root': 'data/coco/',
+        'val_dataloader': {
+            'batch_size': 64, 'num_workers': 2,
+            'persistent_workers': False, 'drop_last': False,
+            'worker_init_fn': {'type': 'mambapose_seed_worker'},
+            'sampler': {
+                'type': 'DefaultSampler', 'shuffle': False,
+                'round_up': False, 'seed': 0,
+            },
+            'dataset': {
+                'ann_file': 'annotations/person_keypoints_val2017.json',
+                'bbox_file': (
+                    'data/coco/person_detection_results/'
+                    'COCO_val2017_detections_AP_H_56_person.json'),
+            },
+        },
+        'test_dataloader': {
+            'batch_size': 64, 'num_workers': 2,
+            'persistent_workers': False, 'drop_last': False,
+            'worker_init_fn': {'type': 'mambapose_seed_worker'},
+            'sampler': {
+                'type': 'DefaultSampler', 'shuffle': False,
+                'round_up': False, 'seed': 0,
+            },
+            'dataset': {
+                'ann_file': 'annotations/person_keypoints_val2017.json',
+                'bbox_file': (
+                    'data/coco/person_detection_results/'
+                    'COCO_val2017_detections_AP_H_56_person.json'),
+            },
+        },
+        'val_evaluator': {
+            'type': 'CocoMetric',
+            'ann_file': (
+                'data/coco/annotations/person_keypoints_val2017.json'),
+        },
+        'test_evaluator': {
+            'type': 'CocoMetric',
+            'ann_file': (
+                'data/coco/annotations/person_keypoints_val2017.json'),
+        },
+        'model': {
+            'test_cfg': {
+                'flip_test': True, 'flip_mode': 'heatmap',
+                'shift_heatmap': True,
+            },
+        },
+    }
+    protocol = {
+        'epochs': 300, 'effective_batch_size': 128,
+        'per_device_batch_size': 128, 'world_size': 1,
+        'accumulation_steps': 1, 'worker_count': 2,
+        'persistent_workers': False, 'deterministic': True,
+        'evaluator': 'mmpose.CocoMetric',
+        'tta_modes': {'flip': True, 'no_flip': False},
+    }
+    baseline = deepcopy(canonical)
+    candidate = deepcopy(canonical)
+    for arm in (baseline, candidate):
+        arm['optim_wrapper']['optimizer'] = {
+            'type': 'AdamW', 'lr': 0.5}
+        arm['param_scheduler'][1]['milestones'] = [1]
+        arm['val_evaluator']['type'] = 'evil.CocoMetric'
+        arm['test_evaluator']['type'] = 'evil.CocoMetric'
+        arm['model']['test_cfg']['flip_test'] = False
+
+    assert _paired_resolved_config(baseline) == _paired_resolved_config(
+        candidate)
+    for arm in (baseline, candidate):
+        with pytest.raises(ValueError, match='canonical formal protocol'):
+            _resolved_protocol_semantics(arm, protocol)
+
+
+def test_final_pareto_rejects_recommitted_both_arm_protocol_drift(
+        tmp_path, monkeypatch):
+    """Rehashing both arms cannot turn a shared malicious base canonical."""
+    from mambapose_opt.pareto import build_final_pareto_record
+
+    roots = _pareto_fixture(
+        tmp_path, monkeypatch, [0.05, 0.06, 0.04],
+        synchronized_protocol_drift=True)
+
+    with pytest.raises(ValueError, match='canonical formal protocol'):
+        build_final_pareto_record(
+            candidate_id='binary-qk-s-v1', repository_root=tmp_path,
+            baseline_roots=roots['baseline'],
+            candidate_roots=roots['candidate'])
 
 
 @pytest.mark.parametrize(
@@ -1646,7 +1846,7 @@ def test_final_pareto_rejects_missing_exact_formal_manifest_run_row(
         tmp_path, monkeypatch, [0.05, 0.06, 0.04],
         omit_formal_run=('candidate', 0))
 
-    with pytest.raises(ValueError, match='formal.*run row'):
+    with pytest.raises(ValueError, match='Stage-C.*run'):
         build_final_pareto_record(
             candidate_id='binary-qk-s-v1', repository_root=tmp_path,
             baseline_roots=roots['baseline'],

@@ -41,10 +41,6 @@ _CANONICAL_ARTIFACT_ROLES = {
     'smoke': Path('smoke-stage-a/smoke.json'),
     'formal_authority': Path('formal/formal-authority.json'),
 }
-_FORMAL_RUN_FIELDS = {
-    'run_id', 'role', 'seed', 'conditional', 'config', 'config_sha256',
-    'initialization_id', 'output_root',
-}
 _PUBLIC_EVALUATION_PROTOCOL_FIELDS = {
     'dataset', 'split', 'complete_split', 'batch_size',
     'authority_path', 'authority_sha256', 'authority_image_count',
@@ -245,73 +241,217 @@ def _candidate_row_sha256(manifest: Path, candidate_id: str, seed: int) -> str:
     return canonical_json_sha256(matches[0])
 
 
-def _formal_run_authority(
-        manifest: Mapping[str, Any], *, role: str, seed: int,
-        config: str, config_sha256: str, initialization_id: str,
-        output_root: str) -> dict[str, Any]:
-    runs = manifest.get('runs')
-    if not isinstance(runs, list):
-        raise ValueError('formal Stage-C manifest run rows are missing')
-    if any(
-            not isinstance(row, Mapping) or set(row) != _FORMAL_RUN_FIELDS
-            for row in runs):
-        raise ValueError('formal Stage-C manifest run row fields are invalid')
-    run_ids = [row['run_id'] for row in runs]
-    if (
-            any(not isinstance(run_id, str) or not run_id for run_id in run_ids)
-            or len(run_ids) != len(set(run_ids))):
-        raise ValueError('formal Stage-C manifest run row ids are invalid')
-    matches = [
-        row for row in runs
-        if row.get('role') == role and row.get('seed') == seed]
-    expected = {
-        'role': role,
-        'seed': seed,
-        'conditional': seed in (3, 4),
-        'config': config,
-        'config_sha256': config_sha256,
-        'initialization_id': initialization_id,
-        'output_root': output_root,
-    }
-    if (
-            len(matches) != 1
-            or any(matches[0].get(name) != value
-                   for name, value in expected.items())):
+def _strict_public_stage_c_run_authority(
+        *, repository_root: Path, manifest_path: Path, artifact_root: Path,
+        role: str, seed: int) -> dict[str, Any]:
+    """Consume the one strict public Stage-C v2 schema or fail closed.
+
+    Binary Q/K is a derivative of the approved ``baseline``/``no_pif``
+    experiment.  It must not invent a third role in that public manifest.  The
+    derivative will remain inadmissible until its own strict authority schema
+    is integrated and binds one of these authenticated parent runs.
+    """
+    try:
+        from .formal_schema import (
+            FormalManifestError, load_formal_manifest,
+            load_formal_run_init, load_formal_train_result)
+    except ImportError as error:
         raise ValueError(
-            'formal Stage-C exact role/seed run row authority mismatch')
-    return _plain(matches[0])
+            'strict public Stage-C schema v2 integration dependency is '
+            'unavailable') from error
+
+    root = Path(repository_root).resolve(strict=True)
+    try:
+        manifest = load_formal_manifest(
+            manifest_path, repository_root=root)
+    except (FormalManifestError, OSError, ValueError) as error:
+        raise ValueError(
+            f'strict public Stage-C schema v2 integration rejected the '
+            f'manifest: {error}') from error
+    if role not in {'baseline', 'no_pif'}:
+        raise ValueError(
+            'strict public Stage-C schema v2 integration has no Binary '
+            'candidate role; an exact derivative authority is required')
+    matches = [
+        run for run in manifest.runs
+        if run.role == role and run.seed == seed]
+    if len(matches) != 1:
+        raise ValueError(
+            'strict public Stage-C schema v2 run authority is missing')
+    run = matches[0]
+    if root / run.output_root != artifact_root:
+        raise ValueError(
+            'strict public Stage-C schema v2 output authority mismatch')
+    run_init_path = artifact_root / 'run-init.json'
+    train_result_path = artifact_root / 'train-result.json'
+    try:
+        run_init = load_formal_run_init(
+            run_init_path, repository_root=root)
+        train_result = load_formal_train_result(
+            train_result_path, repository_root=root, verify_files=True)
+    except (FormalManifestError, OSError, ValueError) as error:
+        raise ValueError(
+            f'strict public Stage-C run-init/train-result relationship is '
+            f'invalid: {error}') from error
+    if (
+            run_init.run_id != run.run_id
+            or run_init.role != run.role
+            or run_init.seed != run.seed
+            or run_init.config != run.config
+            or run_init.config_closure_sha256 != run.config_sha256
+            or run_init.output_root != run.output_root
+            or train_result.run_id != run.run_id
+            or train_result.role != run.role
+            or train_result.seed != run.seed
+            or train_result.output_root != run.output_root):
+        raise ValueError(
+            'strict public Stage-C run/init/result authority differs')
+    return {
+        'run_id': run.run_id,
+        'role': run.role,
+        'seed': run.seed,
+        'conditional': run.conditional,
+        'config': run.config.as_posix(),
+        'config_sha256': run.config_sha256,
+        'initialization_id': run.initialization_id,
+        'output_root': run.output_root.as_posix(),
+    }
 
 
 def _resolved_protocol_semantics(
-        value: Mapping[str, Any], protocol: Mapping[str, Any]) -> dict[str, Any]:
+        value: Mapping[str, Any], protocol: Mapping[str, Any], *,
+        seed: int = 0) -> dict[str, Any]:
+    canonical_protocol = {
+        'epochs': 300,
+        'effective_batch_size': 128,
+        'per_device_batch_size': 128,
+        'world_size': 1,
+        'accumulation_steps': 1,
+        'worker_count': 2,
+        'persistent_workers': False,
+        'deterministic': True,
+        'evaluator': 'mmpose.CocoMetric',
+        'tta_modes': {'flip': True, 'no_flip': False},
+    }
+    if any(
+            protocol.get(name) != expected
+            for name, expected in canonical_protocol.items()):
+        raise ValueError(
+            'formal sidecar contradicts the canonical formal protocol')
     train_cfg = value.get('train_cfg')
     dataloader = value.get('train_dataloader')
     randomness = value.get('randomness')
-    evaluator = value.get('val_evaluator')
+    optimizer = value.get('optim_wrapper')
+    schedulers = value.get('param_scheduler')
+    val_loader = value.get('val_dataloader')
+    test_loader = value.get('test_dataloader')
+    val_evaluator = value.get('val_evaluator')
+    test_evaluator = value.get('test_evaluator')
+    model = value.get('model')
+    expected_detection = (
+        'data/coco/person_detection_results/'
+        'COCO_val2017_detections_AP_H_56_person.json')
+    expected_dataset = {
+        'ann_file': 'annotations/person_keypoints_val2017.json',
+        'bbox_file': expected_detection,
+    }
+    expected_evaluator = {
+        'type': 'CocoMetric',
+        'ann_file': 'data/coco/annotations/person_keypoints_val2017.json',
+    }
+    expected_schedulers = [
+        {
+            'type': 'LinearLR', 'begin': 0, 'end': 500,
+            'start_factor': 0.001, 'by_epoch': False,
+        },
+        {
+            'type': 'MultiStepLR', 'begin': 0, 'end': 300,
+            'milestones': [200, 260], 'gamma': 0.1,
+            'by_epoch': True,
+        },
+    ]
+    val_dataset = val_loader.get('dataset') \
+        if isinstance(val_loader, Mapping) else None
+    test_dataset = test_loader.get('dataset') \
+        if isinstance(test_loader, Mapping) else None
+    optimizer_value = optimizer.get('optimizer') \
+        if isinstance(optimizer, Mapping) else None
+    test_cfg = model.get('test_cfg') if isinstance(model, Mapping) else None
+    expected_worker_init = {'type': 'mambapose_seed_worker'}
+    expected_train_sampler = {
+        'type': 'DefaultSampler', 'shuffle': True,
+        'round_up': True, 'seed': seed,
+    }
+    expected_eval_sampler = {
+        'type': 'DefaultSampler', 'shuffle': False,
+        'round_up': False, 'seed': seed,
+    }
     if (
             not isinstance(train_cfg, Mapping)
-            or train_cfg.get('max_epochs') != protocol['epochs']
+            or {
+                'max_epochs': train_cfg.get('max_epochs'),
+                'val_interval': train_cfg.get('val_interval'),
+            } != {'max_epochs': 300, 'val_interval': 5}
             or not isinstance(dataloader, Mapping)
-            or dataloader.get('batch_size') !=
-            protocol['per_device_batch_size']
-            or dataloader.get('num_workers') != protocol['worker_count']
-            or dataloader.get('persistent_workers') is not
-            protocol['persistent_workers']
+            or dataloader.get('batch_size') != 128
+            or dataloader.get('num_workers') != 2
+            or dataloader.get('persistent_workers') is not False
+            or _plain(dataloader.get('worker_init_fn')) !=
+            expected_worker_init
+            or _plain(dataloader.get('sampler')) != expected_train_sampler
             or not isinstance(randomness, Mapping)
-            or randomness.get('deterministic') is not protocol['deterministic']
-            or not isinstance(evaluator, Mapping)
-            or not isinstance(evaluator.get('type'), str)
-            or not evaluator['type'].endswith('CocoMetric')):
+            or randomness.get('seed') != seed
+            or randomness.get('deterministic') is not True
+            or optimizer_value != {'type': 'Adam', 'lr': 1e-3}
+            or (
+                isinstance(optimizer, Mapping)
+                and 'accumulative_counts' in optimizer)
+            or value.get('auto_scale_lr') is not None
+            or _plain(schedulers) != expected_schedulers
+            or value.get('data_root') != 'data/coco/'
+            or not isinstance(val_loader, Mapping)
+            or val_loader.get('batch_size') != 64
+            or val_loader.get('num_workers') != 2
+            or val_loader.get('persistent_workers') is not False
+            or val_loader.get('drop_last') is not False
+            or _plain(val_loader.get('worker_init_fn')) != expected_worker_init
+            or _plain(val_loader.get('sampler')) != expected_eval_sampler
+            or not isinstance(val_dataset, Mapping)
+            or {
+                'ann_file': val_dataset.get('ann_file'),
+                'bbox_file': val_dataset.get('bbox_file'),
+            } != expected_dataset
+            or not isinstance(test_loader, Mapping)
+            or test_loader.get('batch_size') != 64
+            or test_loader.get('num_workers') != 2
+            or test_loader.get('persistent_workers') is not False
+            or test_loader.get('drop_last') is not False
+            or _plain(test_loader.get('worker_init_fn')) != expected_worker_init
+            or _plain(test_loader.get('sampler')) != expected_eval_sampler
+            or not isinstance(test_dataset, Mapping)
+            or {
+                'ann_file': test_dataset.get('ann_file'),
+                'bbox_file': test_dataset.get('bbox_file'),
+            } != expected_dataset
+            or _plain(val_evaluator) != expected_evaluator
+            or _plain(test_evaluator) != expected_evaluator
+            or _plain(test_cfg) != {
+                'flip_test': True, 'flip_mode': 'heatmap',
+                'shift_heatmap': True,
+            }):
         raise ValueError(
-            'formal resolved config contradicts the recorded protocol')
+            'formal resolved config contradicts the canonical formal protocol')
     return {
-        'epochs': train_cfg['max_epochs'],
-        'per_device_batch_size': dataloader['batch_size'],
-        'worker_count': dataloader['num_workers'],
-        'persistent_workers': dataloader['persistent_workers'],
-        'deterministic': randomness['deterministic'],
-        'evaluator': protocol['evaluator'],
-        'tta_modes': _plain(protocol['tta_modes']),
+        **canonical_protocol,
+        'optimizer': {'type': 'Adam', 'lr': 1e-3},
+        'param_scheduler': expected_schedulers,
+        'auto_scale_lr': False,
+        'evaluation': {
+            'config_evaluator': expected_evaluator,
+            'validation_annotations': expected_dataset['ann_file'],
+            'detections': expected_detection,
+            'test_cfg': _plain(test_cfg),
+        },
     }
 
 
@@ -458,7 +598,8 @@ def _validate_formal_authority(
         raise ValueError('formal source manifest/candidate row mismatch')
     formal_manifest, _ = _repository_file(
         root, source.get('formal_manifest_path'),
-        label='formal Stage-C manifest')
+        label='formal Stage-C manifest',
+        expected=Path('optimization/formal_stage_c.json'))
     formal_manifest_value = _json_file(
         formal_manifest, label='formal Stage-C manifest')
     if (
@@ -521,11 +662,9 @@ def _validate_formal_authority(
             or config.get('resolved_config_sha256') != hashlib.sha256(
                     resolved.encode('utf-8')).hexdigest()):
         raise ValueError('formal config closure/resolved identity mismatch')
-    formal_run = _formal_run_authority(
-        formal_manifest_value, role=role, seed=flip.seed,
-        config=config_relative, config_sha256=result_source['config_sha256'],
-        initialization_id=initialization['id'],
-        output_root=artifact_root.relative_to(root).as_posix())
+    formal_run = _strict_public_stage_c_run_authority(
+        repository_root=root, manifest_path=formal_manifest,
+        artifact_root=artifact_root, role=role, seed=flip.seed)
 
     protocol = run.get('protocol')
     protocol_fields = {
@@ -557,7 +696,8 @@ def _validate_formal_authority(
                 and _SHA256.fullmatch(protocol[name])
                 for name in ('environment_inventory_sha256',))):
         raise ValueError('formal 300-epoch protocol authority is invalid')
-    resolved_protocol = _resolved_protocol_semantics(resolved_value, protocol)
+    resolved_protocol = _resolved_protocol_semantics(
+        resolved_value, protocol, seed=flip.seed)
     paired_config_sha256 = canonical_json_sha256(
         _paired_resolved_config(resolved_value))
     flip_protocol = getattr(flip, 'protocol', None)
@@ -916,7 +1056,11 @@ def build_final_pareto_record(
         *, candidate_id: str, repository_root: Path,
         baseline_roots: Mapping[int, str],
         candidate_roots: Mapping[int, str]) -> dict[str, Any]:
-    """Build Pareto evidence solely from public-valid artifact roots."""
+    """Build Pareto evidence solely from public-valid artifact roots.
+
+    Admission intentionally fails closed until the strict public Stage-C v2
+    schema and a separate Binary derivative authority are both integrated.
+    """
     record = _build_record(
         candidate_id=candidate_id, repository_root=repository_root,
         baseline_roots=baseline_roots, candidate_roots=candidate_roots)
