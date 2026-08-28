@@ -121,11 +121,12 @@ def profile(
         raise ValueError('candidate is not proven CPU-capable for profiling')
     manifest_path = manifest_path or REPOSITORY_ROOT / 'optimization/candidates.json'
     commit = clean_git_commit(REPOSITORY_ROOT)
+    downstream_output = (
+        output or REPOSITORY_ROOT / 'work_dirs/optimization/profile/profile.json')
     runtime = resolve_numeric_runtime(
         candidate, repository_root=REPOSITORY_ROOT,
         manifest_path=manifest_path,
-        downstream_output=(output or REPOSITORY_ROOT / 'work_dirs/optimization/'
-                           'profile/profile.json'))
+        downstream_output=downstream_output)
     checkpoint = runtime['checkpoint_path']
     actual_checksum = _sha256(checkpoint)
     if actual_checksum != runtime['checkpoint_sha256']:
@@ -146,7 +147,8 @@ def profile(
     if candidate.features.get('numeric_kind') == 'pwl':
         model = build_manifest_authorized_model(
             REPOSITORY_ROOT, manifest_path, candidate,
-            config_authority=config_authority, device=device)
+            config_authority=config_authority,
+            downstream_output=downstream_output, device=device)
     else:
         from mmpose.apis import init_model
         model = init_model(str(config_path), str(checkpoint), device=device)

@@ -195,10 +195,11 @@ def measure_candidate(
         except (KeyError, ValueError) as error:
             raise ValueError('physical GPU device index is required') from error
     manifest = manifest_path or REPO_ROOT / 'optimization/candidates.json'
+    downstream_output = (
+        output or REPO_ROOT / 'work_dirs/optimization/latency/latency.json')
     runtime = resolve_numeric_runtime(
         candidate, repository_root=REPO_ROOT, manifest_path=manifest,
-        downstream_output=(output or REPO_ROOT / 'work_dirs/optimization/'
-                           'latency/latency.json'))
+        downstream_output=downstream_output)
     checkpoint = runtime['checkpoint_path']
     config_path = runtime['config_path']
     admission = _latency_admission(
@@ -232,7 +233,8 @@ def measure_candidate(
     if candidate.features.get('numeric_kind') == 'pwl':
         model = build_manifest_authorized_model(
             REPO_ROOT, manifest, candidate,
-            config_authority=config_authority, device='cuda:0')
+            config_authority=config_authority,
+            downstream_output=downstream_output, device='cuda:0')
     else:
         from mmpose.apis import init_model
         model = init_model(config, str(checkpoint), device='cuda:0')

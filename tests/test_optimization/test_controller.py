@@ -101,6 +101,189 @@ def _candidate(repo_root):
     return candidate
 
 
+def _pwl_candidate(repo_root):
+    from mambapose_opt.schema import CandidateSpec
+
+    parent = _candidate(repo_root)
+    return CandidateSpec.from_dict({
+        'id': parent.id,
+        'route': 'ssm-quant-pwl',
+        'kind': 'pwl',
+        'config': parent.config.as_posix(),
+        'checkpoint': parent.checkpoint.as_posix(),
+        'checkpoint_sha256': parent.checkpoint_sha256,
+        'seed': parent.seed,
+        'features': {'numeric_kind': 'pwl'},
+    })
+
+
+def _stub_pwl_controller_validation(
+        tmp_path, monkeypatch, *, stage, authority):
+    from types import SimpleNamespace
+
+    from mambapose_opt import controller as controller_module
+    from mambapose_opt import numeric_runtime
+    from mambapose_opt.controller import OptimizationController
+
+    candidate = _pwl_candidate(tmp_path)
+    output = (
+        tmp_path / 'work_dirs/optimization' / candidate.route /
+        candidate.id / str(candidate.seed) / stage / f'{stage}.json')
+    _write_generic_artifact(output, stage)
+    runtime_config = output.parent.parent / 'convert/resolved-runtime.py'
+    runtime_config.parent.mkdir(parents=True, exist_ok=True)
+    runtime_config.write_text(
+        'model = dict(type="Fixture", authority_tag="canonical")\n',
+        encoding='utf-8')
+    runtime = {
+        'config_path': runtime_config,
+        'config_sha256': _sha256(runtime_config),
+        'checkpoint_name': candidate.checkpoint.as_posix(),
+        'checkpoint_sha256': candidate.checkpoint_sha256,
+        'pwl_stage_a': {'path': 'smoke.json', 'sha256': '7' * 64},
+    }
+    source = {
+        'authority_sha256': '8' * 64,
+        'config_sha256': _sha256(tmp_path / candidate.config),
+        'git_commit': subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=tmp_path,
+            text=True).strip(),
+    }
+    monkeypatch.setattr(
+        controller_module, 'resolve_artifact_source',
+        lambda *args, **kwargs: (source, candidate, object()))
+    monkeypatch.setattr(
+        numeric_runtime, 'resolve_numeric_runtime',
+        lambda *args, **kwargs: runtime)
+    monkeypatch.setattr(
+        controller_module, 'validate_evaluation_envelope',
+        lambda *args, **kwargs: {
+            'modes': {'flip': {'protocol': {'kind': 'evaluate'}}}})
+    monkeypatch.setattr(
+        controller_module, 'validate_latency_envelope',
+        lambda *args, **kwargs: {
+            'protocol': {'data': {'kind': 'latency'}}, 'gpu_lease': {}})
+    monkeypatch.setattr(
+        OptimizationController, '_match_latency_lease',
+        lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        controller_module, 'validate_live_coco_observation',
+        lambda *args, **kwargs: None)
+
+    def authorize(*args, **kwargs):
+        value = authority(*args, **kwargs)
+        value.path = runtime_config.resolve()
+        value.sha256 = _sha256(runtime_config)
+        return value
+
+    monkeypatch.setattr(
+        'mambapose_opt.checkpoints.authorize_pwl_runtime_config', authorize)
+    controller = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate,
+        lambda *args: None, repository_root=tmp_path,
+        manifest_path=tmp_path / 'optimization/candidates.json',
+        stages=(stage,))
+    return controller, output, runtime_config
+
+
+@pytest.mark.parametrize('stage', ['evaluate', 'latency'])
+def test_pwl_controller_reconstructs_runtime_config_without_direct_parse(
+        tmp_path, monkeypatch, stage):
+    from types import SimpleNamespace
+
+    from mmengine.config import Config
+
+    calls = []
+    expected_config = Config(dict(
+        model=dict(type='Fixture', authority_tag='authorized')))
+
+    def authorize(*args, conversion_path, **kwargs):
+        calls.append(('authorize', Path(conversion_path)))
+        return SimpleNamespace(
+            load_config=lambda: (
+                calls.append(('load', None)) or expected_config),
+            verify=lambda: calls.append(('verify', None)))
+
+    controller, output, _runtime_config = _stub_pwl_controller_validation(
+        tmp_path, monkeypatch, stage=stage, authority=authorize)
+    monkeypatch.setattr(
+        Config, 'fromfile',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError('PWL controller used direct Config.fromfile')))
+
+    schema = controller._artifact_schema(
+        stage, output,
+        expected_gpu_lease=(object() if stage == 'latency' else None),
+        lease_validated_at=(
+            datetime.now(timezone.utc) if stage == 'latency' else None))
+
+    assert schema == 'optimization-stage-envelope-v1'
+    assert calls[0] == (
+        'authorize', output.parent.parent / 'convert/convert.json')
+    assert [kind for kind, _ in calls].count('load') == 1
+    assert [kind for kind, _ in calls].count('verify') >= 1
+
+
+@pytest.mark.parametrize('stage', ['evaluate', 'latency'])
+def test_pwl_controller_rejects_runtime_config_swap_after_live_observation(
+        tmp_path, monkeypatch, stage):
+    from types import SimpleNamespace
+
+    from mmengine.config import Config
+    from mambapose_opt import controller as controller_module
+    from mambapose_opt.controller import ArtifactValidationError
+
+    verifies = []
+    expected_config = Config(dict(model=dict(type='Fixture')))
+
+    def verify():
+        verifies.append(None)
+        if len(verifies) > 1:
+            raise ValueError('PWL runtime config authority changed')
+
+    authority = lambda *args, **kwargs: SimpleNamespace(
+        load_config=lambda: (verify() or expected_config), verify=verify)
+    controller, output, runtime_config = _stub_pwl_controller_validation(
+        tmp_path, monkeypatch, stage=stage, authority=authority)
+    monkeypatch.setattr(
+        controller_module, 'validate_live_coco_observation',
+        lambda *args, **kwargs: runtime_config.write_text(
+            'model = dict(type="Substituted")\n', encoding='utf-8'))
+
+    with pytest.raises(
+            ArtifactValidationError,
+            match='PWL runtime config authority changed'):
+        controller._artifact_schema(
+            stage, output,
+            expected_gpu_lease=(object() if stage == 'latency' else None),
+            lease_validated_at=(
+                datetime.now(timezone.utc) if stage == 'latency' else None))
+
+    assert len(verifies) >= 2
+
+
+@pytest.mark.parametrize('stage', ['evaluate', 'latency'])
+def test_pwl_controller_rejects_alternate_stage_output_before_authorizing(
+        tmp_path, monkeypatch, stage):
+    from mambapose_opt.controller import ArtifactValidationError
+
+    def must_not_authorize(*args, **kwargs):
+        raise AssertionError('alternate stage output reached Config authorizer')
+
+    controller, output, _runtime_config = _stub_pwl_controller_validation(
+        tmp_path, monkeypatch, stage=stage, authority=must_not_authorize)
+    alternate = output.parent.parent / 'alternate' / output.name
+    alternate.parent.mkdir()
+    alternate.write_bytes(output.read_bytes())
+
+    with pytest.raises(ArtifactValidationError, match='path is not canonical'):
+        controller._artifact_schema(
+            stage, alternate,
+            expected_gpu_lease=(object() if stage == 'latency' else None),
+            lease_validated_at=(
+                datetime.now(timezone.utc) if stage == 'latency' else None))
+
+
 def _outcome(stage, artifact, *, exit_code=0, valid=True, fingerprint='ok'):
     from mambapose_opt.controller import StageOutcome
 

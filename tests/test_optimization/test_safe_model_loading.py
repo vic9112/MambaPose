@@ -180,7 +180,7 @@ def test_manifest_authorized_builder_rejects_naked_alternate_config(
             config=alternate, device='cpu')
 
 
-def test_config_authority_rejects_in_memory_config_tampering(tmp_path):
+def test_config_authority_returns_reconstructed_config_not_mutable_state(tmp_path):
     from mambapose_opt.checkpoints import authorize_tracked_config
 
     manifest, _checkpoint = _authorized_repo(tmp_path, {
@@ -191,10 +191,105 @@ def test_config_authority_rejects_in_memory_config_tampering(tmp_path):
     })
     authority = authorize_tracked_config(
         tmp_path, manifest, 'pwl-silu-s-v1')
-    authority._config.model.authority_tag = 'alternate'
+    config = authority.load_config()
+    config.model.type = 'Alternate'
 
-    with pytest.raises(ValueError, match='ConfigAuthority.*changed|tamper'):
-        authority.verify()
+    assert authority.load_config().model.type == 'Fixture'
+    authority.verify()
+
+
+def test_public_config_authority_constructor_rejects_forgery(tmp_path):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {
+            'state_dict': {
+                'weight': torch.tensor([1.0, 2.0], dtype=torch.float32),
+                'counter': torch.tensor([3], dtype=torch.int64),
+            },
+        }, 'model = dict(type="Fixture", authority_tag="tracked")\n')
+    authorized = checkpoints.authorize_manifest_candidate(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    alternate = Config(dict(model=dict(
+        type='Fixture', authority_tag='alternate')))
+    with pytest.raises(TypeError, match='created by an authorizer'):
+        forged = checkpoints.ConfigAuthority(
+            object(),
+            repository_root=tmp_path, manifest_path=manifest,
+            candidate=authorized.candidate, path=authorized.config_path,
+            sha256='0' * 64, config=alternate, verify=lambda: None,
+            reference={'kind': 'forged'})
+
+
+def test_builder_rejects_compound_mutation_of_authority_locator(
+        tmp_path, monkeypatch):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {
+            'state_dict': {
+                'weight': torch.tensor([1.0, 2.0], dtype=torch.float32),
+                'counter': torch.tensor([3], dtype=torch.int64),
+            },
+        }, 'model = dict(type="Fixture", authority_tag="tracked")\n')
+    authority = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    alternate = Config(dict(model=dict(
+        type='Fixture', authority_tag='alternate')))
+    mutations = {
+        '_config': alternate,
+        '_config_sha256': checkpoints.ConfigAuthority._config_fingerprint(
+            alternate),
+        '_verify_callback': lambda: None,
+        '_reference': {'kind': 'forged'},
+        '_seal': object(),
+    }
+    for name, value in mutations.items():
+        try:
+            object.__setattr__(authority, name, value)
+        except (AttributeError, TypeError):
+            pass
+    captured = {}
+    monkeypatch.setattr(
+        'mmpose.apis.init_model',
+        lambda config, _checkpoint, *, device: (
+            captured.update(tag=config.model.authority_tag) or _ToyModel()))
+
+    with pytest.raises(ValueError, match='locator differs'):
+        checkpoints.build_manifest_authorized_model(
+            tmp_path, manifest, 'pwl-silu-s-v1',
+            config_authority=authority, device='cpu')
+
+    assert captured == {}
+
+
+def test_builder_rejects_caller_selected_noncanonical_stage_locators(tmp_path):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(tmp_path, {
+        'state_dict': {
+            'weight': torch.tensor([1.0, 2.0], dtype=torch.float32),
+            'counter': torch.tensor([3], dtype=torch.int64),
+        },
+    })
+    authority = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    candidate = authority.candidate
+    candidate_root = (
+        tmp_path / 'work_dirs/optimization' / candidate.route /
+        candidate.id / str(candidate.seed))
+
+    with pytest.raises(ValueError, match='does not identify a model stage'):
+        checkpoints.build_manifest_authorized_model(
+            tmp_path, manifest, candidate, config_authority=authority,
+            downstream_output=(candidate_root / 'alternate/profile.json'))
+
+    with pytest.raises(ValueError, match='not canonical for stage'):
+        checkpoints.build_manifest_authorized_model(
+            tmp_path, manifest, candidate, config_authority=authority,
+            materialized_config_path=(tmp_path / 'alternate/resolved-flip.py'),
+            materialized_authority_path=(
+                tmp_path / 'alternate/resolved-flip.config-authority.json'))
 
 
 def test_test_cli_injects_safe_model_and_disables_runner_checkpoint(
@@ -236,7 +331,8 @@ def test_test_cli_injects_safe_model_and_disables_runner_checkpoint(
     monkeypatch.setattr(
         checkpoints, 'build_manifest_authorized_model',
         lambda repository_root, manifest_path, candidate, *,
-        config_authority, device:
+        config_authority, materialized_authority_path,
+        materialized_config_path, device:
         model)
 
     class FakeRunner:

@@ -190,7 +190,10 @@ def main():
         cfg.load_from = None
         cfg.model = build_manifest_authorized_model(
             repository_root, Path(args.safe_manifest), args.safe_candidate,
-            config_authority=config_authority, device='cpu')
+            config_authority=config_authority,
+            materialized_authority_path=Path(args.safe_config_authority),
+            materialized_config_path=Path(args.config),
+            device='cpu')
 
     # build the runner from config
     runner = Runner.from_cfg(cfg)

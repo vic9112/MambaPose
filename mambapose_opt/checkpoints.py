@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
 import numpy as np
 import torch
@@ -33,46 +33,81 @@ class AuthorizedCandidate:
 
 
 _APPROVED_CHECKPOINT_ROOTS = (Path('work_dirs/reproduction'),)
-_CONFIG_AUTHORITY_SEAL = object()
+
+
+@dataclass(frozen=True)
+class _ConfigSnapshot:
+    candidate: CandidateSpec
+    path: Path
+    sha256: str
+    config: Any
+    reference: Mapping[str, Any]
+
+    def identity(self) -> tuple[CandidateSpec, Path, str, str]:
+        return (
+            self.candidate, self.path, self.sha256,
+            json.dumps(
+                self.reference, sort_keys=True, separators=(',', ':'),
+                allow_nan=False))
 
 
 class ConfigAuthority:
-    """Sealed, revalidated authority for one candidate construction Config."""
+    """A public locator whose Config is reconstructed on every consumption."""
 
     __slots__ = (
-        '_candidate', '_config', '_config_sha256', '_manifest_path', '_path',
-        '_reference', '_repository_root', '_sha256', '_verify_callback',
-        '_seal')
+        '_candidate_id', '_manifest_path', '_reference', '_repository_root')
 
-    def __init__(
-            self, seal: object, *, repository_root: Path,
-            manifest_path: Path, candidate: CandidateSpec, path: Path,
-            sha256: str, config: Any, verify: Callable[[], None],
-            reference: Mapping[str, Any] | None = None):
-        if seal is not _CONFIG_AUTHORITY_SEAL:
-            raise TypeError('ConfigAuthority must be created by an authorizer')
-        self._seal = seal
-        self._repository_root = Path(repository_root).resolve(strict=True)
-        self._manifest_path = Path(manifest_path).resolve(strict=True)
-        self._candidate = candidate
-        self._path = Path(path).resolve(strict=True)
-        self._sha256 = sha256
-        self._config = copy.deepcopy(config)
-        self._config_sha256 = self._config_fingerprint(self._config)
-        self._verify_callback = verify
-        self._reference = copy.deepcopy(dict(reference or {}))
+    def __init__(self, *args, **kwargs):
+        raise TypeError('ConfigAuthority must be created by an authorizer')
+
+    @classmethod
+    def _create(
+            cls, *, repository_root: Path, manifest_path: Path,
+            candidate_id: str, reference: Mapping[str, Any]):
+        value = object.__new__(cls)
+        object.__setattr__(
+            value, '_repository_root',
+            Path(repository_root).resolve(strict=True))
+        object.__setattr__(
+            value, '_manifest_path', Path(manifest_path).resolve(strict=True))
+        object.__setattr__(value, '_candidate_id', candidate_id)
+        object.__setattr__(
+            value, '_reference', copy.deepcopy(dict(reference)))
+        return value
+
+    def _snapshot(self) -> _ConfigSnapshot:
+        return _reconstruct_config_snapshot(
+            self._repository_root, self._manifest_path,
+            self._candidate_id, self._reference)
+
+    def _require_exact(self, expected: 'ConfigAuthority') -> None:
+        if not isinstance(expected, ConfigAuthority):
+            raise TypeError('expected ConfigAuthority is invalid')
+        actual_identity = self._locator_identity()
+        expected_identity = expected._locator_identity()
+        if actual_identity != expected_identity:
+            raise ValueError(
+                'ConfigAuthority locator differs from the expected stage source')
+
+    def _locator_identity(self) -> tuple[Path, Path, str, str]:
+        return (
+            Path(self._repository_root), Path(self._manifest_path),
+            str(self._candidate_id),
+            json.dumps(
+                self._reference, sort_keys=True, separators=(',', ':'),
+                allow_nan=False))
 
     @property
     def path(self) -> Path:
-        return self._path
+        return self._snapshot().path
 
     @property
     def sha256(self) -> str:
-        return self._sha256
+        return self._snapshot().sha256
 
     @property
     def candidate(self) -> CandidateSpec:
-        return self._candidate
+        return self._snapshot().candidate
 
     @staticmethod
     def _config_fingerprint(config: Any) -> str:
@@ -85,32 +120,24 @@ class ConfigAuthority:
         return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
     def verify(self) -> None:
-        if self._seal is not _CONFIG_AUTHORITY_SEAL:
-            raise ValueError('ConfigAuthority seal is invalid')
-        if self._config_fingerprint(self._config) != self._config_sha256:
-            raise ValueError('ConfigAuthority in-memory Config changed')
-        self._verify_callback()
+        first = self._snapshot()
+        second = self._snapshot()
+        if (
+                first.identity() != second.identity()
+                or self._config_fingerprint(first.config) !=
+                self._config_fingerprint(second.config)):
+            raise ValueError('ConfigAuthority source changed during verification')
 
     def load_config(self) -> Any:
-        self.verify()
-        value = copy.deepcopy(self._config)
-        self.verify()
-        return value
-
-    def _config_for(
-            self, authorized: AuthorizedCandidate,
-            repository_root: Path, manifest_path: Path) -> Any:
-        root = Path(repository_root).resolve(strict=True)
-        manifest = Path(manifest_path)
-        if not manifest.is_absolute():
-            manifest = root / manifest
+        first = self._snapshot()
+        value = copy.deepcopy(first.config)
+        second = self._snapshot()
         if (
-                root != self._repository_root
-                or manifest.resolve(strict=True) != self._manifest_path
-                or authorized.candidate != self._candidate):
-            raise ValueError(
-                'ConfigAuthority differs from the authorized candidate source')
-        return self.load_config()
+                first.identity() != second.identity()
+                or self._config_fingerprint(first.config) !=
+                self._config_fingerprint(second.config)):
+            raise ValueError('ConfigAuthority source changed during parsing')
+        return value
 
 
 def _sha256(path: Path) -> str:
@@ -233,10 +260,17 @@ def authorized_tracked_file(
     return path
 
 
-def authorize_tracked_config(
+def _manifest_absolute(root: Path, manifest_path: Path) -> Path:
+    manifest = Path(manifest_path)
+    if not manifest.is_absolute():
+        manifest = root / manifest
+    return manifest.resolve(strict=True)
+
+
+def _tracked_config_snapshot(
         repository_root: Path, manifest_path: Path,
-        candidate: str | CandidateSpec) -> ConfigAuthority:
-    """Build Config only after binding its tracked bytes and base closure."""
+        candidate: str | CandidateSpec) -> _ConfigSnapshot:
+    """Rebuild a tracked Config and its full public source evidence."""
     from mmengine.config import Config
 
     from .numeric_source import validate_numeric_config_closure
@@ -248,7 +282,8 @@ def authorize_tracked_config(
         raise ValueError('candidate differs from the authorized manifest entry')
     commit = authorized.source['git_commit']
 
-    def snapshot() -> tuple[Path, bytes, tuple[dict[str, str], ...]]:
+    def source_snapshot() -> tuple[
+            Path, bytes, tuple[dict[str, str], ...]]:
         path = authorized_tracked_file(
             root, authorized.candidate.config, commit=commit,
             label='candidate config')
@@ -256,30 +291,35 @@ def authorize_tracked_config(
             root, authorized.candidate.config, git_commit=commit)
         return path, path.read_bytes(), closure
 
-    path, payload, closure = snapshot()
+    path, payload, closure = source_snapshot()
     config = Config.fromfile(path)
-    after_path, after_payload, after_closure = snapshot()
+    after_path, after_payload, after_closure = source_snapshot()
     if (after_path != path or after_payload != payload
             or after_closure != closure):
         raise ValueError('candidate config authority changed during parsing')
     checksum = hashlib.sha256(payload).hexdigest()
-
-    def verify() -> None:
-        current = authorize_manifest_candidate(root, manifest_path, candidate_id)
-        if current.candidate != authorized.candidate:
-            raise ValueError('candidate config authority manifest changed')
-        current_path, current_payload, current_closure = snapshot()
-        if (current_path != path or current_payload != payload
-                or current_closure != closure):
-            raise ValueError('candidate config authority changed')
-
-    authority = ConfigAuthority(
-        _CONFIG_AUTHORITY_SEAL, repository_root=root,
-        manifest_path=(
-            manifest_path if Path(manifest_path).is_absolute()
-            else root / manifest_path),
+    return _ConfigSnapshot(
         candidate=authorized.candidate, path=path, sha256=checksum,
-        config=config, verify=verify)
+        config=config,
+        reference={
+            'kind': 'tracked-candidate-config-v1',
+            'config_path': authorized.candidate.config.as_posix(),
+            'config_sha256': checksum,
+            'git_commit': commit,
+            'closure': [dict(item) for item in closure],
+        })
+
+
+def authorize_tracked_config(
+        repository_root: Path, manifest_path: Path,
+        candidate: str | CandidateSpec) -> ConfigAuthority:
+    """Return a locator for a tracked Config, never the parsed Config itself."""
+    root = lexical_repository_root(repository_root)
+    snapshot = _tracked_config_snapshot(root, manifest_path, candidate)
+    authority = ConfigAuthority._create(
+        repository_root=root,
+        manifest_path=_manifest_absolute(root, manifest_path),
+        candidate_id=snapshot.candidate.id, reference=snapshot.reference)
     authority.verify()
     return authority
 
@@ -311,11 +351,11 @@ def _config_from_bytes(payload: bytes, *, label: str):
         raise ValueError(f'{label} is not a valid materialized Config') from error
 
 
-def authorize_pwl_runtime_config(
+def _pwl_runtime_config_snapshot(
         repository_root: Path, manifest_path: Path,
         candidate: str | CandidateSpec, *,
-        conversion_path: Path) -> ConfigAuthority:
-    """Authorize the exact runtime Config from a public-valid convert record."""
+        conversion_path: Path) -> _ConfigSnapshot:
+    """Rebuild a runtime Config from a public-valid convert record."""
     from .numeric_runtime import validate_numeric_convert_artifact
 
     root = lexical_repository_root(repository_root)
@@ -330,7 +370,7 @@ def authorize_pwl_runtime_config(
     conversion_file = _lexical_file(
         root, conversion_relative, label='PWL conversion artifact')
 
-    def snapshot():
+    def source_snapshot():
         try:
             conversion_payload = conversion_file.read_bytes()
             conversion = json.loads(conversion_payload)
@@ -353,32 +393,39 @@ def authorize_pwl_runtime_config(
             conversion_payload, runtime_path, runtime_payload,
             runtime_sha256)
 
-    conversion_payload, path, payload, checksum = snapshot()
+    conversion_payload, path, payload, checksum = source_snapshot()
     config = _config_from_bytes(payload, label='PWL runtime config')
-    after = snapshot()
+    after = source_snapshot()
     if after != (conversion_payload, path, payload, checksum):
         raise ValueError('PWL runtime config authority changed during parsing')
-
-    def verify() -> None:
-        current = authorize_manifest_candidate(root, manifest_path, candidate_id)
-        if current.candidate != authorized.candidate:
-            raise ValueError('PWL runtime config candidate changed')
-        if snapshot() != (conversion_payload, path, payload, checksum):
-            raise ValueError('PWL runtime config authority changed')
-
-    authority = ConfigAuthority(
-        _CONFIG_AUTHORITY_SEAL, repository_root=root,
-        manifest_path=(
-            manifest_path if Path(manifest_path).is_absolute()
-            else root / manifest_path),
+    return _ConfigSnapshot(
         candidate=authorized.candidate, path=path, sha256=checksum,
-        config=config, verify=verify,
+        config=config,
         reference={
             'kind': 'pwl-convert-runtime-v1',
             'conversion_path': conversion_relative.as_posix(),
             'conversion_sha256': hashlib.sha256(
                 conversion_payload).hexdigest(),
+            'runtime_path': path.relative_to(root).as_posix(),
+            'runtime_sha256': checksum,
+            'source_git_commit': authorized.source['git_commit'],
+            'source_manifest_sha256': authorized.source['manifest_sha256'],
+            'source_config_sha256': authorized.source['config_sha256'],
         })
+
+
+def authorize_pwl_runtime_config(
+        repository_root: Path, manifest_path: Path,
+        candidate: str | CandidateSpec, *,
+        conversion_path: Path) -> ConfigAuthority:
+    """Return a locator for the exact public-valid PWL runtime Config."""
+    root = lexical_repository_root(repository_root)
+    snapshot = _pwl_runtime_config_snapshot(
+        root, manifest_path, candidate, conversion_path=conversion_path)
+    authority = ConfigAuthority._create(
+        repository_root=root,
+        manifest_path=_manifest_absolute(root, manifest_path),
+        candidate_id=snapshot.candidate.id, reference=snapshot.reference)
     authority.verify()
     return authority
 
@@ -410,10 +457,12 @@ def materialize_evaluation_config_authority(
         config_path: Path, authority_path: Path) -> ConfigAuthority:
     """Write the exact transformed config and a child-consumed authority."""
     if not isinstance(authority, ConfigAuthority):
-        raise TypeError('base authority must be a sealed ConfigAuthority')
-    if authority._reference.get('kind') != 'pwl-convert-runtime-v1':
+        raise TypeError('base authority must be a ConfigAuthority locator')
+    base_snapshot = authority._snapshot()
+    base_reference = dict(base_snapshot.reference)
+    if base_reference.get('kind') != 'pwl-convert-runtime-v1':
         raise ValueError('evaluation materialization requires PWL runtime authority')
-    root = authority._repository_root
+    root = Path(authority._repository_root)
     config_relative = _repository_relative(
         root, config_path, label='materialized evaluation config')
     authority_relative = _repository_relative(
@@ -432,12 +481,14 @@ def materialize_evaluation_config_authority(
     _write_atomic(config_file, payload)
     record = {
         'schema_version': 1,
-        'candidate_id': authority.candidate.id,
-        'base': copy.deepcopy(authority._reference),
+        'candidate_id': base_snapshot.candidate.id,
+        'base': {
+            name: base_reference[name] for name in (
+                'kind', 'conversion_path', 'conversion_sha256')},
         'transform': {
             'kind': 'deterministic-coco-evaluation-v1',
             'flip_test': flip_test,
-            'seed': authority.candidate.seed,
+            'seed': base_snapshot.candidate.seed,
         },
         'materialized': {
             'path': config_relative.as_posix(),
@@ -449,14 +500,14 @@ def materialize_evaluation_config_authority(
         (json.dumps(record, indent=2, sort_keys=True, allow_nan=False)
          + '\n').encode('utf-8'))
     return load_materialized_config_authority(
-        root, authority._manifest_path, authority.candidate, authority_file)
+        root, authority._manifest_path, base_snapshot.candidate, authority_file)
 
 
-def load_materialized_config_authority(
+def _materialized_config_snapshot(
         repository_root: Path, manifest_path: Path,
         candidate: str | CandidateSpec,
-        authority_path: Path) -> ConfigAuthority:
-    """Consume and reconstruct an evaluation authority without path parsing."""
+        authority_path: Path) -> _ConfigSnapshot:
+    """Rebuild an evaluation Config from its public materialized authority."""
     root = lexical_repository_root(repository_root)
     candidate_id = candidate if isinstance(candidate, str) else candidate.id
     authorized = authorize_manifest_candidate(root, manifest_path, candidate_id)
@@ -500,11 +551,13 @@ def load_materialized_config_authority(
             root, conversion_relative, label='PWL conversion artifact')
         if _sha256(conversion_file) != record['base']['conversion_sha256']:
             raise ValueError('materialized config base conversion changed')
-        base = authorize_pwl_runtime_config(
+        base = _pwl_runtime_config_snapshot(
             root, manifest_path, authorized.candidate,
             conversion_path=conversion_file)
         expected_config = _evaluation_config(
-            base, record['transform']['flip_test'])
+            _authority_from_snapshot(
+                root, manifest_path, base),
+            record['transform']['flip_test'])
         serialized = expected_config.dump()
         if not isinstance(serialized, str):
             raise ValueError('materialized evaluation Config is not serializable')
@@ -530,26 +583,71 @@ def load_materialized_config_authority(
     if after[:4] != initial[:4] or after[5] != record:
         raise ValueError('materialized config authority changed during parsing')
 
-    def verify() -> None:
-        current = snapshot()
-        if current[:4] != initial[:4] or current[5] != record:
-            raise ValueError('materialized config authority changed')
-
-    authority = ConfigAuthority(
-        _CONFIG_AUTHORITY_SEAL, repository_root=root,
-        manifest_path=(
-            manifest_path if Path(manifest_path).is_absolute()
-            else root / manifest_path),
+    return _ConfigSnapshot(
         candidate=authorized.candidate, path=path, sha256=checksum,
-        config=config, verify=verify,
+        config=config,
         reference={
             'kind': 'materialized-evaluation-v1',
             'authority_path': authority_relative.as_posix(),
             'authority_sha256': hashlib.sha256(
                 authority_payload).hexdigest(),
+            'base_conversion_path': record['base']['conversion_path'],
+            'base_conversion_sha256': record['base']['conversion_sha256'],
+            'materialized_path': path.relative_to(root).as_posix(),
+            'materialized_sha256': checksum,
         })
+
+
+def _authority_from_snapshot(
+        root: Path, manifest_path: Path,
+        snapshot: _ConfigSnapshot) -> ConfigAuthority:
+    return ConfigAuthority._create(
+        repository_root=root,
+        manifest_path=_manifest_absolute(root, manifest_path),
+        candidate_id=snapshot.candidate.id, reference=snapshot.reference)
+
+
+def load_materialized_config_authority(
+        repository_root: Path, manifest_path: Path,
+        candidate: str | CandidateSpec,
+        authority_path: Path) -> ConfigAuthority:
+    """Return a reconstructable locator for one materialized evaluation Config."""
+    root = lexical_repository_root(repository_root)
+    snapshot = _materialized_config_snapshot(
+        root, manifest_path, candidate, authority_path)
+    authority = _authority_from_snapshot(root, manifest_path, snapshot)
     authority.verify()
     return authority
+
+
+def _reconstruct_config_snapshot(
+        repository_root: Path, manifest_path: Path, candidate_id: str,
+        reference: Mapping[str, Any]) -> _ConfigSnapshot:
+    """Rebuild one locator and reject every caller-selected substitution."""
+    if not isinstance(reference, Mapping):
+        raise ValueError('ConfigAuthority locator reference is invalid')
+    kind = reference.get('kind')
+    if kind == 'tracked-candidate-config-v1':
+        snapshot = _tracked_config_snapshot(
+            repository_root, manifest_path, candidate_id)
+    elif kind == 'pwl-convert-runtime-v1':
+        if not isinstance(reference.get('conversion_path'), str):
+            raise ValueError('PWL runtime ConfigAuthority locator is invalid')
+        snapshot = _pwl_runtime_config_snapshot(
+            repository_root, manifest_path, candidate_id,
+            conversion_path=Path(reference['conversion_path']))
+    elif kind == 'materialized-evaluation-v1':
+        if not isinstance(reference.get('authority_path'), str):
+            raise ValueError(
+                'materialized ConfigAuthority locator is invalid')
+        snapshot = _materialized_config_snapshot(
+            repository_root, manifest_path, candidate_id,
+            Path(reference['authority_path']))
+    else:
+        raise ValueError('ConfigAuthority locator kind is invalid')
+    if dict(snapshot.reference) != dict(reference):
+        raise ValueError('ConfigAuthority locator evidence changed')
+    return snapshot
 
 
 def tensor_state(checkpoint: Path) -> dict[str, Tensor]:
@@ -663,9 +761,8 @@ def _build_authorized_model(
     from mmpose.apis import init_model
 
     if not isinstance(config_authority, ConfigAuthority):
-        raise TypeError('config_authority must be a sealed ConfigAuthority')
-    source_config = config_authority._config_for(
-        authorized, repository_root, manifest_path)
+        raise TypeError('config_authority must be a ConfigAuthority locator')
+    source_config = config_authority.load_config()
     safe_config = neutralize_model_initializers(source_config)
     model = init_model(safe_config, None, device=device)
     load_tensor_state_strict(model, tensor_state(authorized.checkpoint_path))
@@ -677,14 +774,84 @@ def build_manifest_authorized_model(
         repository_root: Path, manifest_path: Path,
         candidate: str | CandidateSpec, *,
         config_authority: ConfigAuthority,
+        downstream_output: Path | None = None,
+        materialized_authority_path: Path | None = None,
+        materialized_config_path: Path | None = None,
         device: str = 'cpu') -> Any:
-    """Authorize manifest identity and safely construct its exact model."""
+    """Derive the stage source, reconstruct it, and safely build the model."""
+    root = lexical_repository_root(repository_root)
     candidate_id = candidate if isinstance(candidate, str) else candidate.id
     authorized = authorize_manifest_candidate(
-        repository_root, manifest_path, candidate_id)
+        root, manifest_path, candidate_id)
     if isinstance(candidate, CandidateSpec) and authorized.candidate != candidate:
         raise ValueError('candidate differs from the authorized manifest entry')
+    if not isinstance(config_authority, ConfigAuthority):
+        raise TypeError('config_authority must be a ConfigAuthority locator')
+    materialized_requested = (
+        materialized_authority_path is not None
+        or materialized_config_path is not None)
+    if downstream_output is not None and materialized_requested:
+        raise ValueError('model construction accepts exactly one stage source')
+    if materialized_requested:
+        if (
+                materialized_authority_path is None
+                or materialized_config_path is None):
+            raise ValueError(
+                'materialized model construction requires config and authority')
+        config_relative = _repository_relative(
+            root, materialized_config_path,
+            label='materialized evaluation config')
+        expected_directory = (
+            Path('work_dirs/optimization') / authorized.candidate.route /
+            authorized.candidate.id / str(authorized.candidate.seed) /
+            'evaluate')
+        if (
+                config_relative.parent != expected_directory
+                or config_relative.name not in {
+                    'resolved-flip.py', 'resolved-no-flip.py'}):
+            raise ValueError(
+                'materialized evaluation config is not canonical for stage')
+        expected_authority_relative = config_relative.with_name(
+            f'{config_relative.stem}.config-authority.json')
+        supplied_authority_relative = _repository_relative(
+            root, materialized_authority_path,
+            label='materialized config authority')
+        if supplied_authority_relative != expected_authority_relative:
+            raise ValueError(
+                'materialized ConfigAuthority is not canonical for config')
+        expected = load_materialized_config_authority(
+            root, manifest_path, authorized.candidate,
+            root / expected_authority_relative)
+        if expected.path != root / config_relative:
+            raise ValueError(
+                'materialized ConfigAuthority config path differs from stage')
+    elif downstream_output is not None:
+        output_relative = _repository_relative(
+            root, downstream_output, label='PWL downstream output')
+        output_path = root / output_relative
+        expected_stage_root = (
+            root / 'work_dirs/optimization' / authorized.candidate.route /
+            authorized.candidate.id / str(authorized.candidate.seed))
+        try:
+            stage_relative = output_path.relative_to(expected_stage_root)
+        except ValueError as error:
+            raise ValueError(
+                'PWL downstream output is not canonical for candidate') from error
+        if (
+                len(stage_relative.parts) != 2
+                or stage_relative.parts[0] not in {'profile', 'latency'}
+                or stage_relative.name != f'{stage_relative.parts[0]}.json'):
+            raise ValueError(
+                'PWL downstream output does not identify a model stage')
+        conversion_path = expected_stage_root / 'convert/convert.json'
+        expected = authorize_pwl_runtime_config(
+            root, manifest_path, authorized.candidate,
+            conversion_path=conversion_path)
+    else:
+        expected = authorize_tracked_config(
+            root, manifest_path, authorized.candidate)
+    config_authority._require_exact(expected)
     return _build_authorized_model(
-        authorized, config_authority=config_authority,
-        repository_root=repository_root, manifest_path=manifest_path,
+        authorized, config_authority=expected,
+        repository_root=root, manifest_path=manifest_path,
         device=device)

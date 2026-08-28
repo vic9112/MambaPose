@@ -619,6 +619,13 @@ class OptimizationController:
                 expected_checkpoint_sha = self.candidate.checkpoint_sha256
                 runtime_config_path = self.repository_root / self.candidate.config
                 if self.candidate.route == 'ssm-quant-pwl':
+                    if (
+                            any(part in {'.', '..'} for part in Path(path).parts)
+                            or Path(path).absolute() !=
+                            (self._stage_dir(stage) / f'{stage}.json')):
+                        raise MetricError(
+                            'PWL evaluate artifact path is not canonical')
+                    from .checkpoints import authorize_pwl_runtime_config
                     from .numeric_runtime import resolve_numeric_runtime
                     runtime = resolve_numeric_runtime(
                         self.candidate, repository_root=self.repository_root,
@@ -630,8 +637,22 @@ class OptimizationController:
                     expected_checkpoint = runtime['checkpoint_name']
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
                     expected_pwl_stage_a = runtime.get('pwl_stage_a')
+                    config_authority = authorize_pwl_runtime_config(
+                        self.repository_root, self.manifest_path,
+                        self.candidate,
+                        conversion_path=(
+                            path.parent.parent / 'convert/convert.json'))
+                    if (
+                            config_authority.path !=
+                            runtime_config_path.resolve(strict=True)
+                            or config_authority.sha256 !=
+                            runtime['config_sha256']):
+                        raise ValueError(
+                            'PWL runtime ConfigAuthority differs from '
+                            'resolved stage runtime')
                 else:
                     expected_pwl_stage_a = None
+                    config_authority = None
                 validated_evaluation = validate_evaluation_envelope(
                     value,
                     expected_candidate_id=self.candidate.id,
@@ -647,12 +668,16 @@ class OptimizationController:
                     require_source_binding=True,
                     expected_pwl_stage_a=expected_pwl_stage_a,
                 )
-                from mmengine.config import Config
-                config = Config.fromfile(
-                    runtime_config_path)
+                if config_authority is not None:
+                    config = config_authority.load_config()
+                else:
+                    from mmengine.config import Config
+                    config = Config.fromfile(runtime_config_path)
                 validate_live_coco_observation(
                     validated_evaluation['modes']['flip']['protocol'],
                     config=config, repository_root=self.repository_root)
+                if config_authority is not None:
+                    config_authority.verify()
             except (MetricError, OSError, ValueError) as error:
                 raise ArtifactValidationError(
                     f'evaluate artifact is invalid: {error}') from error
@@ -670,6 +695,13 @@ class OptimizationController:
                 expected_config_sha = source['config_sha256']
                 runtime_config_path = self.repository_root / self.candidate.config
                 if self.candidate.route == 'ssm-quant-pwl':
+                    if (
+                            any(part in {'.', '..'} for part in Path(path).parts)
+                            or Path(path).absolute() !=
+                            (self._stage_dir(stage) / f'{stage}.json')):
+                        raise MetricError(
+                            'PWL latency artifact path is not canonical')
+                    from .checkpoints import authorize_pwl_runtime_config
                     from .numeric_runtime import resolve_numeric_runtime
                     runtime = resolve_numeric_runtime(
                         self.candidate, repository_root=self.repository_root,
@@ -682,8 +714,22 @@ class OptimizationController:
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
                     expected_config_sha = runtime['config_sha256']
                     expected_pwl_stage_a = runtime.get('pwl_stage_a')
+                    config_authority = authorize_pwl_runtime_config(
+                        self.repository_root, self.manifest_path,
+                        self.candidate,
+                        conversion_path=(
+                            path.parent.parent / 'convert/convert.json'))
+                    if (
+                            config_authority.path !=
+                            runtime_config_path.resolve(strict=True)
+                            or config_authority.sha256 !=
+                            expected_config_sha):
+                        raise ValueError(
+                            'PWL runtime ConfigAuthority differs from '
+                            'resolved stage runtime')
                 else:
                     expected_pwl_stage_a = None
+                    config_authority = None
                 validated_latency = validate_latency_envelope(
                     value,
                     expected_candidate_id=self.candidate.id,
@@ -706,12 +752,17 @@ class OptimizationController:
                 self._match_latency_lease(
                     validated_latency['gpu_lease'], expected_gpu_lease,
                     validated_at=lease_validated_at)
-                from mmengine.config import Config
+                if config_authority is not None:
+                    config = config_authority.load_config()
+                else:
+                    from mmengine.config import Config
+                    config = Config.fromfile(runtime_config_path)
                 validate_live_coco_observation(
                     validated_latency['protocol']['data'],
-                    config=Config.fromfile(
-                        runtime_config_path),
+                    config=config,
                     repository_root=self.repository_root)
+                if config_authority is not None:
+                    config_authority.verify()
             except (MetricError, OSError, ValueError) as error:
                 raise ArtifactValidationError(
                     f'latency artifact is invalid: {error}') from error
