@@ -8,7 +8,9 @@ established the environment authority.
 from __future__ import annotations
 
 import copy
+import ctypes
 from dataclasses import dataclass
+import errno
 import ast
 import hashlib
 import io
@@ -61,6 +63,159 @@ class FormalRepeatabilityError(ValueError):
 
 class FormalTrainingError(ValueError):
     """A formal training or resume authority is invalid."""
+
+
+_RENAME_NOREPLACE = 1
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC_RENAMEAT2 = getattr(_LIBC, 'renameat2', None)
+if _LIBC_RENAMEAT2 is not None:
+    _LIBC_RENAMEAT2.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint)
+    _LIBC_RENAMEAT2.restype = ctypes.c_int
+
+
+def _single_component_name(value: str, *, label: str) -> bytes:
+    if not isinstance(value, str) or not value or '/' in value \
+            or value in {'.', '..'} or '\x00' in value:
+        raise FormalTrainingError(f'{label} name is invalid')
+    return os.fsencode(value)
+
+
+def _rename_noreplace_at(
+        source_directory_fd: int, source_name: str,
+        destination_directory_fd: int, destination_name: str, *,
+        label: str) -> None:
+    """Atomically move one dirfd child without replacing the destination."""
+    source = _single_component_name(source_name, label=label)
+    destination = _single_component_name(destination_name, label=label)
+    if _LIBC_RENAMEAT2 is None:
+        raise FormalTrainingError(
+            f'{label} requires Linux renameat2(RENAME_NOREPLACE)')
+    ctypes.set_errno(0)
+    result = _LIBC_RENAMEAT2(
+        source_directory_fd, source, destination_directory_fd, destination,
+        _RENAME_NOREPLACE)
+    if result == 0:
+        return
+    observed_errno = ctypes.get_errno()
+    if observed_errno == errno.EEXIST:
+        raise FormalTrainingError(f'{label} destination already exists')
+    if observed_errno in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+        raise FormalTrainingError(
+            f'{label} no-replace move is unavailable')
+    error = OSError(observed_errno, os.strerror(observed_errno))
+    raise FormalTrainingError(f'{label} no-replace move failed') from error
+
+
+def _read_regular_payload_at(
+        directory_fd: int, name: str, *, label: str
+        ) -> tuple[bytes, tuple[int, int, int, int, int]]:
+    name_bytes = _single_component_name(name, label=label)
+    del name_bytes
+    try:
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0),
+            dir_fd=directory_fd)
+    except OSError as error:
+        raise FormalTrainingError(f'{label} is unavailable') from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise FormalTrainingError(f'{label} is not regular')
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+            digest.update(block)
+        after = os.fstat(descriptor)
+        identity = (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns)
+        if identity != (
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns):
+            raise FormalTrainingError(f'{label} changed during read')
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(named.st_mode) or (
+                named.st_dev, named.st_ino, named.st_size,
+                named.st_mtime_ns, named.st_ctime_ns) != identity:
+            raise FormalTrainingError(f'{label} name authority changed')
+        payload = b''.join(chunks)
+        if hashlib.sha256(payload).hexdigest() != digest.hexdigest():
+            raise FormalTrainingError(f'{label} digest changed')
+        return payload, identity
+    finally:
+        os.close(descriptor)
+
+
+def _write_immutable_file_at(
+        directory_fd: int, destination_name: str, payload: bytes, *,
+        pending_name: str, label: str,
+        allow_existing_identical: bool = False
+        ) -> tuple[int, int, int, int, int]:
+    """Publish bytes by a fixed pending file and no-replace final move.
+
+    On a destination collision the owned pending name is deliberately retained;
+    deleting it in the same transaction would reintroduce a name race.
+    """
+    _single_component_name(destination_name, label=label)
+    _single_component_name(pending_name, label=f'{label} pending')
+    try:
+        existing = os.stat(
+            destination_name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        if not allow_existing_identical:
+            raise FormalTrainingError(f'{label} already exists')
+        observed, identity = _read_regular_payload_at(
+            directory_fd, destination_name, label=label)
+        if observed != payload:
+            raise FormalTrainingError(f'{label} already differs')
+        return identity
+    try:
+        descriptor = os.open(
+            pending_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            | getattr(os, 'O_CLOEXEC', 0), 0o600, dir_fd=directory_fd)
+    except FileExistsError as error:
+        raise FormalTrainingError(f'{label} pending already exists') from error
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        created = os.fstat(descriptor)
+        created_identity = (
+            created.st_dev, created.st_ino, created.st_size,
+            created.st_mtime_ns, created.st_ctime_ns)
+    finally:
+        os.close(descriptor)
+    pending_payload, pending_identity = _read_regular_payload_at(
+        directory_fd, pending_name, label=f'{label} pending')
+    if pending_payload != payload or pending_identity != created_identity:
+        raise FormalTrainingError(f'{label} pending authority changed')
+    _rename_noreplace_at(
+        directory_fd, pending_name, directory_fd, destination_name,
+        label=label)
+    os.fsync(directory_fd)
+    final_payload, final_identity = _read_regular_payload_at(
+        directory_fd, destination_name, label=label)
+    if final_payload != payload or final_identity[:4] != pending_identity[:4]:
+        try:
+            _rename_noreplace_at(
+                directory_fd, destination_name, directory_fd, pending_name,
+                label=f'{label} restore')
+            os.fsync(directory_fd)
+        except FormalTrainingError:
+            pass
+        raise FormalTrainingError(f'{label} publication changed')
+    return final_identity
 
 
 FORMAL_TOLERANCES = (
@@ -358,17 +513,15 @@ def write_immutable_artifact(
         raise FormalTrainingError('artifact path escapes the frozen root') from error
     if not relative.parts or '..' in relative.parts:
         raise FormalTrainingError('artifact path is not canonical')
-    cursor = root
-    for part in relative.parent.parts:
-        cursor = cursor / part
-        if cursor.exists() and cursor.is_symlink():
-            raise FormalTrainingError('artifact path contains a symlink')
-    if target.exists():
-        if target.is_symlink() or not target.is_file() \
-                or target.read_bytes() != payload:
-            raise FormalTrainingError('immutable artifact already differs')
-        return
-    _atomic_write_bytes(target, payload)
+    with _HeldDirectoryTree(
+            root, label='immutable artifact authority') as held:
+        parent = (held._directory_fd(()) if relative.parent == Path('.') else
+                  held.ensure_directories(relative.parent))
+        _write_immutable_file_at(
+            parent, relative.name, payload,
+            pending_name=f'.{relative.name}.pending',
+            label='immutable artifact')
+        held.revalidate_directories()
 
 
 def _same_authority(
@@ -741,24 +894,29 @@ class _PrivateRunnerStaging:
             f'mambapose-formal-runner-{run_id}-{secrets.token_hex(12)}')
         try:
             os.mkdir(self.name, 0o700, dir_fd=self._parent_fd)
+            flags = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                     | getattr(os, 'O_CLOEXEC', 0))
+            self._directory_fd = os.open(
+                self.name, flags, dir_fd=self._parent_fd)
+            observed = os.fstat(self._directory_fd)
+            if not stat.S_ISDIR(observed.st_mode):
+                raise FormalTrainingError(
+                    'formal runner staging child is not a directory')
+            self._identity = (observed.st_dev, observed.st_ino)
+            created_identity = self._identity
+            if stat.S_IMODE(observed.st_mode) != 0o700:
+                raise FormalTrainingError(
+                    'formal runner staging permissions are invalid')
             os.fsync(self._parent_fd)
             created = os.stat(
                 self.name, dir_fd=self._parent_fd, follow_symlinks=False)
             if not stat.S_ISDIR(created.st_mode):
                 raise FormalTrainingError(
                     'formal runner staging child is not a directory')
-            created_identity = (created.st_dev, created.st_ino)
-            flags = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-                     | getattr(os, 'O_CLOEXEC', 0))
-            self._directory_fd = os.open(
-                self.name, flags, dir_fd=self._parent_fd)
-            observed = os.fstat(self._directory_fd)
-            if not stat.S_ISDIR(observed.st_mode) \
-                    or stat.S_IMODE(observed.st_mode) != 0o700:
-                raise FormalTrainingError(
-                    'formal runner staging permissions are invalid')
-            self._identity = (observed.st_dev, observed.st_ino)
             if self._identity != created_identity:
+                raise FormalTrainingError(
+                    'formal runner staging authority changed')
+            if self._identity != (created.st_dev, created.st_ino):
                 raise FormalTrainingError(
                     'formal runner staging authority changed')
             self.path = Path('/tmp') / self.name
@@ -771,8 +929,7 @@ class _PrivateRunnerStaging:
                     except OSError:
                         pass
                     self._directory_fd = -1
-                if created_identity is not None:
-                    self._remove_failed_constructor_child(created_identity)
+                self._remove_failed_constructor_child(created_identity)
             finally:
                 try:
                     os.close(self._parent_fd)
@@ -783,51 +940,38 @@ class _PrivateRunnerStaging:
             raise
 
     def _remove_failed_constructor_child(
-            self, expected_identity: tuple[int, int]) -> None:
-        """Remove only the still-named, empty directory created by us."""
+            self, expected_identity: tuple[int, int] | None) -> None:
+        """Move a failed constructor child aside without deleting any name."""
+        if expected_identity is None:
+            # mkdirat does not return the created inode.  If the immediate
+            # no-follow open/fstat failed, the live name cannot be proven to
+            # still be our child and must remain untouched.
+            return
         try:
             observed = os.stat(
                 self.name, dir_fd=self._parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             return
-        if not stat.S_ISDIR(observed.st_mode) or (
-                observed.st_dev, observed.st_ino) != expected_identity:
-            return
-        quarantine = f'.{self.name}.constructor-cleanup'
+        tombstone = f'.{self.name}.constructor-abandoned'
         try:
-            os.stat(quarantine, dir_fd=self._parent_fd,
-                    follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
+            _rename_noreplace_at(
+                self._parent_fd, self.name, self._parent_fd, tombstone,
+                label='formal runner constructor abandonment')
+        except FormalTrainingError:
             return
-        os.rename(
-            self.name, quarantine,
-            src_dir_fd=self._parent_fd, dst_dir_fd=self._parent_fd)
         os.fsync(self._parent_fd)
         moved = os.stat(
-            quarantine, dir_fd=self._parent_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(moved.st_mode) or (
-                moved.st_dev, moved.st_ino) != expected_identity:
+            tombstone, dir_fd=self._parent_fd, follow_symlinks=False)
+        matches = stat.S_ISDIR(moved.st_mode) and (
+            expected_identity is None or (
+                moved.st_dev, moved.st_ino) == expected_identity)
+        if not matches:
             try:
-                os.rename(
-                    quarantine, self.name,
-                    src_dir_fd=self._parent_fd, dst_dir_fd=self._parent_fd)
+                _rename_noreplace_at(
+                    self._parent_fd, tombstone, self._parent_fd, self.name,
+                    label='formal runner constructor restore')
                 os.fsync(self._parent_fd)
-            except OSError:
-                pass
-            return
-        try:
-            os.rmdir(quarantine, dir_fd=self._parent_fd)
-            os.fsync(self._parent_fd)
-        except OSError:
-            # A non-empty or concurrently changed directory is preserved.
-            try:
-                os.rename(
-                    quarantine, self.name,
-                    src_dir_fd=self._parent_fd, dst_dir_fd=self._parent_fd)
-                os.fsync(self._parent_fd)
-            except OSError:
+            except FormalTrainingError:
                 pass
 
     def _close_after_fork(self) -> None:
@@ -856,15 +1000,24 @@ class _PrivateRunnerStaging:
                     opened.st_dev, opened.st_ino) != self._identity:
                 raise FormalTrainingError(
                     'formal runner private staging authority changed')
-            _purge_directory_fd(self._directory_fd)
-            current = os.stat(
-                self.name, dir_fd=self._parent_fd, follow_symlinks=False)
-            if not stat.S_ISDIR(current.st_mode) or (
-                    current.st_dev, current.st_ino) != self._identity:
+            tombstone = f'.{self.name}.completed'
+            _rename_noreplace_at(
+                self._parent_fd, self.name, self._parent_fd, tombstone,
+                label='formal runner staging completion')
+            os.fsync(self._parent_fd)
+            moved = os.stat(
+                tombstone, dir_fd=self._parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(moved.st_mode) or (
+                    moved.st_dev, moved.st_ino) != self._identity:
+                try:
+                    _rename_noreplace_at(
+                        self._parent_fd, tombstone, self._parent_fd, self.name,
+                        label='formal runner staging restore')
+                    os.fsync(self._parent_fd)
+                except FormalTrainingError:
+                    pass
                 raise FormalTrainingError(
                     'formal runner private staging authority changed')
-            os.rmdir(self.name, dir_fd=self._parent_fd)
-            os.fsync(self._parent_fd)
         finally:
             self._close_after_fork()
 
@@ -936,6 +1089,36 @@ class _HeldOutputRegular:
             os.close(self._descriptor)
         except OSError:
             pass
+
+
+@dataclass(frozen=True)
+class _RetirementBinding:
+    record_path: Path
+    payload_path: Path
+    source_path: Path
+    source_sha256: str
+    source_device: int
+    source_inode: int
+    owning_commit_sha256: str
+    reason: str
+    target_state: str
+
+
+_RETIREMENT_ROOT = Path('.formal-retired')
+_RETIREMENT_RECORD_RE = re.compile(r'^([0-9a-f]{64})\.record\.json$')
+_RETIREMENT_PAYLOAD_RE = re.compile(r'^([0-9a-f]{64})\.payload$')
+_RETIREMENT_REASONS = {
+    'best-cleanup',
+    'empty-log-rollback',
+    'exact-next-pending',
+    'linked-immutable-pending',
+    'mutable-pending-rollback',
+    'run-init-linked-pending',
+    'stale-checkpoint',
+    'test-rollback',
+    'uncommitted-best',
+    'uncommitted-checkpoint',
+}
 
 
 class _FormalOutputAuthority:
@@ -1238,9 +1421,63 @@ class _FormalOutputAuthority:
         self._tree._directory_fd(self._output_parts + parts)
         return True
 
-    def purge_directory(self, relative: Path | str) -> None:
-        """Purge and remove one already-authorized output child directory."""
+    def _retirement_fd(self) -> int:
+        self.mkdir(_RETIREMENT_ROOT)
+        return self._tree._directory_fd(
+            self._output_parts + tuple(_RETIREMENT_ROOT.parts))
+
+    @staticmethod
+    def _retirement_identifier(document: Mapping[str, Any]) -> str:
+        return hashlib.sha256(_canonical_json_bytes(document)).hexdigest()
+
+    def _retirement_document(
+            self, relative: Path, *, source_sha256: str,
+            source_identity: tuple[int, int, int, int, int], reason: str,
+            owning_commit_sha256: str, target_state: str
+            ) -> tuple[str, bytes]:
+        key = {
+            'schema_version': 1,
+            'run_id': self.expected.run_id,
+            'source_path': relative.as_posix(),
+            'source_sha256': source_sha256,
+            'source_device': source_identity[0],
+            'source_inode': source_identity[1],
+            'source_size': source_identity[2],
+            'source_mtime_ns': source_identity[3],
+            'reason': reason,
+            'owning_commit_sha256': owning_commit_sha256,
+            'target_state': target_state,
+        }
+        retirement_id = self._retirement_identifier(key)
+        document = {
+            'schema_version': 1,
+            'retirement_id': retirement_id,
+            'run_id': self.expected.run_id,
+            'source': {
+                'path': relative.as_posix(),
+                'sha256': source_sha256,
+                'device': source_identity[0],
+                'inode': source_identity[1],
+                'size': source_identity[2],
+                'mtime_ns': source_identity[3],
+            },
+            'payload_path': (
+                _RETIREMENT_ROOT / f'{retirement_id}.payload').as_posix(),
+            'reason': reason,
+            'owning_commit_sha256': owning_commit_sha256,
+            'target_state': target_state,
+        }
+        return retirement_id, _canonical_json_bytes(document)
+
+    def abandon_directory(
+            self, relative: Path | str, *, tombstone_name: str,
+            owning_commit_sha256: str,
+            expected_identity: tuple[int, int] | None = None) -> Path | None:
+        """Logically retire a held child directory without deleting its tree."""
         self._ensure_mutable()
+        if not _is_sha(owning_commit_sha256):
+            raise FormalTrainingError(
+                'formal abandonment commit binding is invalid')
         parts = self._parts(relative)
         parent = self._tree._directory_fd(
             self._output_parts + parts[:-1])
@@ -1248,30 +1485,69 @@ class _FormalOutputAuthority:
             named = os.stat(
                 parts[-1], dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
-            return
+            return None
         if not stat.S_ISDIR(named.st_mode):
             raise FormalTrainingError(
-                'formal output purge target is unsafe')
-        key = self._tree._root_key + self._output_parts + parts
+                'formal output abandonment target is unsafe')
         child = self._tree._directory_fd(self._output_parts + parts)
         opened = os.fstat(child)
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
             raise FormalTrainingError(
-                'formal output purge authority changed')
-        _purge_directory_fd(child)
-        current = os.stat(
-            parts[-1], dir_fd=parent, follow_symlinks=False)
-        if not stat.S_ISDIR(current.st_mode) or (
-                current.st_dev, current.st_ino) != (
-                opened.st_dev, opened.st_ino):
+                'formal output abandonment authority changed')
+        identity = (opened.st_dev, opened.st_ino)
+        if expected_identity is not None and identity != expected_identity:
             raise FormalTrainingError(
-                'formal output purge authority changed')
-        os.rmdir(parts[-1], dir_fd=parent)
+                'formal output abandonment authority changed')
+        retirement_fd = self._retirement_fd()
+        _single_component_name(
+            tombstone_name, label='formal output abandonment tombstone')
+        tree_sha256 = _directory_tree_digest_fd(child)
+        record_name = f'{tombstone_name}.record.json'
+        record_payload = _canonical_json_bytes({
+            'schema_version': 1, 'run_id': self.expected.run_id,
+            'source_path': Path(*parts).as_posix(),
+            'tombstone_path': (
+                _RETIREMENT_ROOT / tombstone_name).as_posix(),
+            'device': identity[0], 'inode': identity[1],
+            'tree_sha256': tree_sha256,
+            'owning_commit_sha256': owning_commit_sha256})
+        _write_immutable_file_at(
+            retirement_fd, record_name, record_payload,
+            pending_name=f'.{record_name}.pending',
+            label='formal output abandonment record',
+            allow_existing_identical=True)
+        _rename_noreplace_at(
+            parent, parts[-1], retirement_fd, tombstone_name,
+            label='formal output abandonment')
         os.fsync(parent)
+        os.fsync(retirement_fd)
+        moved = os.stat(
+            tombstone_name, dir_fd=retirement_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(moved.st_mode) or (
+                moved.st_dev, moved.st_ino) != identity:
+            try:
+                _rename_noreplace_at(
+                    retirement_fd, tombstone_name, parent, parts[-1],
+                    label='formal output abandonment restore')
+                os.fsync(parent)
+                os.fsync(retirement_fd)
+            except FormalTrainingError:
+                pass
+                raise FormalTrainingError(
+                    'formal output abandonment authority changed')
+        if _directory_tree_digest_fd(child) != tree_sha256:
+            raise FormalTrainingError(
+                'formal output abandonment tree changed')
+        key = self._tree._root_key + self._output_parts + parts
         cached = self._tree._directories.pop(key, None)
         self._tree._directory_identities.pop(key, None)
         if cached is not None:
             os.close(cached)
+        return _RETIREMENT_ROOT / tombstone_name
+
+    def purge_directory(self, relative: Path | str) -> None:
+        raise FormalTrainingError(
+            'online recursive purge is forbidden; abandon the whole directory')
 
     def _write_pending(
             self, directory_fd: int, name: str, payload: bytes
@@ -1309,56 +1585,32 @@ class _FormalOutputAuthority:
                 'formal output pending authority changed')
 
     def _unlink_owned_pending(
-            self, directory_fd: int, pending: str, payload: bytes,
+            self, relative: Path | str, directory_fd: int, pending: str,
+            payload: bytes,
             identity: tuple[int, int, int, int]) -> None:
         try:
             os.stat(pending, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
             return
         self._verify_pending(directory_fd, pending, payload, identity)
-        os.unlink(pending, dir_fd=directory_fd)
-        os.fsync(directory_fd)
+        pending_relative = Path(*self._parts(relative)).parent / pending
+        digest, full_identity = self.file_authority(pending_relative)
+        if digest != hashlib.sha256(payload).hexdigest() \
+                or full_identity[:4] != identity:
+            raise FormalTrainingError(
+                'formal output pending authority changed')
+        self.unlink(
+            pending_relative, expected_sha256=digest,
+            expected_identity=full_identity,
+            retirement_reason='mutable-pending-rollback',
+            owning_commit_sha256=digest)
 
     def write_immutable(self, relative: Path | str, payload: bytes) -> None:
         self._ensure_mutable()
         parent, name = self._parent_and_name(relative)
-        pending, pending_identity = self._write_pending(
-            parent, name, payload)
-        linked = False
-        try:
-            self._verify_pending(
-                parent, pending, payload, pending_identity)
-            try:
-                os.link(
-                    pending, name, src_dir_fd=parent, dst_dir_fd=parent,
-                    follow_symlinks=False)
-                linked = True
-            except FileExistsError as error:
-                raise FormalTrainingError(
-                    'immutable formal output already exists') from error
-            pending_stat = os.stat(
-                pending, dir_fd=parent, follow_symlinks=False)
-            final_stat = os.stat(
-                name, dir_fd=parent, follow_symlinks=False)
-            if not stat.S_ISREG(final_stat.st_mode) or (
-                    pending_stat.st_dev, pending_stat.st_ino,
-                    pending_stat.st_size, pending_stat.st_mtime_ns) != \
-                    pending_identity or (
-                    pending_stat.st_dev, pending_stat.st_ino,
-                    pending_stat.st_size) != (
-                    final_stat.st_dev, final_stat.st_ino,
-                    final_stat.st_size):
-                raise FormalTrainingError(
-                    'immutable formal output publication changed')
-            self._unlink_owned_pending(
-                parent, pending, payload, pending_identity)
-        finally:
-            # Before link publication, an owned pending file is rollback state.
-            # After a successful link, a mismatched final may be an attacker
-            # replacement; retain the original pending inode for recovery.
-            if not linked:
-                self._unlink_owned_pending(
-                    parent, pending, payload, pending_identity)
+        _write_immutable_file_at(
+            parent, name, payload, pending_name=f'.{name}.pending',
+            label='immutable formal output')
 
     def write_mutable(
             self, relative: Path | str, payload: bytes, *,
@@ -1398,15 +1650,330 @@ class _FormalOutputAuthority:
             os.fsync(parent)
         finally:
             self._unlink_owned_pending(
-                parent, pending, payload, pending_identity)
+                relative, parent, pending, payload, pending_identity)
+
+    def _retirement_binding_from_document(
+            self, name: str, payload: bytes) -> _RetirementBinding:
+        match = _RETIREMENT_RECORD_RE.fullmatch(name)
+        if match is None:
+            raise FormalTrainingError('formal retirement inventory is invalid')
+        try:
+            document = json.loads(payload.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise FormalTrainingError('formal retirement record is malformed') \
+                from error
+        if not isinstance(document, Mapping) or set(document) != {
+                'schema_version', 'retirement_id', 'run_id', 'source',
+                'payload_path', 'reason', 'owning_commit_sha256',
+                'target_state'} or document['schema_version'] != 1:
+            raise FormalTrainingError('formal retirement record is invalid')
+        source = document['source']
+        if not isinstance(source, Mapping) or set(source) != {
+                'path', 'sha256', 'device', 'inode', 'size', 'mtime_ns'}:
+            raise FormalTrainingError('formal retirement source is invalid')
+        try:
+            source_path = Path(*self._parts(source['path']))
+        except (TypeError, FormalTrainingError) as error:
+            raise FormalTrainingError('formal retirement source is invalid') \
+                from error
+        if document['run_id'] != self.expected.run_id \
+                or document['retirement_id'] != match.group(1) \
+                or document['reason'] not in _RETIREMENT_REASONS \
+                or document['target_state'] not in {
+                    'retained', 'retained-hardlink', 'reclaimed-zero'} \
+                or not _is_sha(source['sha256']) \
+                or not _is_sha(document['owning_commit_sha256']) \
+                or any(isinstance(source[field], bool)
+                       or not isinstance(source[field], int)
+                       or source[field] < 0
+                       for field in ('device', 'inode', 'size', 'mtime_ns')):
+            raise FormalTrainingError('formal retirement authority is invalid')
+        key = {
+            'schema_version': 1, 'run_id': document['run_id'],
+            'source_path': source_path.as_posix(),
+            'source_sha256': source['sha256'],
+            'source_device': source['device'],
+            'source_inode': source['inode'],
+            'source_size': source['size'],
+            'source_mtime_ns': source['mtime_ns'],
+            'reason': document['reason'],
+            'owning_commit_sha256': document['owning_commit_sha256'],
+            'target_state': document['target_state'],
+        }
+        retirement_id = self._retirement_identifier(key)
+        expected_payload = (
+            _RETIREMENT_ROOT / f'{retirement_id}.payload').as_posix()
+        if retirement_id != match.group(1) \
+                or document['payload_path'] != expected_payload:
+            raise FormalTrainingError('formal retirement record binding differs')
+        return _RetirementBinding(
+            record_path=_RETIREMENT_ROOT / name,
+            payload_path=Path(expected_payload), source_path=source_path,
+            source_sha256=source['sha256'],
+            source_device=source['device'], source_inode=source['inode'],
+            owning_commit_sha256=document['owning_commit_sha256'],
+            reason=document['reason'], target_state=document['target_state'])
+
+    def _complete_retirement(self, binding: _RetirementBinding) -> None:
+        source_parent, source_name = self._parent_and_name(binding.source_path)
+        retirement_fd = self._retirement_fd()
+        payload_name = binding.payload_path.name
+        try:
+            source_stat = os.stat(
+                source_name, dir_fd=source_parent, follow_symlinks=False)
+        except FileNotFoundError:
+            source_stat = None
+        try:
+            payload_stat = os.stat(
+                payload_name, dir_fd=retirement_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            payload_stat = None
+        if source_stat is not None and payload_stat is not None:
+            raise FormalTrainingError(
+                'formal retirement source and payload are both active')
+        if source_stat is None and payload_stat is None:
+            raise FormalTrainingError('formal retirement payload is unavailable')
+        if source_stat is not None:
+            source_sha, source_identity = self.file_authority(
+                binding.source_path)
+            if source_sha != binding.source_sha256 or (
+                    source_identity[0], source_identity[1]) != (
+                    binding.source_device, binding.source_inode):
+                raise FormalTrainingError(
+                    'formal retirement source authority changed')
+            _rename_noreplace_at(
+                source_parent, source_name, retirement_fd, payload_name,
+                label='formal retirement payload')
+            os.fsync(source_parent)
+            os.fsync(retirement_fd)
+            payload_stat = os.stat(
+                payload_name, dir_fd=retirement_fd, follow_symlinks=False)
+            if not stat.S_ISREG(payload_stat.st_mode) or (
+                    payload_stat.st_dev, payload_stat.st_ino) != (
+                    binding.source_device, binding.source_inode):
+                try:
+                    _rename_noreplace_at(
+                        retirement_fd, payload_name, source_parent, source_name,
+                        label='formal retirement restore')
+                    os.fsync(source_parent)
+                    os.fsync(retirement_fd)
+                except FormalTrainingError:
+                    pass
+                raise FormalTrainingError(
+                    'formal retirement authority changed')
+        payload_sha, payload_identity = self.file_authority(
+            binding.payload_path)
+        if (payload_identity[0], payload_identity[1]) != (
+                binding.source_device, binding.source_inode):
+            raise FormalTrainingError('formal retirement payload rebound')
+        if binding.target_state in {'retained', 'retained-hardlink'}:
+            if payload_sha != binding.source_sha256:
+                raise FormalTrainingError('formal retirement payload differs')
+            return
+        if payload_identity[2] == 0:
+            if payload_sha != hashlib.sha256(b'').hexdigest():
+                raise FormalTrainingError('formal retirement reclaimed payload differs')
+            return
+        if payload_sha != binding.source_sha256:
+            raise FormalTrainingError('formal retirement payload differs')
+        descriptor = os.open(
+            payload_name, os.O_RDWR | os.O_NOFOLLOW
+            | getattr(os, 'O_CLOEXEC', 0), dir_fd=retirement_fd)
+        try:
+            before = os.fstat(descriptor)
+            if (before.st_dev, before.st_ino) != (
+                    binding.source_device, binding.source_inode) \
+                    or before.st_nlink != 1:
+                raise FormalTrainingError(
+                    'formal retirement payload cannot be reclaimed')
+            os.ftruncate(descriptor, 0)
+            os.fsync(descriptor)
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino, after.st_size) != (
+                    binding.source_device, binding.source_inode, 0):
+                raise FormalTrainingError(
+                    'formal retirement payload reclaim changed')
+        finally:
+            os.close(descriptor)
+        os.fsync(retirement_fd)
+
+    def reconcile_retirements(self) -> tuple[_RetirementBinding, ...]:
+        self._ensure_mutable()
+        if not self.has_directory(_RETIREMENT_ROOT):
+            return ()
+        retirement_fd = self._retirement_fd()
+        names = tuple(sorted(os.listdir(retirement_fd)))
+        record_names = {
+            match.group(1): name for name in names
+            if (match := _RETIREMENT_RECORD_RE.fullmatch(name)) is not None}
+        payload_names = {
+            match.group(1): name for name in names
+            if (match := _RETIREMENT_PAYLOAD_RE.fullmatch(name)) is not None}
+        staging_record_pattern = re.compile(
+            r'^(partial-staging\.abandoned-([A-Za-z0-9_-]{1,128}))'
+            r'\.record\.json$')
+        staging_records = {
+            match.group(1): name for name in names
+            if (match := staging_record_pattern.fullmatch(name)) is not None}
+        staging_directories = {
+            name for name in names
+            if re.fullmatch(
+                r'partial-staging\.abandoned-[A-Za-z0-9_-]{1,128}',
+                name) is not None}
+        recognized = (set(record_names.values()) | set(payload_names.values())
+                      | set(staging_records.values()) | staging_directories)
+        if recognized != set(names) or set(payload_names) - set(record_names) \
+                or staging_directories - set(staging_records):
+            raise FormalTrainingError('formal retirement inventory is invalid')
+        bindings: list[_RetirementBinding] = []
+        for retirement_id, record_name in sorted(record_names.items()):
+            payload, _identity = _read_regular_payload_at(
+                retirement_fd, record_name, label='formal retirement record')
+            binding = self._retirement_binding_from_document(
+                record_name, payload)
+            if binding.payload_path.name != f'{retirement_id}.payload':
+                raise FormalTrainingError('formal retirement inventory differs')
+            bindings.append(binding)
+        source_paths = [binding.source_path for binding in bindings]
+        payload_paths = [binding.payload_path for binding in bindings]
+        if len(set(source_paths)) != len(source_paths):
+            raise FormalTrainingError(
+                'formal retirement inventory has a duplicate source')
+        if len(set(payload_paths)) != len(payload_paths):
+            raise FormalTrainingError(
+                'formal retirement inventory has a duplicate payload')
+        valid_abandonment_owners = {
+            self.sha256(Path('run-init.json'))}
+        if self.has_directory(Path('epoch-commits')):
+            for commit_name in self.list_names(Path('epoch-commits')):
+                if re.fullmatch(r'epoch_[1-9][0-9]*\.json', commit_name):
+                    valid_abandonment_owners.add(self.sha256(
+                        Path('epoch-commits') / commit_name))
+        abandonment_sources: list[str] = []
+        for tombstone, record_name in sorted(staging_records.items()):
+            payload, _record_identity = _read_regular_payload_at(
+                retirement_fd, record_name,
+                label='formal abandonment record')
+            try:
+                document = json.loads(payload.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise FormalTrainingError(
+                    'formal abandonment record is malformed') from error
+            if not isinstance(document, Mapping) or document != {
+                    'schema_version': 1, 'run_id': self.expected.run_id,
+                    'source_path': document.get('source_path'),
+                    'tombstone_path': (
+                        _RETIREMENT_ROOT / tombstone).as_posix(),
+                    'device': document.get('device'),
+                    'inode': document.get('inode'),
+                    'tree_sha256': document.get('tree_sha256'),
+                    'owning_commit_sha256': document.get(
+                        'owning_commit_sha256')} \
+                    or not isinstance(document['source_path'], str) \
+                    or not _is_sha(document['tree_sha256']) \
+                    or not _is_sha(document['owning_commit_sha256']) \
+                    or document['owning_commit_sha256'] not in \
+                    valid_abandonment_owners \
+                    or any(isinstance(document[field], bool)
+                           or not isinstance(document[field], int)
+                           or document[field] < 0
+                           for field in ('device', 'inode')):
+                raise FormalTrainingError(
+                    'formal abandonment record is invalid')
+            try:
+                source = Path(*self._parts(document['source_path']))
+            except FormalTrainingError as error:
+                raise FormalTrainingError(
+                    'formal abandonment record is invalid') from error
+            abandonment_sources.append(source.as_posix())
+        if len(set(abandonment_sources)) != len(abandonment_sources):
+            raise FormalTrainingError(
+                'formal abandonment inventory has a duplicate source')
+        for tombstone, record_name in sorted(staging_records.items()):
+            payload, _record_identity = _read_regular_payload_at(
+                retirement_fd, record_name,
+                label='formal abandonment record')
+            try:
+                document = json.loads(payload.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise FormalTrainingError(
+                    'formal abandonment record is malformed') from error
+            if not isinstance(document, Mapping) or document != {
+                    'schema_version': 1, 'run_id': self.expected.run_id,
+                    'source_path': document.get('source_path'),
+                    'tombstone_path': (
+                        _RETIREMENT_ROOT / tombstone).as_posix(),
+                    'device': document.get('device'),
+                    'inode': document.get('inode'),
+                    'tree_sha256': document.get('tree_sha256'),
+                    'owning_commit_sha256': document.get(
+                        'owning_commit_sha256')} \
+                    or not isinstance(document['source_path'], str) \
+                    or not _is_sha(document['tree_sha256']) \
+                    or not _is_sha(document['owning_commit_sha256']) \
+                    or document['owning_commit_sha256'] not in \
+                    valid_abandonment_owners \
+                    or any(isinstance(document[field], bool)
+                           or not isinstance(document[field], int)
+                           or document[field] < 0
+                           for field in ('device', 'inode')):
+                raise FormalTrainingError(
+                    'formal abandonment record is invalid')
+            source = Path(*self._parts(document['source_path']))
+            source_parent, source_name = self._parent_and_name(source)
+            source_stat = _stat_child_nofollow(source_parent, source_name)
+            destination_stat = _stat_child_nofollow(retirement_fd, tombstone)
+            if source_stat is not None and destination_stat is not None:
+                raise FormalTrainingError(
+                    'formal abandonment has two active names')
+            if source_stat is None and destination_stat is None:
+                raise FormalTrainingError(
+                    'formal abandonment directory is unavailable')
+            if source_stat is not None:
+                if not stat.S_ISDIR(source_stat.st_mode) or (
+                        source_stat.st_dev, source_stat.st_ino) != (
+                        document['device'], document['inode']):
+                    raise FormalTrainingError(
+                        'formal abandonment source authority changed')
+                _rename_noreplace_at(
+                    source_parent, source_name, retirement_fd, tombstone,
+                    label='formal abandonment recovery')
+                os.fsync(source_parent)
+                os.fsync(retirement_fd)
+                destination_stat = os.stat(
+                    tombstone, dir_fd=retirement_fd,
+                    follow_symlinks=False)
+            if not stat.S_ISDIR(destination_stat.st_mode) or (
+                    destination_stat.st_dev, destination_stat.st_ino) != (
+                    document['device'], document['inode']):
+                raise FormalTrainingError(
+                    'formal abandonment authority changed')
+            descriptor = os.open(
+                tombstone, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                | getattr(os, 'O_CLOEXEC', 0), dir_fd=retirement_fd)
+            try:
+                if _directory_tree_digest_fd(descriptor) != \
+                        document['tree_sha256']:
+                    raise FormalTrainingError(
+                        'formal abandonment tree changed')
+            finally:
+                os.close(descriptor)
+        for binding in bindings:
+            self._complete_retirement(binding)
+        self.revalidate()
+        return tuple(bindings)
 
     def unlink(
             self, relative: Path | str, *,
             expected_sha256: str | None = None,
             expected_identity: tuple[int, int, int, int, int] | None = None,
+            retirement_reason: str = 'test-rollback',
+            owning_commit_sha256: str | None = None,
+            reclaim_space: bool = False,
             ) -> None:
         self._ensure_mutable()
-        parent, name = self._parent_and_name(relative)
+        relative_path = Path(*self._parts(relative))
+        parent, name = self._parent_and_name(relative_path)
         try:
             digest, identity = self.file_authority(relative)
         except FileNotFoundError:
@@ -1423,40 +1990,36 @@ class _FormalOutputAuthority:
         if expected_identity is not None and identity != expected_identity:
             raise FormalTrainingError(
                 'formal output unlink authority changed')
-        quarantine = f'.{name}.unlink-quarantine'
-        try:
-            os.stat(quarantine, dir_fd=parent, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise FormalTrainingError(
-                'formal output unlink quarantine already exists')
-        os.rename(name, quarantine, src_dir_fd=parent, dst_dir_fd=parent)
-        os.fsync(parent)
-        quarantine_relative = Path(relative).parent / quarantine
-        try:
-            moved_digest, moved_identity = self.file_authority(
-                quarantine_relative)
-        except Exception:
-            raise FormalTrainingError(
-                'formal output unlink quarantine authority changed')
-        # A same-directory rename legitimately changes ctime; inode, size,
-        # mtime, and bytes must remain the captured authority.
-        if moved_identity[:4] != identity[:4] or moved_digest != digest:
-            try:
-                os.stat(name, dir_fd=parent, follow_symlinks=False)
-            except FileNotFoundError:
-                try:
-                    os.rename(
-                        quarantine, name,
-                        src_dir_fd=parent, dst_dir_fd=parent)
-                    os.fsync(parent)
-                except OSError:
-                    pass
-            raise FormalTrainingError(
-                'formal output unlink authority changed')
-        os.unlink(quarantine, dir_fd=parent)
-        os.fsync(parent)
+        if retirement_reason not in _RETIREMENT_REASONS:
+            raise FormalTrainingError('formal retirement reason is invalid')
+        owning = owning_commit_sha256 or digest
+        if not _is_sha(owning):
+            raise FormalTrainingError('formal retirement commit binding is invalid')
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISREG(named.st_mode) or (
+                named.st_dev, named.st_ino, named.st_size,
+                named.st_mtime_ns, named.st_ctime_ns) != identity:
+            raise FormalTrainingError('formal retirement source authority changed')
+        target_state = 'retained'
+        if reclaim_space:
+            target_state = (
+                'reclaimed-zero' if named.st_nlink == 1
+                else 'retained-hardlink')
+        retirement_id, record_payload = self._retirement_document(
+            relative_path, source_sha256=digest, source_identity=identity,
+            reason=retirement_reason, owning_commit_sha256=owning,
+            target_state=target_state)
+        retirement_fd = self._retirement_fd()
+        record_name = f'{retirement_id}.record.json'
+        _write_immutable_file_at(
+            retirement_fd, record_name, record_payload,
+            pending_name=f'.{record_name}.pending',
+            label='formal retirement record',
+            allow_existing_identical=True)
+        binding = self._retirement_binding_from_document(
+            record_name, record_payload)
+        self._complete_retirement(binding)
+        self.revalidate()
 
     def list_names(self, relative: Path | str | None = None) -> tuple[str, ...]:
         self._ensure_owner()
@@ -2095,24 +2658,8 @@ def _destination_root(destination: Path, relative_parent: Path) -> Path:
 
 
 def _atomic_write_bytes(destination: Path, payload: bytes) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_temporary = tempfile.mkstemp(
-        prefix=f'.{destination.name}.', suffix='.tmp', dir=destination.parent)
-    temporary = Path(raw_temporary)
-    try:
-        with os.fdopen(descriptor, 'wb') as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
-        directory = os.open(destination.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    raise FormalTrainingError(
+        'ambiguous pathname artifact publication is forbidden')
 
 
 def write_formal_run_init(
@@ -2148,32 +2695,45 @@ def write_formal_run_init(
         except FileNotFoundError:
             observed = None
         if pending_stat is not None:
-            pending_payload, pending_identity = _FormalOutputAuthority._read_at(
+            pending_payload, pending_identity = _read_regular_payload_at(
                 output_fd, pending, label='immutable run init pending')
             if pending_payload != payload:
                 raise FormalTrainingError(
                     'immutable run init pending payload differs')
             if observed is None:
-                try:
-                    os.link(
-                        pending, 'run-init.json', src_dir_fd=output_fd,
-                        dst_dir_fd=output_fd, follow_symlinks=False)
-                except FileExistsError as error:
-                    raise FormalTrainingError(
-                        'immutable run init pending publication collided') \
-                        from error
+                _rename_noreplace_at(
+                    output_fd, pending, output_fd, 'run-init.json',
+                    label='immutable run init pending publication')
+                os.fsync(output_fd)
                 observed = os.stat(
                     'run-init.json', dir_fd=output_fd,
                     follow_symlinks=False)
-            final_payload, final_identity = _FormalOutputAuthority._read_at(
-                output_fd, 'run-init.json', label='immutable run init')
-            if final_payload != payload or pending_identity[:3] != \
-                    final_identity[:3]:
-                raise FormalTrainingError(
-                    'immutable run init pending publication differs')
-            os.unlink(pending, dir_fd=output_fd)
-            os.fsync(output_fd)
-            pending_stat = None
+                final_payload, final_identity = _read_regular_payload_at(
+                    output_fd, 'run-init.json', label='immutable run init')
+                if final_payload != payload or pending_identity[:4] != \
+                        final_identity[:4]:
+                    raise FormalTrainingError(
+                        'immutable run init pending publication differs')
+                pending_stat = None
+            else:
+                final_payload, final_identity = _read_regular_payload_at(
+                    output_fd, 'run-init.json', label='immutable run init')
+                if final_payload != payload or pending_identity[:3] != \
+                        final_identity[:3]:
+                    raise FormalTrainingError(
+                        'immutable run init pending publication differs')
+                # A legacy hard-link publication can leave two names for the
+                # same inode.  Retire only the pending alias; never truncate it.
+                with _FormalOutputAuthority(root, init) as authority:
+                    pending_sha, full_identity = authority.file_authority(
+                        Path(pending))
+                    authority.unlink(
+                        Path(pending), expected_sha256=pending_sha,
+                        expected_identity=full_identity,
+                        retirement_reason='run-init-linked-pending',
+                        owning_commit_sha256=hashlib.sha256(payload).hexdigest(),
+                        reclaim_space=True)
+                pending_stat = None
         if observed is not None:
             existing, _identity = _FormalOutputAuthority._read_at(
                 output_fd, 'run-init.json', label='immutable run init')
@@ -2181,58 +2741,9 @@ def write_formal_run_init(
                 raise FormalTrainingError(
                     'immutable run init already differs')
         else:
-            try:
-                descriptor = os.open(
-                    pending,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                    | getattr(os, 'O_CLOEXEC', 0),
-                    0o600, dir_fd=output_fd)
-            except FileExistsError as error:
-                raise FormalTrainingError(
-                    'immutable run init has a pending transaction') from error
-            try:
-                view = memoryview(payload)
-                while view:
-                    written = os.write(descriptor, view)
-                    view = view[written:]
-                os.fsync(descriptor)
-                created_stat = os.fstat(descriptor)
-            finally:
-                os.close(descriptor)
-            created_identity = (
-                created_stat.st_dev, created_stat.st_ino,
-                created_stat.st_size, created_stat.st_mtime_ns)
-            pending_payload, pending_identity = \
-                _FormalOutputAuthority._read_at(
-                    output_fd, pending,
-                    label='immutable run init pending')
-            if pending_payload != payload \
-                    or pending_identity != created_identity:
-                raise FormalTrainingError(
-                    'immutable run init pending authority changed')
-            try:
-                os.link(
-                    pending, 'run-init.json', src_dir_fd=output_fd,
-                    dst_dir_fd=output_fd, follow_symlinks=False)
-            except FileExistsError as error:
-                raise FormalTrainingError(
-                    'immutable run init already exists') from error
-            pending_stat = os.stat(
-                pending, dir_fd=output_fd, follow_symlinks=False)
-            final_stat = os.stat(
-                'run-init.json', dir_fd=output_fd,
-                follow_symlinks=False)
-            if (pending_stat.st_dev, pending_stat.st_ino,
-                    pending_stat.st_size, pending_stat.st_mtime_ns) != \
-                    created_identity or (
-                    pending_stat.st_dev, pending_stat.st_ino,
-                    pending_stat.st_size) != (
-                    final_stat.st_dev, final_stat.st_ino,
-                    final_stat.st_size):
-                raise FormalTrainingError(
-                    'immutable run init publication changed')
-            os.unlink(pending, dir_fd=output_fd)
-            os.fsync(output_fd)
+            _write_immutable_file_at(
+                output_fd, 'run-init.json', payload, pending_name=pending,
+                label='immutable run init')
         held.revalidate_directories()
         final_payload, _identity = _FormalOutputAuthority._read_at(
             output_fd, 'run-init.json', label='immutable run init')
@@ -2466,21 +2977,8 @@ def _resume_document(
 
 
 def _atomic_torch_save(document: Mapping[str, Any], destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_temporary = tempfile.mkstemp(
-        prefix=f'.{destination.name}.', suffix='.tmp', dir=destination.parent)
-    os.close(descriptor)
-    temporary = Path(raw_temporary)
-    try:
-        torch.save(dict(document), temporary)
-        with temporary.open('rb') as stream:
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
-        _fsync_directory(destination.parent)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-            _fsync_directory(destination.parent)
+    raise FormalTrainingError(
+        'ambiguous pathname tensor publication is forbidden')
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -2492,8 +2990,8 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _durable_unlink(path: Path) -> None:
-    path.unlink()
-    _fsync_directory(path.parent)
+    raise FormalTrainingError(
+        'online physical artifact deletion is forbidden')
 
 
 def _training_log_record(
@@ -2780,10 +3278,24 @@ def _recover_training_lineage_held(
         dataset_size: int, authority: _FormalOutputAuthority
         ) -> ResumeState | None:
     authority.revalidate()
+    prior_retirements = authority.reconcile_retirements()
     _recover_linked_pending_publications(authority)
     chain = _load_epoch_commit_chain(
         output, expected, authority=authority)
     committed = len(chain.documents)
+    for retirement in prior_retirements:
+        if retirement.reason != 'stale-checkpoint':
+            continue
+        match = re.fullmatch(r'epoch_([1-9][0-9]*)\.pth',
+                             retirement.source_path.name)
+        if match is None:
+            raise FormalTrainingError(
+                'stale checkpoint retirement source is invalid')
+        epoch = int(match.group(1))
+        if epoch > committed or retirement.owning_commit_sha256 != \
+                chain.sha256s[epoch - 1]:
+            raise FormalTrainingError(
+                'stale checkpoint retirement commit binding differs')
     _recover_linked_pending_publications(
         authority, committed=committed)
     _recover_exact_pending_transaction(
@@ -2849,7 +3361,11 @@ def _recover_training_lineage_held(
             authority.unlink(
                 Path('training.jsonl'),
                 expected_sha256=observed_log_authority[0],
-                expected_identity=observed_log_authority[1])
+                expected_identity=observed_log_authority[1],
+                retirement_reason='empty-log-rollback',
+                owning_commit_sha256=(
+                    chain.sha256s[-1] if chain.sha256s else
+                    authority.sha256(Path('run-init.json'))))
     _recover_best_lineage_state(
         root, expected, chain, authority=authority)
     if uncommitted:
@@ -2859,7 +3375,12 @@ def _recover_training_lineage_held(
         entry = checkpoint_entries[next_epoch]
         authority.unlink(
             Path(entry.path.name), expected_sha256=entry.sha256,
-            expected_identity=entry.identity)
+            expected_identity=entry.identity,
+            retirement_reason='uncommitted-checkpoint',
+            owning_commit_sha256=(
+                chain.sha256s[-1] if chain.sha256s else
+                authority.sha256(Path('run-init.json'))),
+            reclaim_space=True)
 
     if not committed:
         return None
@@ -2868,7 +3389,11 @@ def _recover_training_lineage_held(
                 Path(entry.path.name)) is not None:
             authority.unlink(
                 Path(entry.path.name), expected_sha256=entry.sha256,
-                expected_identity=entry.identity)
+                expected_identity=entry.identity,
+                retirement_reason='stale-checkpoint',
+                owning_commit_sha256=chain.sha256s[epoch - 1],
+                reclaim_space=True)
+    authority.reconcile_retirements()
     latest = output / f'epoch_{committed}.pth'
     result = validate_resume_checkpoint(
         latest, expected, repository_root=root, dataset_size=dataset_size,
@@ -2919,7 +3444,10 @@ def _recover_exact_pending_transaction(
     digest, identity = inventory[pending[0]]
     authority.unlink(
         pending[0], expected_sha256=digest,
-        expected_identity=identity)
+        expected_identity=identity,
+        retirement_reason='exact-next-pending',
+        owning_commit_sha256=digest,
+        reclaim_space=pending[0].name.endswith('.pth.pending'))
 
 
 def _recover_linked_pending_publications(
@@ -2976,7 +3504,9 @@ def _recover_linked_pending_publications(
     if is_mutable:
         authority.unlink(
             pending_relative, expected_sha256=pending_sha,
-            expected_identity=pending_identity)
+            expected_identity=pending_identity,
+            retirement_reason='mutable-pending-rollback',
+            owning_commit_sha256=pending_sha)
         return
     if final_relative == Path('train-result.json'):
         if committed is None:
@@ -2995,7 +3525,10 @@ def _recover_linked_pending_publications(
                 'immutable pending publication differs from final authority')
         authority.unlink(
             pending_relative, expected_sha256=pending_sha,
-            expected_identity=pending_identity)
+            expected_identity=pending_identity,
+            retirement_reason='linked-immutable-pending',
+            owning_commit_sha256=final_sha,
+            reclaim_space=True)
 
 
 def _validate_completed_best_decision_payload(
@@ -3305,7 +3838,10 @@ def _write_resume_checkpoint_held(
                         'stale checkpoint differs from commit authority')
                 authority.unlink(
                     Path(stale.name), expected_sha256=committed_sha,
-                    expected_identity=stale_identity)
+                    expected_identity=stale_identity,
+                    retirement_reason='stale-checkpoint',
+                    owning_commit_sha256=committed_chain.sha256s[
+                        stale_epoch - 1], reclaim_space=True)
     authority.revalidate()
     return target
 
@@ -3706,59 +4242,161 @@ def _stat_child_nofollow(directory_fd: int, name: str) -> os.stat_result | None:
 
 
 def _purge_directory_fd(directory_fd: int) -> None:
-    with os.scandir(directory_fd) as entries:
-        names = tuple(entry.name for entry in entries)
+    del directory_fd
+    raise FormalTrainingError(
+        'online recursive purge is forbidden; retain a whole-directory tombstone')
+
+
+def _directory_tree_digest_fd(directory_fd: int) -> str:
+    digest = hashlib.sha256()
+    names = tuple(sorted(os.listdir(directory_fd)))
     for name in names:
+        _single_component_name(name, label='staging tree child')
         observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISDIR(observed.st_mode):
-            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-            child_fd = os.open(name, flags, dir_fd=directory_fd)
+        digest.update(name.encode('utf-8', errors='surrogateescape'))
+        if stat.S_ISREG(observed.st_mode):
+            payload, identity = _read_regular_payload_at(
+                directory_fd, name, label='staging tree file')
+            if identity[:4] != (
+                    observed.st_dev, observed.st_ino, observed.st_size,
+                    observed.st_mtime_ns):
+                raise FormalTrainingError('staging tree file authority changed')
+            digest.update(b'F')
+            digest.update(hashlib.sha256(payload).digest())
+        elif stat.S_ISDIR(observed.st_mode):
+            child = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                | getattr(os, 'O_CLOEXEC', 0), dir_fd=directory_fd)
             try:
-                opened = os.fstat(child_fd)
+                opened = os.fstat(child)
                 if (opened.st_dev, opened.st_ino) != (
                         observed.st_dev, observed.st_ino):
                     raise FormalTrainingError(
-                        'partial staging changed during cleanup')
-                _purge_directory_fd(child_fd)
+                        'staging tree directory authority changed')
+                child_digest = _directory_tree_digest_fd(child)
+                current = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (
+                        opened.st_dev, opened.st_ino):
+                    raise FormalTrainingError(
+                        'staging tree directory authority changed')
             finally:
-                os.close(child_fd)
-            current = os.stat(
-                name, dir_fd=directory_fd, follow_symlinks=False)
-            if (current.st_dev, current.st_ino) != (
-                    observed.st_dev, observed.st_ino):
-                raise FormalTrainingError(
-                    'partial staging changed during cleanup')
-            os.rmdir(name, dir_fd=directory_fd)
+                os.close(child)
+            digest.update(b'D')
+            digest.update(bytes.fromhex(child_digest))
         else:
-            os.unlink(name, dir_fd=directory_fd)
-    os.fsync(directory_fd)
+            raise FormalTrainingError('staging tree child is unsafe')
+    return digest.hexdigest()
 
 
-def _write_atomic_file_at(
-        directory_fd: int, destination_name: str, payload: bytes,
-        *, temporary_name: str) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-    descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+def _ensure_directory_at(
+        parent_fd: int, name: str, *, label: str) -> tuple[int, tuple[int, int]]:
+    _single_component_name(name, label=label)
     try:
-        view = memoryview(payload)
-        while view:
-            written = os.write(descriptor, view)
-            view = view[written:]
-        os.fsync(descriptor)
-    finally:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except FileExistsError:
+        pass
+    descriptor = os.open(
+        name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        | getattr(os, 'O_CLOEXEC', 0), dir_fd=parent_fd)
+    observed = os.fstat(descriptor)
+    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    identity = (observed.st_dev, observed.st_ino)
+    if not stat.S_ISDIR(observed.st_mode) or identity != (
+            named.st_dev, named.st_ino):
         os.close(descriptor)
+        raise FormalTrainingError(f'{label} authority changed')
+    return descriptor, identity
+
+
+def _abandon_staging_directory_at(
+        root_fd: int, *, request_id: str,
+        owning_authority_sha256: str) -> str | None:
+    if not _is_sha(owning_authority_sha256):
+        raise FormalTrainingError(
+            'partial staging owning authority is invalid')
+    retired_fd, retired_identity = _ensure_directory_at(
+        root_fd, _RETIREMENT_ROOT.name, label='stop retirement root')
+    tombstone = f'{_STOP_STAGING_NAME}.abandoned-{request_id}'
+    record_name = f'{tombstone}.record.json'
     try:
-        os.replace(
-            temporary_name, destination_name,
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        os.fsync(directory_fd)
-    except Exception:
+        staging_stat = _stat_child_nofollow(root_fd, _STOP_STAGING_NAME)
+        tombstone_stat = _stat_child_nofollow(retired_fd, tombstone)
+        if staging_stat is None and tombstone_stat is None:
+            return None
+        if staging_stat is not None and tombstone_stat is not None:
+            raise FormalTrainingError(
+                'partial staging retirement has two active names')
+        if staging_stat is not None:
+            if not stat.S_ISDIR(staging_stat.st_mode):
+                raise FormalTrainingError('partial staging authority is unsafe')
+            staging_fd = os.open(
+                _STOP_STAGING_NAME,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                | getattr(os, 'O_CLOEXEC', 0), dir_fd=root_fd)
+        else:
+            staging_fd = os.open(
+                tombstone,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                | getattr(os, 'O_CLOEXEC', 0), dir_fd=retired_fd)
         try:
-            os.unlink(temporary_name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-        except FileNotFoundError:
-            pass
-        raise
+            opened = os.fstat(staging_fd)
+            identity = (opened.st_dev, opened.st_ino)
+            expected_stat = staging_stat or tombstone_stat
+            if identity != (expected_stat.st_dev, expected_stat.st_ino):
+                raise FormalTrainingError('partial staging authority changed')
+            tree_sha256 = _directory_tree_digest_fd(staging_fd)
+            record_payload = _canonical_json_bytes({
+                'schema_version': 1, 'request_id': request_id,
+                'source_path': _STOP_STAGING_NAME,
+                'tombstone_path': (_RETIREMENT_ROOT / tombstone).as_posix(),
+                'device': identity[0], 'inode': identity[1],
+                'tree_sha256': tree_sha256,
+                'owning_authority_sha256': owning_authority_sha256})
+            _write_immutable_file_at(
+                retired_fd, record_name, record_payload,
+                pending_name=f'.{record_name}.pending',
+                label='partial staging retirement record',
+                allow_existing_identical=True)
+            if staging_stat is not None:
+                _rename_noreplace_at(
+                    root_fd, _STOP_STAGING_NAME, retired_fd, tombstone,
+                    label='partial staging abandonment')
+                os.fsync(root_fd)
+                os.fsync(retired_fd)
+            moved = os.stat(
+                tombstone, dir_fd=retired_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(moved.st_mode) or (
+                    moved.st_dev, moved.st_ino) != identity:
+                if staging_stat is not None:
+                    try:
+                        _rename_noreplace_at(
+                            retired_fd, tombstone, root_fd,
+                            _STOP_STAGING_NAME,
+                            label='partial staging abandonment restore')
+                        os.fsync(root_fd)
+                        os.fsync(retired_fd)
+                    except FormalTrainingError:
+                        pass
+                raise FormalTrainingError('partial staging authority changed')
+            if _directory_tree_digest_fd(staging_fd) != tree_sha256:
+                raise FormalTrainingError('partial staging tree changed')
+            named_retired = os.stat(
+                _RETIREMENT_ROOT.name, dir_fd=root_fd,
+                follow_symlinks=False)
+            if (named_retired.st_dev, named_retired.st_ino) != retired_identity:
+                raise FormalTrainingError('stop retirement root authority changed')
+        finally:
+            os.close(staging_fd)
+        return (_RETIREMENT_ROOT / tombstone).as_posix()
+    finally:
+        os.close(retired_fd)
+
+
+def _write_atomic_file_at(*_args, **_kwargs) -> None:
+    raise FormalTrainingError(
+        'ambiguous atomic file publication is forbidden')
 
 
 def _validate_stop_boundary(
@@ -3994,7 +4632,13 @@ def _write_formal_training_stop_ack(
         raise FormalTrainingError(
             'training resume is not the latest committed boundary')
     if authority.has_directory(Path(_STOP_STAGING_NAME)):
-        authority.purge_directory(Path(_STOP_STAGING_NAME))
+        owning_commit_sha256 = (
+            chain.sha256s[-1] if chain.sha256s else
+            authority.sha256(Path('run-init.json')))
+        authority.abandon_directory(
+            Path(_STOP_STAGING_NAME), tombstone_name=(
+                f'{_STOP_STAGING_NAME}.abandoned-{request.request_id}'),
+            owning_commit_sha256=owning_commit_sha256)
     if authority.read_optional(Path(_STOP_ACKNOWLEDGEMENT_NAME)) is not None:
         raise FormalTrainingError('stop acknowledgement already exists')
     acknowledgement = StopAcknowledgement(
@@ -4086,44 +4730,9 @@ def write_stop_acknowledgement(
         if _stat_child_nofollow(
                 root_fd, _STOP_ACKNOWLEDGEMENT_NAME) is not None:
             raise FormalTrainingError('stop acknowledgement already exists')
-        staging_stat = _stat_child_nofollow(root_fd, _STOP_STAGING_NAME)
-        if staging_stat is not None:
-            if not stat.S_ISDIR(staging_stat.st_mode):
-                raise FormalTrainingError('partial staging authority is unsafe')
-            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-            staging_fd = os.open(_STOP_STAGING_NAME, flags, dir_fd=root_fd)
-            try:
-                opened = os.fstat(staging_fd)
-                if (opened.st_dev, opened.st_ino) != (
-                        staging_stat.st_dev, staging_stat.st_ino):
-                    raise FormalTrainingError(
-                        'partial staging authority changed')
-                abandoned_name = (
-                    f'.{_STOP_STAGING_NAME}.abandoned-{request.request_id}')
-                if _stat_child_nofollow(root_fd, abandoned_name) is not None:
-                    raise FormalTrainingError(
-                        'partial staging abandonment collides')
-                os.rename(
-                    _STOP_STAGING_NAME, abandoned_name,
-                    src_dir_fd=root_fd, dst_dir_fd=root_fd)
-                os.fsync(root_fd)
-                renamed = os.stat(
-                    abandoned_name, dir_fd=root_fd,
-                    follow_symlinks=False)
-                if (renamed.st_dev, renamed.st_ino) != (
-                        opened.st_dev, opened.st_ino):
-                    raise FormalTrainingError(
-                        'partial staging authority changed')
-                _purge_directory_fd(staging_fd)
-            finally:
-                os.close(staging_fd)
-            renamed = os.stat(
-                abandoned_name, dir_fd=root_fd, follow_symlinks=False)
-            if (renamed.st_dev, renamed.st_ino) != (
-                    staging_stat.st_dev, staging_stat.st_ino):
-                raise FormalTrainingError('partial staging authority changed')
-            os.rmdir(abandoned_name, dir_fd=root_fd)
-            os.fsync(root_fd)
+        _abandon_staging_directory_at(
+            root_fd, request_id=request.request_id,
+            owning_authority_sha256=request.input_sha256)
         resume_document = {
             'kind': ('training' if isinstance(resume, TrainingResumeAuthority)
                      else 'stateless'),
@@ -4136,10 +4745,20 @@ def write_stop_acknowledgement(
             'resume': resume_document,
             'exit_code': 75,
         })
-        _write_atomic_file_at(
+        _write_immutable_file_at(
             root_fd, _STOP_ACKNOWLEDGEMENT_NAME, payload,
-            temporary_name=(
-                f'.{_STOP_ACKNOWLEDGEMENT_NAME}.tmp-{request.request_id}'))
+            pending_name=f'.{_STOP_ACKNOWLEDGEMENT_NAME}.pending',
+            label='stop acknowledgement')
+        observed_ack, _ack_identity = _read_regular_payload_at(
+            root_fd, _STOP_ACKNOWLEDGEMENT_NAME,
+            label='stop acknowledgement')
+        if observed_ack != payload:
+            raise FormalTrainingError('stop acknowledgement changed')
+        reopened_fd, reopened_stat = _open_absolute_directory_nofollow(root)
+        os.close(reopened_fd)
+        if (reopened_stat.st_dev, reopened_stat.st_ino) != (
+                root_stat.st_dev, root_stat.st_ino):
+            raise FormalTrainingError('stage output root authority changed')
         return acknowledgement
     finally:
         os.close(root_fd)
@@ -4180,33 +4799,8 @@ def _restore_rng_state(value: Mapping[str, Any]) -> None:
 
 def _atomic_save_tensor_mapping(
         tensors: Mapping[str, torch.Tensor], destination: Path) -> None:
-    if not tensors or any(not isinstance(key, str)
-                          or not isinstance(value, torch.Tensor)
-                          for key, value in tensors.items()):
-        raise FormalTrainingError('pose checkpoint tensor mapping is invalid')
-    _validate_finite_tree(tensors, 'pose checkpoint')
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f'.{destination.name}.', suffix='.tmp', dir=destination.parent)
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        torch.save({
-            key: value.detach().cpu() for key, value in tensors.items()},
-            temporary)
-        loaded = torch.load(temporary, map_location='cpu', weights_only=True)
-        if set(loaded) != set(tensors) \
-                or any(not isinstance(value, torch.Tensor)
-                       for value in loaded.values()):
-            raise FormalTrainingError('pose checkpoint roundtrip failed')
-        with temporary.open('rb') as stream:
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
-        _fsync_directory(destination.parent)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-            _fsync_directory(destination.parent)
+    raise FormalTrainingError(
+        'pathname tensor mapping publication is forbidden')
 
 
 def _file_binding(root: Path, path: Path) -> FileBinding:
@@ -4388,53 +4982,31 @@ def _read_optional_output_child(
 def _replace_output_child(
         output: Path, name: str, payload: bytes | None, *,
         authority: _FormalOutputAuthority | None = None) -> None:
-    if authority is not None:
-        captured = authority.read_optional(Path(name))
-        prior_authority = None
-        if captured is not None:
-            prior_authority = authority.file_authority(Path(name))
-            if hashlib.sha256(captured).hexdigest() != prior_authority[0]:
-                raise FormalTrainingError(
-                    'formal output child authority changed during capture')
-        if payload is None:
-            if prior_authority is not None:
-                authority.unlink(
-                    Path(name), expected_sha256=prior_authority[0],
-                    expected_identity=prior_authority[1])
-        else:
-            if prior_authority is None:
-                authority.write_mutable(Path(name), payload)
-            else:
-                authority.write_mutable(
-                    Path(name), payload,
-                    expected_previous_sha256=prior_authority[0],
-                    expected_previous_identity=prior_authority[1])
-        authority.revalidate()
-        return
-    output_fd, output_stat = _open_absolute_directory_nofollow(
-        output, label='formal output root')
-    try:
-        if payload is None:
-            observed = _stat_child_nofollow(output_fd, name)
-            if observed is not None:
-                if not stat.S_ISREG(observed.st_mode):
-                    raise FormalTrainingError(
-                        'best checkpoint pointer is unsafe')
-                os.unlink(name, dir_fd=output_fd)
-                os.fsync(output_fd)
-        else:
-            _write_atomic_file_at(
-                output_fd, name, payload,
-                temporary_name=(
-                    f'.{name}.tmp-{os.getpid()}-{time.time_ns()}'))
-    finally:
-        os.close(output_fd)
-    reopened, reopened_stat = _open_absolute_directory_nofollow(
-        output, label='formal output root')
-    os.close(reopened)
-    if (reopened_stat.st_dev, reopened_stat.st_ino) != (
-            output_stat.st_dev, output_stat.st_ino):
-        raise FormalTrainingError('formal output root authority changed')
+    if authority is None:
+        raise FormalTrainingError(
+            'held formal output authority is required')
+    captured = authority.read_optional(Path(name))
+    prior_authority = None
+    if captured is not None:
+        prior_authority = authority.file_authority(Path(name))
+        if hashlib.sha256(captured).hexdigest() != prior_authority[0]:
+            raise FormalTrainingError(
+                'formal output child authority changed during capture')
+    if payload is None:
+        if prior_authority is not None:
+            authority.unlink(
+                Path(name), expected_sha256=prior_authority[0],
+                expected_identity=prior_authority[1],
+                retirement_reason='best-cleanup',
+                owning_commit_sha256=prior_authority[0])
+    elif prior_authority is None:
+        authority.write_mutable(Path(name), payload)
+    else:
+        authority.write_mutable(
+            Path(name), payload,
+            expected_previous_sha256=prior_authority[0],
+            expected_previous_identity=prior_authority[1])
+    authority.revalidate()
 
 
 def _best_epoch_authority(
@@ -4499,111 +5071,14 @@ def _write_best_decision(
         root: Path, init: FormalRunInit, *, completed_epoch: int,
         metric: float, checkpoint: Path,
         authority: _FormalOutputAuthority | None = None) -> Path:
-    if authority is not None:
-        return _write_best_decision_held(
-            root, init, completed_epoch=completed_epoch, metric=metric,
-            checkpoint=checkpoint, authority=authority)
-    output = root / init.output_root
-    decisions = output / 'best-lineages'
-    destination = _best_decision_path(output, completed_epoch)
-    previous = None
-    pointer = output / 'best-lineage.json'
-    output_fd, output_stat = _open_absolute_directory_nofollow(
-        output, label='formal output root')
-    pointer_payload = None
-    pointer_stat = None
-    try:
-        observed_pointer = _stat_child_nofollow(
-            output_fd, 'best-lineage.json')
-        if observed_pointer is not None:
-            pointer_payload, pointer_stat = _read_regular_file_at(
-                output_fd, 'best-lineage.json',
-                label='best checkpoint pointer')
-            pointer_document, predecessor, predecessor_epoch = \
-                _parse_best_pointer(
-                    pointer_payload, output,
-                    completed_epoch=completed_epoch - 1)
-            _document, _path, predecessor_sha = _load_best_decision(
-                output, init, predecessor_epoch)
-            if pointer_document['decision']['sha256'] != predecessor_sha:
-                raise FormalTrainingError(
-                    'best checkpoint pointer authority mismatch')
-            previous = dict(pointer_document['decision'])
-        observed_decisions = _stat_child_nofollow(
-            output_fd, 'best-lineages')
-        if observed_decisions is None:
-            os.mkdir('best-lineages', 0o700, dir_fd=output_fd)
-            os.fsync(output_fd)
-        elif not stat.S_ISDIR(observed_decisions.st_mode):
-            raise FormalTrainingError('best decision root is unsafe')
-        decision_fd = os.open(
-            'best-lineages', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            | os.O_CLOEXEC, dir_fd=output_fd)
-        try:
-            opened_decisions = os.fstat(decision_fd)
-            current_decisions = os.stat(
-                'best-lineages', dir_fd=output_fd, follow_symlinks=False)
-            if (opened_decisions.st_dev, opened_decisions.st_ino) != (
-                    current_decisions.st_dev, current_decisions.st_ino):
-                raise FormalTrainingError('best decision root changed')
-            if _stat_child_nofollow(decision_fd, destination.name) is not None:
-                raise FormalTrainingError('best decision is immutable')
-        finally:
-            os.close(decision_fd)
-    except Exception:
-        os.close(output_fd)
-        raise
-    payload = _canonical_json_bytes({
-        'schema_version': 1,
-        'identity': {
-            'run_id': init.run_id, 'role': init.role, 'seed': init.seed},
-        'completed_epoch': completed_epoch,
-        'metric': metric,
-        'checkpoint': {
-            'path': checkpoint.name, 'sha256': _sha256_file(checkpoint)},
-        'previous_decision': previous,
-    })
-    try:
-        decision_fd = os.open(
-            'best-lineages', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            | os.O_CLOEXEC, dir_fd=output_fd)
-        try:
-            _write_atomic_file_at(
-                decision_fd, destination.name, payload,
-                temporary_name=(
-                    f'.{destination.name}.tmp-{os.getpid()}-'
-                    f'{time.time_ns()}'))
-        finally:
-            os.close(decision_fd)
-        current_pointer = _stat_child_nofollow(
-            output_fd, 'best-lineage.json')
-        if pointer_stat is None:
-            if current_pointer is not None:
-                raise FormalTrainingError(
-                    'best checkpoint pointer authority changed')
-        else:
-            current_payload, current_stat = _read_regular_file_at(
-                output_fd, 'best-lineage.json',
-                label='best checkpoint pointer')
-            if current_payload != pointer_payload or (
-                    current_stat.st_dev, current_stat.st_ino) != (
-                        pointer_stat.st_dev, pointer_stat.st_ino):
-                raise FormalTrainingError(
-                    'best checkpoint pointer authority changed')
-        _write_atomic_file_at(
-            output_fd, 'best-lineage.json',
-            _best_pointer_bytes(output, destination),
-            temporary_name=(
-                f'.best-lineage.json.tmp-{os.getpid()}-{time.time_ns()}'))
-        reopened_fd, reopened_stat = _open_absolute_directory_nofollow(
-            output, label='formal output root')
-        os.close(reopened_fd)
-        if (reopened_stat.st_dev, reopened_stat.st_ino) != (
-                output_stat.st_dev, output_stat.st_ino):
-            raise FormalTrainingError('formal output root authority changed')
-    finally:
-        os.close(output_fd)
-    return destination
+    if authority is None:
+        with _FormalOutputAuthority(root, init) as held:
+            return _write_best_decision_held(
+                root, init, completed_epoch=completed_epoch, metric=metric,
+                checkpoint=checkpoint, authority=held)
+    return _write_best_decision_held(
+        root, init, completed_epoch=completed_epoch, metric=metric,
+        checkpoint=checkpoint, authority=authority)
 
 
 def _write_best_decision_held(
@@ -4777,8 +5252,15 @@ def _recover_best_lineage_state(
         chain: _EpochCommitChain, *,
         authority: _FormalOutputAuthority | None = None
         ) -> tuple[float, Path | None]:
+    if authority is None:
+        with _FormalOutputAuthority(root, init) as held:
+            return _recover_best_lineage_state(
+                root, init, chain, authority=held)
     output = root / init.output_root
     committed = len(chain.documents)
+    cleanup_binding = (
+        chain.sha256s[-1] if chain.sha256s else
+        authority.sha256(Path('run-init.json')))
     committed_best = [document['best'] for document in chain.documents]
     has_best = [item is not None for item in committed_best]
     if any(has_best):
@@ -4896,19 +5378,15 @@ def _recover_best_lineage_state(
     if extras:
         extra_document = decisions[extras[0]]
         extra_checkpoint = output / extra_document['checkpoint']['path']
-        if authority is None:
-            _durable_unlink(_best_decision_path(output, extras[0]))
-        else:
-            extra_sha, extra_identity = decision_authorities[extras[0]]
-            authority.unlink(
-                Path('best-lineages') / f'epoch_{extras[0]}.json',
-                expected_sha256=extra_sha,
-                expected_identity=extra_identity)
+        extra_sha, extra_identity = decision_authorities[extras[0]]
+        authority.unlink(
+            Path('best-lineages') / f'epoch_{extras[0]}.json',
+            expected_sha256=extra_sha,
+            expected_identity=extra_identity,
+            retirement_reason='uncommitted-best',
+            owning_commit_sha256=cleanup_binding)
         if latest_checkpoint is None or extra_checkpoint != latest_checkpoint:
-            if authority is None:
-                if extra_checkpoint.exists():
-                    _durable_unlink(extra_checkpoint)
-            elif authority.read_optional(
+            if authority.read_optional(
                     Path(extra_checkpoint.name)) is not None:
                 extra_sha, extra_identity = tensor_authorities[
                     extra_checkpoint.name]
@@ -4918,27 +5396,30 @@ def _recover_best_lineage_state(
                 authority.unlink(
                     Path(extra_checkpoint.name),
                     expected_sha256=extra_sha,
-                    expected_identity=extra_identity)
+                    expected_identity=extra_identity,
+                    retirement_reason='uncommitted-best',
+                    owning_commit_sha256=cleanup_binding,
+                    reclaim_space=True)
     orphan = output / allowed_orphan
-    if authority is None:
-        if orphan.exists():
-            _durable_unlink(orphan)
-    elif authority.read_optional(Path(orphan.name)) is not None:
+    if authority.read_optional(Path(orphan.name)) is not None:
         orphan_sha, orphan_identity = tensor_authorities[orphan.name]
         authority.unlink(
             Path(orphan.name), expected_sha256=orphan_sha,
-            expected_identity=orphan_identity)
+            expected_identity=orphan_identity,
+            retirement_reason='uncommitted-best',
+            owning_commit_sha256=cleanup_binding,
+            reclaim_space=True)
 
     for name, checkpoint in tensor_paths.items():
         if checkpoint != latest_checkpoint:
-            if authority is None:
-                if checkpoint.exists():
-                    _durable_unlink(checkpoint)
-            elif authority.read_optional(Path(name)) is not None:
+            if authority.read_optional(Path(name)) is not None:
                 checkpoint_sha, checkpoint_identity = tensor_authorities[name]
                 authority.unlink(
                     Path(name), expected_sha256=checkpoint_sha,
-                    expected_identity=checkpoint_identity)
+                    expected_identity=checkpoint_identity,
+                    retirement_reason='best-cleanup',
+                    owning_commit_sha256=cleanup_binding,
+                    reclaim_space=True)
     if latest_checkpoint is None:
         return -math.inf, None
     return _load_best_lineage(

@@ -492,22 +492,23 @@ def test_run_init_immutable_link_race_never_overwrites_competitor(
         tmp_path, monkeypatch):
     init = _run_init(output_root='run')
     destination = tmp_path / 'run/run-init.json'
-    original = formal_training.os.link
+    original = formal_training._rename_noreplace_at
     hostile = b'competitor\n'
     attacked = False
 
-    def race_link(source, target, *args, **kwargs):
+    def race_link(source_fd, source, destination_fd, target, *, label):
         nonlocal attacked
         if not attacked and target == 'run-init.json':
             attacked = True
             descriptor = os.open(
                 target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
-                dir_fd=kwargs['dst_dir_fd'])
+                dir_fd=destination_fd)
             os.write(descriptor, hostile)
             os.close(descriptor)
-        return original(source, target, *args, **kwargs)
+        return original(
+            source_fd, source, destination_fd, target, label=label)
 
-    monkeypatch.setattr(formal_training.os, 'link', race_link)
+    monkeypatch.setattr(formal_training, '_rename_noreplace_at', race_link)
     with pytest.raises(FormalTrainingError, match='immutable'):
         write_formal_run_init(init, destination)
     assert destination.read_bytes() == hostile
@@ -518,23 +519,30 @@ def test_run_init_publish_never_unlinks_replaced_foreign_pending(
     init = _run_init(output_root='run')
     output = tmp_path / 'run'
     destination = output / 'run-init.json'
-    original = formal_training.os.link
+    original = formal_training._rename_noreplace_at
     foreign = b'foreign-pending'
+    held = output / '.run-init.json.pending.held-original'
 
-    def replace_pending_before_link(source, target, *args, **kwargs):
+    def replace_pending_before_link(source_fd, source, destination_fd, target,
+                                    *, label):
         if source == '.run-init.json.pending':
-            os.unlink(source, dir_fd=kwargs['src_dir_fd'])
+            os.rename(
+                source, held.name, src_dir_fd=source_fd,
+                dst_dir_fd=source_fd)
             descriptor = os.open(
                 source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
-                dir_fd=kwargs['src_dir_fd'])
+                dir_fd=source_fd)
             os.write(descriptor, foreign)
             os.close(descriptor)
-        return original(source, target, *args, **kwargs)
+        return original(
+            source_fd, source, destination_fd, target, label=label)
 
-    monkeypatch.setattr(formal_training.os, 'link', replace_pending_before_link)
+    monkeypatch.setattr(
+        formal_training, '_rename_noreplace_at', replace_pending_before_link)
     with pytest.raises(FormalTrainingError, match='publication|pending'):
         write_formal_run_init(init, destination)
     assert (output / '.run-init.json.pending').read_bytes() == foreign
+    assert held.is_file()
 
 
 def test_all_ten_run_inits_are_built_before_publication(monkeypatch):
@@ -770,24 +778,31 @@ def test_immutable_publish_never_unlinks_replaced_foreign_pending(
     output = tmp_path / 'run'
     output.mkdir()
     write_formal_run_init(init, output / 'run-init.json')
-    original = formal_training.os.link
+    original = formal_training._rename_noreplace_at
     foreign = b'foreign-pending'
+    held = output / '.epoch_1.pth.pending.held-original'
 
-    def replace_pending_before_link(source, target, *args, **kwargs):
+    def replace_pending_before_link(source_fd, source, destination_fd, target,
+                                    *, label):
         if source == '.epoch_1.pth.pending':
-            os.unlink(source, dir_fd=kwargs['src_dir_fd'])
+            os.rename(
+                source, held.name, src_dir_fd=source_fd,
+                dst_dir_fd=source_fd)
             descriptor = os.open(
                 source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
-                dir_fd=kwargs['src_dir_fd'])
+                dir_fd=source_fd)
             os.write(descriptor, foreign)
             os.close(descriptor)
-        return original(source, target, *args, **kwargs)
+        return original(
+            source_fd, source, destination_fd, target, label=label)
 
-    monkeypatch.setattr(formal_training.os, 'link', replace_pending_before_link)
+    monkeypatch.setattr(
+        formal_training, '_rename_noreplace_at', replace_pending_before_link)
     with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
         with pytest.raises(FormalTrainingError, match='pending|publication'):
             authority.write_immutable(Path('epoch_1.pth'), b'ours')
     assert (output / '.epoch_1.pth.pending').read_bytes() == foreign
+    assert held.read_bytes() == b'ours'
 
 
 def test_immutable_publish_preserves_original_pending_after_final_replacement(
@@ -796,27 +811,34 @@ def test_immutable_publish_preserves_original_pending_after_final_replacement(
     output = tmp_path / 'run'
     output.mkdir()
     write_formal_run_init(init, output / 'run-init.json')
-    original_link = formal_training.os.link
+    original_move = formal_training._rename_noreplace_at
+    held = output / 'epoch_1.pth.held-original'
 
-    def replace_final_after_link(source, target, *args, **kwargs):
-        result = original_link(source, target, *args, **kwargs)
+    def replace_final_after_link(source_fd, source, destination_fd, target,
+                                 *, label):
+        result = original_move(
+            source_fd, source, destination_fd, target, label=label)
         if target == 'epoch_1.pth':
-            os.unlink(target, dir_fd=kwargs['dst_dir_fd'])
+            os.rename(
+                target, held.name, src_dir_fd=destination_fd,
+                dst_dir_fd=destination_fd)
             descriptor = os.open(
                 target, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600, dir_fd=kwargs['dst_dir_fd'])
+                0o600, dir_fd=destination_fd)
             try:
                 os.write(descriptor, b'alternate-final')
             finally:
                 os.close(descriptor)
         return result
 
-    monkeypatch.setattr(formal_training.os, 'link', replace_final_after_link)
+    monkeypatch.setattr(
+        formal_training, '_rename_noreplace_at', replace_final_after_link)
     with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
         with pytest.raises(FormalTrainingError, match='publication changed'):
             authority.write_immutable(Path('epoch_1.pth'), b'ours')
-    assert (output / 'epoch_1.pth').read_bytes() == b'alternate-final'
-    assert (output / '.epoch_1.pth.pending').read_bytes() == b'ours'
+    assert not (output / 'epoch_1.pth').exists()
+    assert (output / '.epoch_1.pth.pending').read_bytes() == b'alternate-final'
+    assert held.read_bytes() == b'ours'
 
 
 def test_mutable_publish_detects_pending_replacement_before_replace(
@@ -898,23 +920,28 @@ def test_formal_output_authority_rejects_forked_mutation_and_closes_fds(
 
 def test_private_runner_staging_cleanup_is_fd_bound_and_victim_safe(tmp_path):
     staging = formal_training._PrivateRunnerStaging('full-seed0')
-    assert stat.S_IMODE(staging.path.stat().st_mode) == 0o700
-    (staging.path / 'runner.log').write_bytes(b'log')
-    held = tmp_path / 'held-staging'
-    staging.path.rename(held)
-    victim = tmp_path / 'victim'
-    victim.mkdir()
-    (victim / 'valuable.bin').write_bytes(b'valuable')
-    staging.path.symlink_to(victim, target_is_directory=True)
-    with pytest.raises(FormalTrainingError, match='staging authority'):
-        staging.cleanup()
-    assert (held / 'runner.log').read_bytes() == b'log'
-    assert (victim / 'valuable.bin').read_bytes() == b'valuable'
+    try:
+        assert stat.S_IMODE(staging.path.stat().st_mode) == 0o700
+        (staging.path / 'runner.log').write_bytes(b'log')
+        held = tmp_path / 'held-staging'
+        staging.path.rename(held)
+        victim = tmp_path / 'victim'
+        victim.mkdir()
+        (victim / 'valuable.bin').write_bytes(b'valuable')
+        staging.path.symlink_to(victim, target_is_directory=True)
+        with pytest.raises(FormalTrainingError, match='staging authority'):
+            staging.cleanup()
+        assert (held / 'runner.log').read_bytes() == b'log'
+        assert (victim / 'valuable.bin').read_bytes() == b'valuable'
+    finally:
+        if staging.path.is_symlink():
+            staging.path.unlink()
 
 
 def test_private_runner_staging_normal_cleanup_and_fork_fd_closure():
     staging = formal_training._PrivateRunnerStaging('full-seed0')
     path = staging.path
+    retired = path.parent / f'.{path.name}.completed'
     (path / 'runner.log').write_bytes(b'log')
     read_end, write_end = os.pipe()
     child = os.fork()
@@ -934,9 +961,16 @@ def test_private_runner_staging_normal_cleanup_and_fork_fd_closure():
     os.close(read_end)
     os.waitpid(child, 0)
     assert observed == b'closed'
-    staging.cleanup()
-    assert not path.exists()
-    assert not tuple(formal_training._ACTIVE_PRIVATE_RUNNER_STAGINGS)
+    try:
+        staging.cleanup()
+        assert not path.exists()
+        assert (retired / 'runner.log').read_bytes() == b'log'
+        assert not tuple(formal_training._ACTIVE_PRIVATE_RUNNER_STAGINGS)
+    finally:
+        if (retired / 'runner.log').exists():
+            (retired / 'runner.log').unlink()
+        if retired.is_dir():
+            retired.rmdir()
 
 
 @pytest.mark.parametrize('failure', ['child_open', 'fstat', 'mode'])
@@ -945,6 +979,7 @@ def test_private_runner_staging_constructor_failure_closes_and_removes_exact_dir
     token = f'constructor-{failure}'
     name = f'mambapose-formal-runner-full-seed0-{token}'
     path = Path('/tmp') / name
+    retired = Path('/tmp') / f'.{name}.constructor-abandoned'
     assert not path.exists()
     monkeypatch.setattr(formal_training.secrets, 'token_hex', lambda _n: token)
     original_open = formal_training.os.open
@@ -975,7 +1010,12 @@ def test_private_runner_staging_constructor_failure_closes_and_removes_exact_dir
     try:
         with pytest.raises((OSError, FormalTrainingError)):
             formal_training._PrivateRunnerStaging('full-seed0')
-        assert not path.exists()
+        if failure in {'child_open', 'fstat'}:
+            assert path.is_dir()
+            assert not retired.exists()
+        else:
+            assert not path.exists()
+            assert retired.is_dir()
         assert not tuple(formal_training._ACTIVE_PRIVATE_RUNNER_STAGINGS)
         if child_fd is not None:
             with pytest.raises(OSError):
@@ -983,6 +1023,8 @@ def test_private_runner_staging_constructor_failure_closes_and_removes_exact_dir
     finally:
         if path.is_dir():
             path.rmdir()
+        if retired.is_dir():
+            retired.rmdir()
 
 
 def test_private_runner_staging_constructor_failure_preserves_replaced_name(
@@ -1023,6 +1065,45 @@ def test_private_runner_staging_constructor_failure_preserves_replaced_name(
             victim.rmdir()
         if held.is_dir():
             held.rmdir()
+
+
+def test_private_runner_child_open_failure_never_relocates_replacement_dir(
+        monkeypatch):
+    token = 'constructor-replaced-directory'
+    name = f'mambapose-formal-runner-full-seed0-{token}'
+    path = Path('/tmp') / name
+    held = Path('/tmp') / f'{name}.held'
+    retired = Path('/tmp') / f'.{name}.constructor-abandoned'
+    for candidate in (path, held, retired):
+        assert not candidate.exists() and not candidate.is_symlink()
+    monkeypatch.setattr(formal_training.secrets, 'token_hex', lambda _n: token)
+    original_open = formal_training.os.open
+
+    def replace_before_child_open(target, flags, *args, **kwargs):
+        if target == name:
+            path.rename(held)
+            path.mkdir()
+            (path / 'unrelated.bin').write_bytes(b'unrelated')
+            raise OSError('injected replaced-directory child open failure')
+        return original_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(formal_training.os, 'open', replace_before_child_open)
+    try:
+        with pytest.raises(OSError, match='replaced-directory'):
+            formal_training._PrivateRunnerStaging('full-seed0')
+        assert (path / 'unrelated.bin').read_bytes() == b'unrelated'
+        assert held.is_dir()
+        assert not retired.exists()
+        assert not tuple(formal_training._ACTIVE_PRIVATE_RUNNER_STAGINGS)
+    finally:
+        if (path / 'unrelated.bin').exists():
+            (path / 'unrelated.bin').unlink()
+        if path.is_dir():
+            path.rmdir()
+        if held.is_dir():
+            held.rmdir()
+        if retired.is_dir():
+            retired.rmdir()
 
 
 def test_public_recovery_rejects_preexisting_same_byte_output_replacement(
@@ -2794,15 +2875,20 @@ def test_formal_training_stop_staging_replacement_never_purges_victim(
         request = formal_training._poll_formal_training_stop(
             authority, StageSafeBoundary('training', 'optimizer', 1, True))
         assert request is not None
-        original = authority.purge_directory
+        original = authority.abandon_directory
 
-        def replace_before_purge(relative):
+        def replace_before_purge(relative, *, tombstone_name,
+                                 owning_commit_sha256,
+                                 expected_identity=None):
             staging.rename(held_staging)
             staging.symlink_to(victim, target_is_directory=True)
-            return original(relative)
+            return original(
+                relative, tombstone_name=tombstone_name,
+                owning_commit_sha256=owning_commit_sha256,
+                expected_identity=expected_identity)
 
-        monkeypatch.setattr(authority, 'purge_directory', replace_before_purge)
-        with pytest.raises(FormalTrainingError, match='purge'):
+        monkeypatch.setattr(authority, 'abandon_directory', replace_before_purge)
+        with pytest.raises(FormalTrainingError, match='abandon'):
             formal_training._write_formal_training_stop_ack(
                 authority, request,
                 TrainingResumeAuthority(
@@ -2810,3 +2896,760 @@ def test_formal_training_stop_staging_replacement_never_purges_victim(
     assert (victim / 'valuable.bin').read_bytes() == b'valuable'
     assert (held_staging / 'partial.bin').read_bytes() == b'partial'
     assert not (output / 'stop-ack.json').exists()
+
+
+# Fourth-fix transaction REDs.  These deliberately exercise final namespace
+# mutation boundaries rather than only validating inputs before cleanup.
+
+
+def _inject_immutable_destination_collision(
+        monkeypatch, *, destination_name: str, destination: Path,
+        payload: bytes) -> dict[str, bool]:
+    injected = {'value': False}
+    if hasattr(formal_training, '_rename_noreplace_at'):
+        original = formal_training._rename_noreplace_at
+
+        def collide(source_directory_fd, source_name,
+                    destination_directory_fd, observed_destination_name,
+                    *, label):
+            if observed_destination_name == destination_name \
+                    and not injected['value']:
+                destination.write_bytes(payload)
+                injected['value'] = True
+            return original(
+                source_directory_fd, source_name,
+                destination_directory_fd, observed_destination_name,
+                label=label)
+
+        monkeypatch.setattr(formal_training, '_rename_noreplace_at', collide)
+    else:
+        original = formal_training.os.replace
+
+        def collide(source, observed_destination, *args, **kwargs):
+            observed_name = os.fspath(observed_destination)
+            if observed_name == destination_name and not injected['value']:
+                destination.write_bytes(payload)
+                injected['value'] = True
+            return original(source, observed_destination, *args, **kwargs)
+
+        monkeypatch.setattr(formal_training.os, 'replace', collide)
+    return injected
+
+
+def test_linux_rename_noreplace_moves_exact_inode_and_never_overwrites(tmp_path):
+    source = tmp_path / 'source'
+    destination = tmp_path / 'destination'
+    source.write_bytes(b'owned')
+    destination.write_bytes(b'unrelated')
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(FormalTrainingError, match='already exists'):
+            formal_training._rename_noreplace_at(
+                directory_fd, source.name, directory_fd, destination.name,
+                label='test no-replace')
+    finally:
+        os.close(directory_fd)
+    assert source.read_bytes() == b'owned'
+    assert destination.read_bytes() == b'unrelated'
+
+
+def test_linux_rename_noreplace_never_replaces_existing_directory(tmp_path):
+    source = tmp_path / 'source'
+    destination = tmp_path / 'destination'
+    source.mkdir()
+    (source / 'owned').write_bytes(b'owned')
+    destination.mkdir()
+    (destination / 'unrelated').write_bytes(b'unrelated')
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(FormalTrainingError, match='already exists'):
+            formal_training._rename_noreplace_at(
+                directory_fd, source.name, directory_fd, destination.name,
+                label='test directory no-replace')
+    finally:
+        os.close(directory_fd)
+    assert (source / 'owned').read_bytes() == b'owned'
+    assert (destination / 'unrelated').read_bytes() == b'unrelated'
+
+
+def test_formal_regular_retirement_keeps_verified_tombstone_without_unlink(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    target = output / 'stale.json'
+    target.write_bytes(b'stale')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        digest, identity = authority.file_authority(Path(target.name))
+        original_unlink = formal_training.os.unlink
+
+        def forbid_unlink(name, *args, **kwargs):
+            if os.fspath(name) in {target.name, f'.{target.name}.unlink-quarantine'}:
+                pytest.fail('online retirement used unlink')
+            return original_unlink(name, *args, **kwargs)
+
+        monkeypatch.setattr(formal_training.os, 'unlink', forbid_unlink)
+        authority.unlink(
+            Path(target.name), expected_sha256=digest,
+            expected_identity=identity, retirement_reason='test-rollback',
+            owning_commit_sha256='1' * 64)
+        retired = authority.reconcile_retirements()
+    assert not target.exists()
+    assert len(retired) == 1
+    assert (output / retired[0].payload_path).read_bytes() == b'stale'
+    assert (output / retired[0].record_path).is_file()
+
+
+def test_single_link_large_checkpoint_retirement_reclaims_only_held_inode(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    target = output / 'epoch_1.pth'
+    target.write_bytes(b'x' * (2 * 1024 * 1024))
+    original_sha = _sha(target)
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        digest, identity = authority.file_authority(Path(target.name))
+        authority.unlink(
+            Path(target.name), expected_sha256=digest,
+            expected_identity=identity, retirement_reason='stale-checkpoint',
+            owning_commit_sha256='2' * 64, reclaim_space=True)
+        retired = authority.reconcile_retirements()
+    assert len(retired) == 1
+    payload = output / retired[0].payload_path
+    document = json.loads((output / retired[0].record_path).read_text())
+    assert payload.stat().st_size == 0
+    assert document['source']['sha256'] == original_sha
+    assert document['target_state'] == 'reclaimed-zero'
+
+
+def test_hardlinked_immutable_pending_retirement_never_truncates_final(tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    final = output / 'epoch_1.pth'
+    pending = output / '.epoch_1.pth.pending'
+    final.write_bytes(b'checkpoint')
+    os.link(final, pending)
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        digest, identity = authority.file_authority(Path(pending.name))
+        authority.unlink(
+            Path(pending.name), expected_sha256=digest,
+            expected_identity=identity,
+            retirement_reason='linked-immutable-pending',
+            owning_commit_sha256='3' * 64, reclaim_space=True)
+        retired = authority.reconcile_retirements()
+    assert final.read_bytes() == b'checkpoint'
+    assert (output / retired[0].payload_path).read_bytes() == b'checkpoint'
+    assert os.stat(final).st_ino == os.stat(output / retired[0].payload_path).st_ino
+
+
+def test_retirement_restart_completes_prepared_and_reclaimed_states(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    target = output / 'epoch_1.pth'
+    target.write_bytes(b'x' * (2 * 1024 * 1024))
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        digest, identity = authority.file_authority(Path(target.name))
+        original = formal_training._rename_noreplace_at
+
+        def crash_before_move(source_fd, source, destination_fd, destination,
+                              *, label):
+            if destination.endswith('.payload'):
+                raise OSError('injected crash after prepared record')
+            return original(
+                source_fd, source, destination_fd, destination, label=label)
+
+        monkeypatch.setattr(
+            formal_training, '_rename_noreplace_at', crash_before_move)
+        with pytest.raises(OSError, match='prepared'):
+            authority.unlink(
+                Path(target.name), expected_sha256=digest,
+                expected_identity=identity,
+                retirement_reason='stale-checkpoint',
+                owning_commit_sha256='4' * 64, reclaim_space=True)
+        monkeypatch.setattr(formal_training, '_rename_noreplace_at', original)
+    assert target.is_file()
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        retired = authority.reconcile_retirements()
+    assert not target.exists()
+    assert (output / retired[0].payload_path).stat().st_size == 0
+
+
+def test_retirement_restart_completes_moved_before_reclaim_state(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    target = output / 'epoch_1.pth'
+    target.write_bytes(b'x' * (2 * 1024 * 1024))
+    original_ftruncate = formal_training.os.ftruncate
+    injected = {'value': False}
+
+    def crash_before_reclaim(descriptor, length):
+        if length == 0 and not injected['value']:
+            injected['value'] = True
+            raise OSError('injected crash after retirement move')
+        return original_ftruncate(descriptor, length)
+
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        digest, identity = authority.file_authority(Path(target.name))
+        monkeypatch.setattr(
+            formal_training.os, 'ftruncate', crash_before_reclaim)
+        with pytest.raises(OSError, match='after retirement move'):
+            authority.unlink(
+                Path(target.name), expected_sha256=digest,
+                expected_identity=identity,
+                retirement_reason='stale-checkpoint',
+                owning_commit_sha256='8' * 64, reclaim_space=True)
+        monkeypatch.setattr(
+            formal_training.os, 'ftruncate', original_ftruncate)
+    assert injected['value'] and not target.exists()
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        retired = authority.reconcile_retirements()
+    assert len(retired) == 1
+    assert (output / retired[0].payload_path).stat().st_size == 0
+
+
+def test_retirement_inventory_rejects_unknown_duplicate_and_tampered_records(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    target = output / 'stale.json'
+    target.write_bytes(b'stale')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        digest, identity = authority.file_authority(Path(target.name))
+        authority.unlink(
+            Path(target.name), expected_sha256=digest,
+            expected_identity=identity, retirement_reason='test-rollback',
+            owning_commit_sha256='5' * 64)
+        retired = authority.reconcile_retirements()
+    retirement_root = output / '.formal-retired'
+    (retirement_root / 'unknown').write_bytes(b'unknown')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='retirement inventory'):
+            authority.reconcile_retirements()
+    (retirement_root / 'unknown').unlink()
+    record = output / retired[0].record_path
+    document = json.loads(record.read_text())
+    document['source']['sha256'] = '0' * 64
+    record.write_text(json.dumps(document, sort_keys=True) + '\n')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='retirement'):
+            authority.reconcile_retirements()
+
+
+def test_retirement_inventory_rejects_duplicate_source_before_mutation(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    source = output / 'epoch_1.pth'
+    source.write_bytes(b'checkpoint')
+    original = formal_training._rename_noreplace_at
+
+    def stop_after_record(source_fd, source_name, destination_fd,
+                          destination_name, *, label):
+        if destination_name.endswith('.payload'):
+            raise OSError('stop after prepared record')
+        return original(
+            source_fd, source_name, destination_fd, destination_name,
+            label=label)
+
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        digest, identity = authority.file_authority(Path(source.name))
+        monkeypatch.setattr(
+            formal_training, '_rename_noreplace_at', stop_after_record)
+        with pytest.raises(OSError, match='prepared record'):
+            authority.unlink(
+                Path(source.name), expected_sha256=digest,
+                expected_identity=identity,
+                retirement_reason='stale-checkpoint',
+                owning_commit_sha256='9' * 64)
+        monkeypatch.setattr(
+            formal_training, '_rename_noreplace_at', original)
+        duplicate_id, duplicate_payload = authority._retirement_document(
+            Path(source.name), source_sha256=digest,
+            source_identity=identity, reason='best-cleanup',
+            owning_commit_sha256='a' * 64, target_state='retained')
+    retirement = output / '.formal-retired'
+    (retirement / f'{duplicate_id}.record.json').write_bytes(
+        duplicate_payload)
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='duplicate source'):
+            authority.reconcile_retirements()
+    assert source.read_bytes() == b'checkpoint'
+    assert not tuple(retirement.glob('*.payload'))
+
+
+def test_retirement_inventory_rejects_duplicate_payload_binding_before_move(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    source = output / 'epoch_1.pth'
+    source.write_bytes(b'checkpoint')
+    original = formal_training._rename_noreplace_at
+
+    def stop_after_record(source_fd, source_name, destination_fd,
+                          destination_name, *, label):
+        if destination_name.endswith('.payload'):
+            raise OSError('stop after prepared record')
+        return original(
+            source_fd, source_name, destination_fd, destination_name,
+            label=label)
+
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        digest, identity = authority.file_authority(Path(source.name))
+        monkeypatch.setattr(
+            formal_training, '_rename_noreplace_at', stop_after_record)
+        with pytest.raises(OSError, match='prepared record'):
+            authority.unlink(
+                Path(source.name), expected_sha256=digest,
+                expected_identity=identity,
+                retirement_reason='stale-checkpoint',
+                owning_commit_sha256='b' * 64)
+        monkeypatch.setattr(
+            formal_training, '_rename_noreplace_at', original)
+    retirement = output / '.formal-retired'
+    record = next(retirement.glob('*.record.json'))
+    document = json.loads(record.read_text())
+    document['payload_path'] = (
+        formal_training._RETIREMENT_ROOT / 'duplicate.payload').as_posix()
+    record.write_text(json.dumps(document, sort_keys=True) + '\n')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='binding'):
+            authority.reconcile_retirements()
+    assert source.read_bytes() == b'checkpoint'
+    assert not tuple(retirement.glob('*.payload'))
+
+
+def test_run_init_linked_pending_is_logically_retired_without_unlink(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    final = output / 'run-init.json'
+    write_formal_run_init(init, final)
+    pending = output / '.run-init.json.pending'
+    os.link(final, pending)
+    original_unlink = formal_training.os.unlink
+
+    def forbid_pending_unlink(name, *args, **kwargs):
+        if os.fspath(name) == pending.name:
+            pytest.fail('run-init pending used unlink')
+        return original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(formal_training.os, 'unlink', forbid_pending_unlink)
+    write_formal_run_init(init, final)
+    assert final.is_file() and not pending.exists()
+    retired = tuple((output / '.formal-retired').glob('*.payload'))
+    assert len(retired) == 1 and retired[0].read_bytes() == final.read_bytes()
+
+
+def test_run_init_pending_only_recovery_moves_without_pending_unlink(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    final = output / 'run-init.json'
+    write_formal_run_init(init, final)
+    payload = final.read_bytes()
+    pending = output / '.run-init.json.pending'
+    final.rename(pending)
+    original_unlink = formal_training.os.unlink
+
+    def forbid_pending_unlink(name, *args, **kwargs):
+        if os.fspath(name) == pending.name:
+            pytest.fail('run-init pending recovery used unlink')
+        return original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(formal_training.os, 'unlink', forbid_pending_unlink)
+    write_formal_run_init(init, final)
+    assert final.read_bytes() == payload
+    assert not pending.exists()
+
+
+def test_generic_stop_abandons_whole_staging_tree_without_purge(tmp_path):
+    control, input_path, staging = _stop_request(tmp_path, 'profile')
+    request = poll_cooperative_stop(
+        control, stage_output_root=tmp_path,
+        safe_boundary=StageSafeBoundary('profile', 'cuda', 1, True))
+    assert request is not None
+    acknowledgement = write_stop_acknowledgement(
+        request, StatelessStageInputAuthority(
+            'profile', str(input_path), _sha(input_path)))
+    abandoned = tmp_path / '.formal-retired' / (
+        'partial-staging.abandoned-request-001')
+    assert acknowledgement.exit_code == 75
+    assert not staging.exists()
+    assert (abandoned / 'partial.bin').read_bytes() == b'partial'
+
+
+def test_generic_stop_abandonment_never_replaces_concurrent_destination(
+        tmp_path, monkeypatch):
+    control, input_path, staging = _stop_request(tmp_path, 'profile')
+    request = poll_cooperative_stop(
+        control, stage_output_root=tmp_path,
+        safe_boundary=StageSafeBoundary('profile', 'cuda', 1, True))
+    assert request is not None
+    destination = tmp_path / '.partial-staging.abandoned-request-001'
+    original_rename = formal_training.os.rename
+
+    def collide(source, observed_destination, *args, **kwargs):
+        if os.fspath(observed_destination) == destination.name:
+            destination.mkdir()
+            (destination / 'unrelated').write_bytes(b'unrelated')
+        return original_rename(source, observed_destination, *args, **kwargs)
+
+    if hasattr(formal_training, '_rename_noreplace_at'):
+        original_noreplace = formal_training._rename_noreplace_at
+
+        def collide_noreplace(source_fd, source, destination_fd,
+                              observed_destination, *, label):
+            if observed_destination == 'partial-staging.abandoned-request-001':
+                retired = tmp_path / '.formal-retired'
+                retired.mkdir(exist_ok=True)
+                concurrent = retired / observed_destination
+                concurrent.mkdir()
+                (concurrent / 'unrelated').write_bytes(b'unrelated')
+            return original_noreplace(
+                source_fd, source, destination_fd, observed_destination,
+                label=label)
+
+        monkeypatch.setattr(
+            formal_training, '_rename_noreplace_at', collide_noreplace)
+    else:
+        monkeypatch.setattr(formal_training.os, 'rename', collide)
+    with pytest.raises(FormalTrainingError, match='already exists|collid'):
+        write_stop_acknowledgement(
+            request, StatelessStageInputAuthority(
+                'profile', str(input_path), _sha(input_path)))
+    assert staging.is_dir()
+    concurrent = (destination if destination.exists() else
+                  tmp_path / '.formal-retired' /
+                  'partial-staging.abandoned-request-001')
+    assert (concurrent / 'unrelated').read_bytes() == b'unrelated'
+    assert not (tmp_path / 'stop-ack.json').exists()
+
+
+def test_generic_stop_source_replacement_is_restored_or_preserved(
+        tmp_path, monkeypatch):
+    control, input_path, staging = _stop_request(tmp_path, 'profile')
+    request = poll_cooperative_stop(
+        control, stage_output_root=tmp_path,
+        safe_boundary=StageSafeBoundary('profile', 'cuda', 1, True))
+    assert request is not None
+    held_original = tmp_path / 'held-original-staging'
+    replacement_marker = b'replacement'
+    injected = {'value': False}
+    if hasattr(formal_training, '_rename_noreplace_at'):
+        original = formal_training._rename_noreplace_at
+
+        def replace_source(source_fd, source, destination_fd, destination,
+                           *, label):
+            if source == staging.name and not injected['value']:
+                staging.rename(held_original)
+                staging.mkdir()
+                (staging / 'replacement.bin').write_bytes(replacement_marker)
+                injected['value'] = True
+            return original(
+                source_fd, source, destination_fd, destination, label=label)
+
+        monkeypatch.setattr(formal_training, '_rename_noreplace_at', replace_source)
+    else:
+        original = formal_training.os.rename
+
+        def replace_source(source, destination, *args, **kwargs):
+            if os.fspath(source) == staging.name and not injected['value']:
+                staging.rename(held_original)
+                staging.mkdir()
+                (staging / 'replacement.bin').write_bytes(replacement_marker)
+                injected['value'] = True
+            return original(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(formal_training.os, 'rename', replace_source)
+    with pytest.raises(FormalTrainingError, match='authority changed'):
+        write_stop_acknowledgement(
+            request, StatelessStageInputAuthority(
+                'profile', str(input_path), _sha(input_path)))
+    assert injected['value']
+    assert (held_original / 'partial.bin').read_bytes() == b'partial'
+    replacement_locations = tuple(
+        path for path in tmp_path.rglob('replacement.bin') if path.is_file())
+    assert len(replacement_locations) == 1
+    assert replacement_locations[0].read_bytes() == replacement_marker
+    assert not (tmp_path / 'stop-ack.json').exists()
+
+
+def test_formal_directory_tombstone_binds_owning_commit_and_rejects_tamper(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    staging = output / 'partial-staging'
+    staging.mkdir()
+    (staging / 'partial.bin').write_bytes(b'partial')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        owning_commit = authority.sha256(Path('run-init.json'))
+        authority.abandon_directory(
+            Path(staging.name), tombstone_name='partial-staging.abandoned-r1',
+            owning_commit_sha256=owning_commit)
+        authority.reconcile_retirements()
+    record = (output / '.formal-retired' /
+              'partial-staging.abandoned-r1.record.json')
+    document = json.loads(record.read_text())
+    assert document['owning_commit_sha256'] == owning_commit
+    document['owning_commit_sha256'] = 'd' * 64
+    record.write_text(json.dumps(document, sort_keys=True) + '\n')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='abandonment'):
+            authority.reconcile_retirements()
+
+
+def test_formal_directory_inventory_rejects_duplicate_source_before_move(
+        tmp_path):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    staging = output / 'partial-staging'
+    staging.mkdir()
+    (staging / 'partial.bin').write_bytes(b'partial')
+    retirement = output / '.formal-retired'
+    retirement.mkdir()
+    descriptor = os.open(
+        staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        tree_sha256 = formal_training._directory_tree_digest_fd(descriptor)
+    finally:
+        os.close(descriptor)
+    owning_commit = _sha(output / 'run-init.json')
+    for request_id in ('r1', 'r2'):
+        tombstone = f'partial-staging.abandoned-{request_id}'
+        (retirement / f'{tombstone}.record.json').write_bytes(
+            formal_training._canonical_json_bytes({
+                'schema_version': 1, 'run_id': init.run_id,
+                'source_path': staging.name,
+                'tombstone_path': (
+                    formal_training._RETIREMENT_ROOT / tombstone).as_posix(),
+                'device': opened.st_dev, 'inode': opened.st_ino,
+                'tree_sha256': tree_sha256,
+                'owning_commit_sha256': owning_commit}))
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        with pytest.raises(FormalTrainingError, match='duplicate source'):
+            authority.reconcile_retirements()
+    assert (staging / 'partial.bin').read_bytes() == b'partial'
+    assert not tuple(path for path in retirement.iterdir() if path.is_dir())
+
+
+def test_retirement_tombstone_collision_preserves_source_and_destination(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    target = output / 'stale.json'
+    target.write_bytes(b'stale')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        digest, identity = authority.file_authority(Path(target.name))
+        original = formal_training._rename_noreplace_at
+        injected = {'path': None}
+
+        def collide(source_fd, source, destination_fd, destination, *, label):
+            if destination.endswith('.payload') and injected['path'] is None:
+                descriptor = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600, dir_fd=destination_fd)
+                os.write(descriptor, b'unrelated')
+                os.close(descriptor)
+                injected['path'] = destination
+            return original(
+                source_fd, source, destination_fd, destination, label=label)
+
+        monkeypatch.setattr(formal_training, '_rename_noreplace_at', collide)
+        with pytest.raises(FormalTrainingError, match='already exists'):
+            authority.unlink(
+                Path(target.name), expected_sha256=digest,
+                expected_identity=identity, retirement_reason='test-rollback',
+                owning_commit_sha256='6' * 64)
+    assert target.read_bytes() == b'stale'
+    assert injected['path'] is not None
+    assert (output / '.formal-retired' / injected['path']).read_bytes() \
+        == b'unrelated'
+
+
+def test_retirement_prepared_record_collision_is_preserved_and_rejected(
+        tmp_path, monkeypatch):
+    init = _run_init(output_root='run')
+    output = tmp_path / 'run'
+    output.mkdir()
+    write_formal_run_init(init, output / 'run-init.json')
+    target = output / 'stale.json'
+    target.write_bytes(b'stale')
+    with formal_training._FormalOutputAuthority(tmp_path, init) as authority:
+        digest, identity = authority.file_authority(Path(target.name))
+        original = formal_training._rename_noreplace_at
+        injected = {'path': None}
+
+        def collide(source_fd, source, destination_fd, destination, *, label):
+            if destination.endswith('.record.json') and injected['path'] is None:
+                descriptor = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600, dir_fd=destination_fd)
+                os.write(descriptor, b'unrelated-record')
+                os.close(descriptor)
+                injected['path'] = destination
+            return original(
+                source_fd, source, destination_fd, destination, label=label)
+
+        monkeypatch.setattr(formal_training, '_rename_noreplace_at', collide)
+        with pytest.raises(FormalTrainingError, match='already exists'):
+            authority.unlink(
+                Path(target.name), expected_sha256=digest,
+                expected_identity=identity, retirement_reason='test-rollback',
+                owning_commit_sha256='7' * 64)
+    assert target.read_bytes() == b'stale'
+    assert injected['path'] is not None
+    assert (output / '.formal-retired' / injected['path']).read_bytes() \
+        == b'unrelated-record'
+
+
+def test_generic_stop_existing_ack_is_always_stale_even_when_bytes_match(
+        tmp_path):
+    control, input_path, staging = _stop_request(tmp_path, 'profile')
+    request = poll_cooperative_stop(
+        control, stage_output_root=tmp_path,
+        safe_boundary=StageSafeBoundary('profile', 'cuda', 1, True))
+    assert request is not None
+    resume = StatelessStageInputAuthority(
+        'profile', str(input_path), _sha(input_path))
+    payload = formal_training._canonical_json_bytes({
+        'schema_version': 1, 'request_id': request.request_id,
+        'stage': request.stage, 'resume': {'kind': 'stateless', **resume.__dict__},
+        'exit_code': 75})
+    (tmp_path / 'stop-ack.json').write_bytes(payload)
+    with pytest.raises(FormalTrainingError, match='already|stale'):
+        write_stop_acknowledgement(request, resume)
+    assert staging.is_dir()
+    assert (tmp_path / 'stop-ack.json').read_bytes() == payload
+
+
+def test_generic_stop_ack_publish_collision_preserves_unrelated_ack(
+        tmp_path, monkeypatch):
+    control, input_path, staging = _stop_request(tmp_path, 'profile')
+    request = poll_cooperative_stop(
+        control, stage_output_root=tmp_path,
+        safe_boundary=StageSafeBoundary('profile', 'cuda', 1, True))
+    assert request is not None
+    ack = tmp_path / 'stop-ack.json'
+    injected = _inject_immutable_destination_collision(
+        monkeypatch, destination_name=ack.name, destination=ack,
+        payload=b'unrelated-ack')
+    with pytest.raises(FormalTrainingError, match='already exists|collid'):
+        write_stop_acknowledgement(
+            request, StatelessStageInputAuthority(
+                'profile', str(input_path), _sha(input_path)))
+    assert injected['value']
+    assert ack.read_bytes() == b'unrelated-ack'
+    assert not staging.exists()
+
+
+def test_repeatability_artifact_publish_collision_preserves_unrelated_file(
+        tmp_path, monkeypatch):
+    destination = tmp_path / 'evidence.json'
+    injected = _inject_immutable_destination_collision(
+        monkeypatch, destination_name=destination.name,
+        destination=destination, payload=b'unrelated')
+    with pytest.raises(FormalTrainingError, match='already exists|collid'):
+        formal_training.write_immutable_artifact(
+            destination, b'approved', tmp_path)
+    assert injected['value']
+    assert destination.read_bytes() == b'unrelated'
+
+
+def test_repeatability_artifact_existing_same_bytes_is_stale_not_idempotent(
+        tmp_path):
+    destination = tmp_path / 'evidence.json'
+    destination.write_bytes(b'approved')
+    before = destination.stat()
+    with pytest.raises(FormalTrainingError, match='already exists|stale'):
+        formal_training.write_immutable_artifact(
+            destination, b'approved', tmp_path)
+    after = destination.stat()
+    assert destination.read_bytes() == b'approved'
+    assert (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+
+
+@pytest.mark.parametrize('failure', ['parent_fsync', 'first_stat'])
+def test_private_runner_staging_preidentity_failure_logically_retires_child(
+        monkeypatch, failure):
+    token = f'preidentity-{failure}'
+    name = f'mambapose-formal-runner-full-seed0-{token}'
+    path = Path('/tmp') / name
+    retired = Path('/tmp') / f'.{name}.constructor-abandoned'
+    assert not path.exists() and not retired.exists()
+    monkeypatch.setattr(formal_training.secrets, 'token_hex', lambda _n: token)
+    original_fsync = formal_training.os.fsync
+    original_stat = formal_training.os.stat
+    injected = {'value': False}
+
+    def fail_fsync(descriptor):
+        if failure == 'parent_fsync' and not injected['value']:
+            injected['value'] = True
+            raise OSError('injected first parent fsync failure')
+        return original_fsync(descriptor)
+
+    def fail_stat(target, *args, **kwargs):
+        if failure == 'first_stat' and target == name and not injected['value']:
+            injected['value'] = True
+            raise OSError('injected first child stat failure')
+        return original_stat(target, *args, **kwargs)
+
+    monkeypatch.setattr(formal_training.os, 'fsync', fail_fsync)
+    monkeypatch.setattr(formal_training.os, 'stat', fail_stat)
+    try:
+        with pytest.raises(OSError, match='injected'):
+            formal_training._PrivateRunnerStaging('full-seed0')
+        assert injected['value']
+        assert not path.exists()
+        assert retired.is_dir()
+        assert not tuple(formal_training._ACTIVE_PRIVATE_RUNNER_STAGINGS)
+    finally:
+        if retired.is_dir():
+            retired.rmdir()
+        if path.is_dir():
+            path.rmdir()
+
+
+def test_private_runner_normal_cleanup_logically_retires_whole_directory():
+    staging = formal_training._PrivateRunnerStaging('full-seed0')
+    path = staging.path
+    (path / 'runner.log').write_bytes(b'log')
+    retired = path.parent / f'.{path.name}.completed'
+    try:
+        staging.cleanup()
+        assert not path.exists()
+        assert (retired / 'runner.log').read_bytes() == b'log'
+        assert not tuple(formal_training._ACTIVE_PRIVATE_RUNNER_STAGINGS)
+    finally:
+        if (retired / 'runner.log').exists():
+            (retired / 'runner.log').unlink()
+        if retired.is_dir():
+            retired.rmdir()
