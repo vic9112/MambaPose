@@ -452,10 +452,10 @@ def test_calibration_v2_provenance_rejects_candidate_seed_downgrade(
             'policy_sha256': 'a' * 64,
             'authority_path': 'optimization/authority.json'})
     monkeypatch.setattr(
-        'mmengine.config.Config.fromfile',
-        lambda _path: {
+        'mambapose_opt.checkpoints.authorize_tracked_config',
+        lambda *_args: SimpleNamespace(load_config=lambda: {
             'numeric_optimization': {
-                'calibration': {'artifact_schema_version': 2}}})
+                'calibration': {'artifact_schema_version': 2}}}))
 
     with pytest.raises(CalibrationContractError, match='candidate'):
         validate_calibration_provenance(
@@ -485,10 +485,10 @@ def test_calibration_provenance_rejects_combined_strip_and_v1_downgrade(
             'policy_sha256': 'a' * 64,
             'authority_path': 'optimization/authority.json'})
     monkeypatch.setattr(
-        'mmengine.config.Config.fromfile',
-        lambda _path: {
+        'mambapose_opt.checkpoints.authorize_tracked_config',
+        lambda *_args: SimpleNamespace(load_config=lambda: {
             'numeric_optimization': {
-                'calibration': {'artifact_schema_version': 2}}})
+                'calibration': {'artifact_schema_version': 2}}}))
 
     with pytest.raises(CalibrationContractError, match='source policy'):
         validate_calibration_provenance(

@@ -634,8 +634,18 @@ def validate_calibration_provenance(
     if source['policy_path'] != expected_policy_path:
         raise CalibrationContractError(
             'calibration source policy must equal target candidate config')
-    from mmengine.config import Config
-    config = Config.fromfile(repository_root / source['policy_path'])
+    identity = value['identity']
+    if (value['schema_version'] in (2, 3)
+            and value['protocol']['root_determinism']['seed']
+            != expected_candidate.seed):
+        raise CalibrationContractError(
+            'calibration root determinism seed disagrees with candidate')
+    if identity['git_commit'] != source['git_commit']:
+        raise CalibrationContractError(
+            'calibration identity commit disagrees with source binding')
+    from .checkpoints import authorize_tracked_config
+    config = authorize_tracked_config(
+        repository_root, manifest_path, expected_candidate).load_config()
     numeric = config.get('numeric_optimization', {})
     calibration_policy = numeric.get('calibration', {}) \
         if isinstance(numeric, Mapping) else None
@@ -650,15 +660,6 @@ def validate_calibration_provenance(
     if value['schema_version'] != expected_schema_version:
         raise CalibrationContractError(
             'calibration artifact version disagrees with source policy')
-    identity = value['identity']
-    if (value['schema_version'] in (2, 3)
-            and value['protocol']['root_determinism']['seed']
-            != expected_candidate.seed):
-        raise CalibrationContractError(
-            'calibration root determinism seed disagrees with candidate')
-    if identity['git_commit'] != source['git_commit']:
-        raise CalibrationContractError(
-            'calibration identity commit disagrees with source binding')
     if (identity['policy'] != source['policy_path']
             or identity['policy_sha256'] != source['policy_sha256']):
         raise CalibrationContractError(

@@ -267,12 +267,126 @@ def _manifest_absolute(root: Path, manifest_path: Path) -> Path:
     return manifest.resolve(strict=True)
 
 
+def _tracked_blob(root: Path, commit: str, relative: str) -> bytes:
+    try:
+        return subprocess.run(
+            ['git', 'show', f'{commit}:{relative}'], cwd=root,
+            check=True, capture_output=True).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError(
+            f'authenticated Config dependency is not tracked: {relative}') \
+            from error
+
+
+def _safe_closure_relative(value: str) -> Path:
+    relative = Path(value)
+    if (
+            relative.is_absolute() or relative.suffix != '.py'
+            or not relative.parts
+            or any(part in {'', '.', '..'} for part in relative.parts)):
+        raise ValueError('authenticated Config closure path is unsafe')
+    return relative
+
+
+def _write_private_config_file(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    path.chmod(0o400)
+
+
+def _private_closure_hashes(
+        private_root: Path, expected: Mapping[str, str]) -> dict[str, str]:
+    observed: dict[str, str] = {}
+    for name, checksum in expected.items():
+        relative = _safe_closure_relative(name)
+        path = private_root / relative
+        if path.is_symlink() or not path.is_file():
+            raise ValueError('authenticated Config closure file changed')
+        actual = _sha256(path)
+        if actual != checksum:
+            raise ValueError('authenticated Config closure hash changed')
+        observed[relative.as_posix()] = actual
+    extra = tuple(
+        path for path in private_root.rglob('*')
+        if path.is_file()
+        and path.relative_to(private_root).as_posix() not in expected)
+    if extra:
+        raise ValueError('authenticated Config parser created extra files')
+    return observed
+
+
+def _parse_authenticated_tracked_config(
+        root: Path, *, start: Path, commit: str,
+        closure: tuple[dict[str, str], ...]):
+    """Parse only a private exact-blob closure, never a live source path."""
+    from mmengine.config import Config
+
+    expected = {
+        _safe_closure_relative(item['path']).as_posix(): item['sha256']
+        for item in closure
+    }
+    start_relative = _safe_closure_relative(start.as_posix())
+    if start_relative.as_posix() not in expected:
+        raise ValueError('authenticated Config root is missing from closure')
+    blobs: dict[str, bytes] = {}
+    for relative, checksum in expected.items():
+        payload = _tracked_blob(root, commit, relative)
+        if hashlib.sha256(payload).hexdigest() != checksum:
+            raise ValueError('authenticated Config Git blob hash changed')
+        if (root / relative).read_bytes() != payload:
+            raise ValueError('authenticated Config live dependency changed')
+        blobs[relative] = payload
+
+    with tempfile.TemporaryDirectory(prefix='mambapose-config-') as name:
+        private_root = Path(name)
+        if private_root.is_symlink() or not private_root.is_dir():
+            raise ValueError('authenticated Config temporary root is invalid')
+        private_root.chmod(0o700)
+        directories = {private_root}
+        for relative in sorted(blobs):
+            destination = private_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            cursor = destination.parent
+            while cursor != private_root.parent:
+                directories.add(cursor)
+                if cursor == private_root:
+                    break
+                cursor = cursor.parent
+            _write_private_config_file(destination, blobs[relative])
+        before = _private_closure_hashes(private_root, expected)
+        for directory in directories:
+            directory.chmod(0o500)
+        try:
+            config = Config.fromfile(private_root / start_relative)
+            after = _private_closure_hashes(private_root, expected)
+        finally:
+            for directory in directories:
+                directory.chmod(0o700)
+        if before != after or after != expected:
+            raise ValueError('authenticated Config closure changed during parse')
+
+    # Force serialization after the private tree is gone. This rejects a
+    # parser result that retained lazy path-backed state.
+    ConfigAuthority._config_fingerprint(config)
+    return config
+
+
 def _tracked_config_snapshot(
         repository_root: Path, manifest_path: Path,
         candidate: str | CandidateSpec) -> _ConfigSnapshot:
     """Rebuild a tracked Config and its full public source evidence."""
-    from mmengine.config import Config
-
     from .numeric_source import validate_numeric_config_closure
 
     root = lexical_repository_root(repository_root)
@@ -292,9 +406,17 @@ def _tracked_config_snapshot(
         return path, path.read_bytes(), closure
 
     path, payload, closure = source_snapshot()
-    config = Config.fromfile(path)
+    config = _parse_authenticated_tracked_config(
+        root, start=authorized.candidate.config, commit=commit,
+        closure=closure)
+    after_authorized = authorize_manifest_candidate(
+        root, manifest_path, candidate_id)
     after_path, after_payload, after_closure = source_snapshot()
-    if (after_path != path or after_payload != payload
+    if (
+            after_authorized != authorized
+            or after_authorized.source != authorized.source
+            or after_authorized.source.get('git_commit') != commit
+            or after_path != path or after_payload != payload
             or after_closure != closure):
         raise ValueError('candidate config authority changed during parsing')
     checksum = hashlib.sha256(payload).hexdigest()
@@ -351,6 +473,18 @@ def _config_from_bytes(payload: bytes, *, label: str):
         raise ValueError(f'{label} is not a valid materialized Config') from error
 
 
+def parse_authenticated_config_bytes(
+        payload: bytes, *, expected_sha256: str, label: str):
+    """Parse a captured standalone Config only after authenticating its bytes."""
+    if not isinstance(payload, bytes):
+        raise TypeError(f'{label} payload must be bytes')
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise ValueError(f'{label} captured bytes hash mismatch')
+    config = _config_from_bytes(payload, label=label)
+    ConfigAuthority._config_fingerprint(config)
+    return config
+
+
 def _pwl_runtime_config_snapshot(
         repository_root: Path, manifest_path: Path,
         candidate: str | CandidateSpec, *,
@@ -394,7 +528,8 @@ def _pwl_runtime_config_snapshot(
             runtime_sha256)
 
     conversion_payload, path, payload, checksum = source_snapshot()
-    config = _config_from_bytes(payload, label='PWL runtime config')
+    config = parse_authenticated_config_bytes(
+        payload, expected_sha256=checksum, label='PWL runtime config')
     after = source_snapshot()
     if after != (conversion_payload, path, payload, checksum):
         raise ValueError('PWL runtime config authority changed during parsing')
@@ -578,7 +713,9 @@ def _materialized_config_snapshot(
 
     initial = snapshot()
     authority_payload, path, payload, checksum, _expected, record = initial
-    config = _config_from_bytes(payload, label='materialized evaluation config')
+    config = parse_authenticated_config_bytes(
+        payload, expected_sha256=checksum,
+        label='materialized evaluation config')
     after = snapshot()
     if after[:4] != initial[:4] or after[5] != record:
         raise ValueError('materialized config authority changed during parsing')

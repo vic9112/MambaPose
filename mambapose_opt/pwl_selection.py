@@ -246,8 +246,7 @@ def _load_selection_file(
 def _canonical_envelopes(
         value: Mapping[str, Any], *, repository_root: Path,
         manifest_path: Path) -> dict[str, Mapping[str, Any]]:
-    from mmengine.config import Config
-
+    from .checkpoints import authorize_tracked_config
     from .numeric_calibration import validate_calibration_provenance
     from .schema import load_candidate_manifest
 
@@ -303,7 +302,8 @@ def _canonical_envelopes(
             raise PWLSelectionError(
                 f'{candidate.id} calibration provenance is invalid: '
                 f'{error}') from error
-        config = Config.fromfile(root / candidate.config)
+        config = authorize_tracked_config(
+            root, manifest_path, candidate).load_config()
         pwl = config.numeric_optimization.pwl
         policy = {name: pwl[name] for name in (
             'enabled_function', 'source', 'roles', 'domain', 'segments',

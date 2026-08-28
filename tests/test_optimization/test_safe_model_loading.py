@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -196,6 +197,170 @@ def test_config_authority_returns_reconstructed_config_not_mutable_state(tmp_pat
 
     assert authority.load_config().model.type == 'Fixture'
     authority.verify()
+
+
+def _install_tracked_parse_window_swap(monkeypatch, source_path):
+    original = Config.fromfile
+    authorized = source_path.read_bytes()
+    alternate = authorized.replace(
+        b'authority_tag="tracked"', b'authority_tag="alternate"')
+    assert alternate != authorized
+    observed = []
+
+    def swapped(path, *args, **kwargs):
+        path = Path(path)
+        if path.resolve() != source_path.resolve():
+            return original(path, *args, **kwargs)
+        path.write_bytes(alternate)
+        try:
+            value = original(path, *args, **kwargs)
+            observed.append(value.model.authority_tag)
+            return value
+        finally:
+            path.write_bytes(authorized)
+
+    monkeypatch.setattr(Config, 'fromfile', swapped)
+    return authorized, observed
+
+
+def test_tracked_authority_never_parses_mutable_source_path(
+        tmp_path, monkeypatch):
+    from mambapose_opt.checkpoints import authorize_tracked_config
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}},
+        'model = dict(type="Fixture", authority_tag="tracked")\n')
+    authority = authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    source = tmp_path / 'configs/model.py'
+    authorized, observed = _install_tracked_parse_window_swap(
+        monkeypatch, source)
+
+    loaded = authority.load_config()
+
+    assert loaded.model.authority_tag == 'tracked'
+    assert source.read_bytes() == authorized
+    assert observed == []
+
+
+def test_builder_never_parses_mutable_tracked_source_path(
+        tmp_path, monkeypatch):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {
+            'state_dict': {
+                'weight': torch.tensor([3.0, 4.0], dtype=torch.float32),
+                'counter': torch.tensor([5], dtype=torch.int64),
+            },
+        }, 'model = dict(type="Fixture", authority_tag="tracked")\n')
+    authority = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    source = tmp_path / 'configs/model.py'
+    authorized, observed = _install_tracked_parse_window_swap(
+        monkeypatch, source)
+    captured = {}
+    monkeypatch.setattr(
+        'mmpose.apis.init_model',
+        lambda config, checkpoint, *, device: (
+            captured.update(
+                tag=config.model.authority_tag,
+                checkpoint=checkpoint,
+                device=device) or _ToyModel()))
+
+    model = checkpoints.build_manifest_authorized_model(
+        tmp_path, manifest, 'pwl-silu-s-v1',
+        config_authority=authority, device='cpu')
+
+    assert captured == {
+        'tag': 'tracked', 'checkpoint': None, 'device': 'cpu'}
+    assert torch.equal(model.weight, torch.tensor([3.0, 4.0]))
+    assert source.read_bytes() == authorized
+    assert observed == []
+
+
+def test_tracked_authority_preserves_inherited_config_in_private_tree(
+        tmp_path, monkeypatch):
+    from mambapose_opt.checkpoints import authorize_tracked_config
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}})
+    base = tmp_path / 'configs/base.py'
+    base.write_text(
+        'model = dict(type="Fixture", inherited=True)\n', encoding='utf-8')
+    source = tmp_path / 'configs/model.py'
+    source.write_text(
+        '_base_ = "base.py"\nmodel = dict(authority_tag="tracked")\n',
+        encoding='utf-8')
+    _git('add', 'configs/base.py', 'configs/model.py', cwd=tmp_path)
+    _git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+         'commit', '-qm', 'add inherited config', cwd=tmp_path)
+    original = Config.fromfile
+    parsed = []
+
+    def observe_private_tree(path, *args, **kwargs):
+        path = Path(path)
+        assert path.resolve() != source.resolve()
+        private_root = next(
+            parent for parent in path.parents
+            if parent.name.startswith('mambapose-config-'))
+        parsed.append(private_root)
+        assert not path.is_symlink()
+        assert os.stat(path).st_mode & 0o777 == 0o400
+        assert os.stat(private_root).st_mode & 0o777 == 0o500
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Config, 'fromfile', observe_private_tree)
+
+    config = authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1').load_config()
+
+    assert config.model.type == 'Fixture'
+    assert config.model.inherited is True
+    assert config.model.authority_tag == 'tracked'
+    assert parsed
+    assert all(not path.exists() for path in parsed)
+
+
+def test_tracked_authority_rejects_lazy_temp_path_backed_config(
+        tmp_path, monkeypatch):
+    from mambapose_opt.checkpoints import authorize_tracked_config
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}})
+
+    class LazyConfig:
+        def __init__(self, path):
+            self.path = Path(path)
+
+        def dump(self):
+            return self.path.read_text(encoding='utf-8')
+
+    monkeypatch.setattr(Config, 'fromfile', lambda path: LazyConfig(path))
+
+    with pytest.raises(ValueError, match='not serializable'):
+        authorize_tracked_config(
+            tmp_path, manifest, 'pwl-silu-s-v1')
+
+
+@pytest.mark.parametrize('base', ['/tmp/outside.py', '../../outside.py'])
+def test_tracked_authority_rejects_base_escaping_private_closure(
+        tmp_path, base):
+    from mambapose_opt.checkpoints import authorize_tracked_config
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}})
+    source = tmp_path / 'configs/model.py'
+    source.write_text(
+        f'_base_ = {base!r}\nmodel = dict(type="Fixture")\n',
+        encoding='utf-8')
+    _git('add', 'configs/model.py', cwd=tmp_path)
+    _git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+         'commit', '-qm', 'add escaping base', cwd=tmp_path)
+
+    with pytest.raises(ValueError, match='base.*absolute|base.*escapes'):
+        authorize_tracked_config(
+            tmp_path, manifest, 'pwl-silu-s-v1')
 
 
 def test_public_config_authority_constructor_rejects_forgery(tmp_path):

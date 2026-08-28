@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .checkpoints import (
-    authorize_candidate_checkpoint_reference, authorize_manifest_candidate)
+    authorize_candidate_checkpoint_reference, authorize_manifest_candidate,
+    authorize_tracked_config, parse_authenticated_config_bytes)
 from .numeric_source import (
     file_sha256, resolve_numeric_file, validate_numeric_config_closure,
     validate_numeric_source_binding)
@@ -132,8 +133,8 @@ def validate_numeric_convert_artifact(
             or conversion.get('simulation_only') is not True
             or conversion.get('integer_kernel_latency_claimed') is not False):
         raise NumericRuntimeError('numeric conversion report is invalid')
-    from mmengine.config import Config
-    policy_config = Config.fromfile(repository_root / candidate.config)
+    policy_config = authorize_tracked_config(
+        repository_root, manifest_path, candidate).load_config()
     numeric = policy_config.get('numeric_optimization')
     if not isinstance(numeric, Mapping):
         raise NumericRuntimeError('numeric policy config is missing')
@@ -250,7 +251,12 @@ def validate_numeric_convert_artifact(
                 dict(installation_reference))
             policy_config.numeric_optimization.pwl.selection_artifact = (
                 dict(selection_reference))
-        if Config.fromfile(runtime_path).to_dict() != policy_config.to_dict():
+        runtime_payload = runtime_path.read_bytes()
+        runtime_config = parse_authenticated_config_bytes(
+            runtime_payload,
+            expected_sha256=runtime_reference['sha256'],
+            label='numeric runtime config')
+        if runtime_config.to_dict() != policy_config.to_dict():
             raise NumericRuntimeError(
                 'numeric runtime config was not derived from candidate policy')
     if stage == 'export':

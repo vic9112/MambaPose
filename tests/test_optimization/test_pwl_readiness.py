@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import subprocess
@@ -6,6 +7,20 @@ import subprocess
 import pytest
 import torch
 import torch.nn.functional as F
+
+
+def test_pwl_transitive_validators_do_not_parse_mutable_config_paths():
+    from mambapose_opt.numeric_calibration import (
+        validate_calibration_provenance)
+    from mambapose_opt.numeric_runtime import (
+        validate_numeric_convert_artifact)
+    from mambapose_opt.pwl_selection import _canonical_envelopes
+
+    for function in (
+            validate_calibration_provenance,
+            validate_numeric_convert_artifact,
+            _canonical_envelopes):
+        assert 'Config.fromfile' not in inspect.getsource(function)
 
 
 def _policy(function_name='silu'):
