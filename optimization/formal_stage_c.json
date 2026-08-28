@@ -1,5 +1,11 @@
 {
   "data_authority": {
+    "annotation_archive": {
+      "asset_relative_path": "downloads/annotations_trainval2017.zip",
+      "authority_root": "work_dirs/reproduction",
+      "sha256": "113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268",
+      "target_root": "canonical-main/work_dirs/reproduction"
+    },
     "detections": {
       "asset_relative_path": "coco/person_detection_results/COCO_val2017_detections_AP_H_56_person.json",
       "authority_root": "data",
@@ -18,10 +24,42 @@
       "sha256": "7fc1549d934547c470384d8a207c38707ca33fc016d00e33b795e408603af83e",
       "target_root": "canonical-main/data"
     },
+    "train_image_archive": {
+      "asset_relative_path": "downloads/train2017.zip",
+      "authority_root": "work_dirs/reproduction",
+      "sha256": "69a8bb58ea5f8f99d24875f21416de2e9ded3178e903f1f7603e283b9e06d929",
+      "target_root": "canonical-main/work_dirs/reproduction"
+    },
+    "train_image_corpus": {
+      "archive_prefix": "train2017/",
+      "archive_role": "train_image_archive",
+      "authority_root": "data",
+      "corpus_relative_path": "coco/train2017",
+      "digest_algorithm": "sha256-zip-member-and-extracted-content-v1",
+      "image_count": 118287,
+      "sha256": "f552fb95e1f40129d9726146ddfbadcbf4fb931bf6c8631cf6425a6994999695",
+      "target_root": "canonical-main/data"
+    },
     "validation_annotations": {
       "asset_relative_path": "coco/annotations/person_keypoints_val2017.json",
       "authority_root": "data",
       "sha256": "788e2dae83c86bd547be7fab269d6399df5671063d29a61360cdb2cc370d2b14",
+      "target_root": "canonical-main/data"
+    },
+    "validation_image_archive": {
+      "asset_relative_path": "downloads/val2017.zip",
+      "authority_root": "work_dirs/reproduction",
+      "sha256": "4f7e2ccb2866ec5041993c9cf2a952bbed69647b115d0f74da7ce8f4bef82f05",
+      "target_root": "canonical-main/work_dirs/reproduction"
+    },
+    "validation_image_corpus": {
+      "archive_prefix": "val2017/",
+      "archive_role": "validation_image_archive",
+      "authority_root": "data",
+      "corpus_relative_path": "coco/val2017",
+      "digest_algorithm": "sha256-zip-member-and-extracted-content-v1",
+      "image_count": 5000,
+      "sha256": "6bf5c46be73304e0e8d77af5cf5764eed9e598e1f815f844e3366675c23e610e",
       "target_root": "canonical-main/data"
     }
   },
@@ -210,5 +248,5 @@
       "seed": 4
     }
   ],
-  "schema_version": 1
+  "schema_version": 2
 }

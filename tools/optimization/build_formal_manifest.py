@@ -24,6 +24,7 @@ if str(DEFAULT_ROOT) not in sys.path:
 from mambapose_opt.formal_schema import (  # noqa: E402
     AssetBinding,
     CONDITIONAL_SEEDS,
+    CorpusBinding,
     INITIALIZATION_ID,
     INITIALIZATION_PATH,
     INITIALIZATION_SHA256,
@@ -31,7 +32,9 @@ from mambapose_opt.formal_schema import (  # noqa: E402
     PriorArtifactAuthority,
     canonical_main_root,
     config_closure_sha256,
+    validate_canonical_formal_config_closure,
     validate_asset_binding,
+    validate_data_authority,
     validate_prior_artifact_authority,
 )
 
@@ -46,6 +49,37 @@ _DATA_ASSETS = {
         'data',
         'coco/person_detection_results/'
         'COCO_val2017_detections_AP_H_56_person.json'),
+    'annotation_archive': (
+        'work_dirs/reproduction',
+        'downloads/annotations_trainval2017.zip'),
+    'train_image_archive': (
+        'work_dirs/reproduction', 'downloads/train2017.zip'),
+    'validation_image_archive': (
+        'work_dirs/reproduction', 'downloads/val2017.zip'),
+}
+_DATA_CORPORA = {
+    'train_image_corpus': {
+        'authority_root': 'data',
+        'target_root': 'canonical-main/data',
+        'corpus_relative_path': 'coco/train2017',
+        'archive_role': 'train_image_archive',
+        'archive_prefix': 'train2017/',
+        'image_count': 118287,
+        'digest_algorithm': 'sha256-zip-member-and-extracted-content-v1',
+        'sha256': (
+            'f552fb95e1f40129d9726146ddfbadcbf4fb931bf6c8631cf6425a6994999695'),
+    },
+    'validation_image_corpus': {
+        'authority_root': 'data',
+        'target_root': 'canonical-main/data',
+        'corpus_relative_path': 'coco/val2017',
+        'archive_role': 'validation_image_archive',
+        'archive_prefix': 'val2017/',
+        'image_count': 5000,
+        'digest_algorithm': 'sha256-zip-member-and-extracted-content-v1',
+        'sha256': (
+            '6bf5c46be73304e0e8d77af5cf5764eed9e598e1f815f844e3366675c23e610e'),
+    },
 }
 _TARGET_ROOTS = {
     'pretrained': 'canonical-main/pretrained',
@@ -207,6 +241,11 @@ def validate_paired_config_symmetry(
             or actual_no_pif != _expected_leaf('no_pif', seed)):
         raise ValueError(
             f'paired config symmetry mismatch for seed {seed}')
+    try:
+        validate_canonical_formal_config_closure(root)
+    except ValueError as error:
+        raise ValueError(f'paired config canonical closure mismatch: {error}') \
+            from error
 
 
 def build_manifest_document(
@@ -243,6 +282,18 @@ def build_manifest_document(
         name: _asset_binding(root, canonical, authority, relative)
         for name, (authority, relative) in _DATA_ASSETS.items()
     }
+    data_authority.update(_DATA_CORPORA)
+    parsed_data = {
+        name: AssetBinding.from_dict(document, repository_root=root)
+        for name, document in data_authority.items()
+        if name in _DATA_ASSETS}
+    parsed_data.update({
+        name: CorpusBinding.from_dict(document)
+        for name, document in data_authority.items()
+        if name in _DATA_CORPORA})
+    validate_data_authority(
+        parsed_data, repository_root=root,
+        canonical_repository_root=canonical)
     prior_artifact = _prior_artifact_binding(root, canonical)
     initialization_asset = _asset_binding(
         root, canonical, 'pretrained', INITIALIZATION_PATH.name)
@@ -250,7 +301,7 @@ def build_manifest_document(
     if initialization_sha256 != INITIALIZATION_SHA256:
         raise ValueError('formal initialization SHA-256 mismatch')
     return {
-        'schema_version': 1,
+        'schema_version': 2,
         'experiment_id': 'mambapose-formal-stage-c',
         'initialization': {
             'id': INITIALIZATION_ID,

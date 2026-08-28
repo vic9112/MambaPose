@@ -382,23 +382,48 @@ def _validate_existing(destination: Path, expected: bytes) -> str:
         raise PriorBundleError('existing bundle does not match authority')
     document = json.loads(expected)
     allowed = {'bundle.json'}
+    allowed_directories: set[str] = set()
     for record in document['entries'].values():
         relative = Path(record['path'])
         allowed.add(relative.as_posix())
+        parent = relative.parent
+        while parent != Path('.'):
+            allowed_directories.add(parent.as_posix())
+            parent = parent.parent
         candidate = destination / relative
         if (
                 _sha256_file(candidate) != record['sha256']
                 or candidate.stat().st_size != record['bytes']):
             raise PriorBundleError('existing bundle file mismatch')
-    actual = {
-        path.relative_to(destination).as_posix()
-        for path in destination.rglob('*') if path.is_file()}
+    actual = set()
+    actual_directories = set()
+    for path in destination.rglob('*'):
+        relative = path.relative_to(destination).as_posix()
+        if path.is_symlink():
+            raise PriorBundleError('existing bundle contains an unexpected symlink')
+        if path.is_file():
+            actual.add(relative)
+        elif path.is_dir():
+            actual_directories.add(relative)
+        else:
+            raise PriorBundleError('existing bundle contains an unexpected entry')
     if actual != allowed:
         raise PriorBundleError('existing bundle contains unexpected files')
-    for path in destination.rglob('*'):
+    if actual_directories != allowed_directories:
+        raise PriorBundleError('existing bundle contains unexpected directories')
+    for path in (destination, *destination.rglob('*')):
         if path.stat().st_mode & stat.S_IWUSR:
             raise PriorBundleError('existing bundle is not read-only')
     return _sha256_file(manifest)
+
+
+def _reject_parent_symlinks(path: Path, field: str) -> None:
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise PriorBundleError(f'{field} parent must not be a symlink')
 
 
 def _preflight_link(link: Path, destination: Path) -> None:
@@ -443,6 +468,8 @@ def _prepare_prior_bundle(
     audit = Path(audit_report).absolute()
     if target == source or target == link or source in target.parents:
         raise PriorBundleError('bundle paths overlap source or link authority')
+    _reject_parent_symlinks(target, 'bundle destination')
+    _reject_parent_symlinks(link, 'logical link')
     _verify_source(source, expected_source_commit)
     entries, sources = _collect_entries(
         source, audit, expected_source_commit, expected_hashes)
@@ -491,6 +518,8 @@ def _check_prior_bundle(
     source = Path(source_root).absolute()
     target = Path(destination).absolute()
     link = Path(logical_link).absolute()
+    _reject_parent_symlinks(target, 'bundle destination')
+    _reject_parent_symlinks(link, 'logical link')
     _verify_source(source, expected_source_commit)
     entries, _sources = _collect_entries(
         source, Path(audit_report).absolute(), expected_source_commit,
@@ -504,35 +533,25 @@ def _check_prior_bundle(
     return PriorBundleResult('current', target, link, bundle_sha)
 
 
-def prepare_prior_bundle(
-        *, source_root: Path | str = DEFAULT_SOURCE_ROOT,
-        destination: Path | str = CANONICAL_DESTINATION,
-        logical_link: Path | str = DEFAULT_LOGICAL_LINK,
-        audit_report: Path | str = DEFAULT_AUDIT_REPORT,
-        ) -> PriorBundleResult:
+def prepare_prior_bundle() -> PriorBundleResult:
     """Prepare only the predeclared, independently audited authority."""
     return _prepare_prior_bundle(
-        source_root=source_root,
-        destination=destination,
-        logical_link=logical_link,
-        audit_report=audit_report,
+        source_root=DEFAULT_SOURCE_ROOT,
+        destination=CANONICAL_DESTINATION,
+        logical_link=DEFAULT_LOGICAL_LINK,
+        audit_report=DEFAULT_AUDIT_REPORT,
         expected_source_commit=SOURCE_COMMIT,
         expected_hashes=PRODUCTION_HASHES,
         unpruned_parent_sha256=UNPRUNED_PARENT_SHA256)
 
 
-def check_prior_bundle(
-        *, source_root: Path | str = DEFAULT_SOURCE_ROOT,
-        destination: Path | str = CANONICAL_DESTINATION,
-        logical_link: Path | str = DEFAULT_LOGICAL_LINK,
-        audit_report: Path | str = DEFAULT_AUDIT_REPORT,
-        ) -> PriorBundleResult:
+def check_prior_bundle() -> PriorBundleResult:
     """Read-only validation of only the predeclared authority."""
     return _check_prior_bundle(
-        source_root=source_root,
-        destination=destination,
-        logical_link=logical_link,
-        audit_report=audit_report,
+        source_root=DEFAULT_SOURCE_ROOT,
+        destination=CANONICAL_DESTINATION,
+        logical_link=DEFAULT_LOGICAL_LINK,
+        audit_report=DEFAULT_AUDIT_REPORT,
         expected_source_commit=SOURCE_COMMIT,
         expected_hashes=PRODUCTION_HASHES,
         unpruned_parent_sha256=UNPRUNED_PARENT_SHA256)
@@ -541,33 +560,19 @@ def check_prior_bundle(
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument('--check', type=Path)
-    parser.add_argument('--source-root', type=Path, default=DEFAULT_SOURCE_ROOT)
-    parser.add_argument('--destination', type=Path, default=CANONICAL_DESTINATION)
-    parser.add_argument('--logical-link', type=Path, default=DEFAULT_LOGICAL_LINK)
-    parser.add_argument('--audit-report', type=Path, default=DEFAULT_AUDIT_REPORT)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.check is not None:
-        expected_manifest = args.logical_link / 'bundle.json'
+        expected_manifest = DEFAULT_LOGICAL_LINK / 'bundle.json'
         if args.check.absolute() != expected_manifest.absolute():
             raise PriorBundleError(
                 '--check must name the declared logical bundle manifest')
-        result = check_prior_bundle(
-            source_root=args.source_root,
-            destination=args.destination,
-            logical_link=args.logical_link,
-            audit_report=args.audit_report,
-        )
+        result = check_prior_bundle()
     else:
-        result = prepare_prior_bundle(
-            source_root=args.source_root,
-            destination=args.destination,
-            logical_link=args.logical_link,
-            audit_report=args.audit_report,
-        )
+        result = prepare_prior_bundle()
     print(json.dumps({
         'status': result.status,
         'destination': str(result.destination),

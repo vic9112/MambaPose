@@ -211,6 +211,9 @@ def test_production_bundle_check_is_read_only_and_standard_library_only():
 def test_production_inventory_is_predeclared_and_not_caller_substitutable():
     tool = _load_tool()
     parameters = inspect.signature(tool.prepare_prior_bundle).parameters
+    check_parameters = inspect.signature(tool.check_prior_bundle).parameters
+    assert not parameters
+    assert not check_parameters
     assert 'expected_hashes' not in parameters
     assert 'expected_source_commit' not in parameters
     assert tool.PRODUCTION_HASHES['train'].startswith('ea276713')
@@ -218,6 +221,52 @@ def test_production_inventory_is_predeclared_and_not_caller_substitutable():
     assert tool.PRODUCTION_HASHES['parent_config'].startswith('706eaa31')
     with pytest.raises(TypeError):
         tool.PRODUCTION_HASHES['train'] = '0' * 64
+
+
+def test_production_cli_has_no_authority_path_overrides():
+    tool = _load_tool()
+    with pytest.raises(SystemExit):
+        tool._parse_args(['--source-root', '/tmp/alternate'])
+    with pytest.raises(SystemExit):
+        tool._parse_args(['--destination', '/tmp/alternate'])
+    with pytest.raises(SystemExit):
+        tool._parse_args(['--logical-link', '/tmp/alternate'])
+    with pytest.raises(SystemExit):
+        tool._parse_args(['--audit-report', '/tmp/alternate'])
+
+
+def test_prepare_bundle_rejects_symlinked_logical_parent(tmp_path):
+    tool = _load_tool()
+    source, audit, commit, hashes = _fake_source(tmp_path)
+    destination = tmp_path / 'canonical/no-pif-seed0'
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    (runtime / 'work_dirs').symlink_to(outside, target_is_directory=True)
+    link = runtime / 'work_dirs/optimization/prior-stage-b'
+    with pytest.raises(tool.PriorBundleError, match='parent.*symlink'):
+        tool._prepare_prior_bundle(
+            source_root=source, destination=destination, logical_link=link,
+            audit_report=audit, expected_source_commit=commit,
+            expected_hashes=hashes, unpruned_parent_sha256='1' * 64)
+    assert not destination.exists()
+    assert not (outside / 'optimization/prior-stage-b').exists()
+
+
+def test_existing_bundle_rejects_writable_root(tmp_path):
+    tool = _load_tool()
+    source, audit, commit, hashes = _fake_source(tmp_path)
+    destination = tmp_path / 'canonical/no-pif-seed0'
+    link = tmp_path / 'runtime/work_dirs/optimization/prior-stage-b'
+    kwargs = dict(
+        source_root=source, destination=destination, logical_link=link,
+        audit_report=audit, expected_source_commit=commit,
+        expected_hashes=hashes, unpruned_parent_sha256='1' * 64)
+    tool._prepare_prior_bundle(**kwargs)
+    destination.chmod(0o755)
+    with pytest.raises(tool.PriorBundleError, match='read-only'):
+        tool._check_prior_bundle(**kwargs)
 
 
 def test_compound_initial_substitution_fails_before_bundle_manifest(tmp_path):

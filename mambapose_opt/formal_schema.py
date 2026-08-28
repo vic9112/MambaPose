@@ -11,12 +11,13 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
+import zipfile
 
 
 INITIALIZATION_ID = 'vmamba-t-imagenet-262'
@@ -45,9 +46,13 @@ _RUN_FIELDS = frozenset({
     'run_id', 'role', 'seed', 'conditional', 'config', 'config_sha256',
     'initialization_id', 'output_root',
 })
-_DATA_FIELDS = frozenset({
+_DATA_FILE_FIELDS = frozenset({
     'inventory', 'train_annotations', 'validation_annotations', 'detections',
+    'annotation_archive', 'train_image_archive', 'validation_image_archive',
 })
+_DATA_CORPUS_FIELDS = frozenset({
+    'train_image_corpus', 'validation_image_corpus'})
+_DATA_FIELDS = _DATA_FILE_FIELDS | _DATA_CORPUS_FIELDS
 _FILE_BINDING_FIELDS = frozenset({'path', 'sha256'})
 _ASSET_BINDING_FIELDS = frozenset({
     'authority_root', 'target_root', 'asset_relative_path', 'sha256'})
@@ -55,6 +60,88 @@ _ASSET_AUTHORITIES = MappingProxyType({
     'pretrained': 'canonical-main/pretrained',
     'data': 'canonical-main/data',
     'work_dirs/reproduction': 'canonical-main/work_dirs/reproduction',
+})
+_CANONICAL_DATA_FILES = MappingProxyType({
+    'inventory': (
+        'data', 'inventory.json',
+        '2a82ab3cfe05a514d141c17921463e72f22741d67eaf978d93317155bbeaf0ed'),
+    'train_annotations': (
+        'data', 'coco/annotations/person_keypoints_train2017.json',
+        '7fc1549d934547c470384d8a207c38707ca33fc016d00e33b795e408603af83e'),
+    'validation_annotations': (
+        'data', 'coco/annotations/person_keypoints_val2017.json',
+        '788e2dae83c86bd547be7fab269d6399df5671063d29a61360cdb2cc370d2b14'),
+    'detections': (
+        'data',
+        ('coco/person_detection_results/'
+         'COCO_val2017_detections_AP_H_56_person.json'),
+        '53ba0ad8d0fd461c5a000cd90797fa8c39cd8c38cd125125c0412626ff592d59'),
+    'annotation_archive': (
+        'work_dirs/reproduction', 'downloads/annotations_trainval2017.zip',
+        '113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268'),
+    'train_image_archive': (
+        'work_dirs/reproduction', 'downloads/train2017.zip',
+        '69a8bb58ea5f8f99d24875f21416de2e9ded3178e903f1f7603e283b9e06d929'),
+    'validation_image_archive': (
+        'work_dirs/reproduction', 'downloads/val2017.zip',
+        '4f7e2ccb2866ec5041993c9cf2a952bbed69647b115d0f74da7ce8f4bef82f05'),
+})
+_CORPUS_BINDING_FIELDS = frozenset({
+    'authority_root', 'target_root', 'corpus_relative_path', 'archive_role',
+    'archive_prefix', 'image_count', 'digest_algorithm', 'sha256',
+})
+_CORPUS_ALGORITHM = 'sha256-zip-member-and-extracted-content-v1'
+_CANONICAL_CORPORA = MappingProxyType({
+    'train_image_corpus': MappingProxyType({
+        'corpus_relative_path': 'coco/train2017',
+        'archive_role': 'train_image_archive',
+        'archive_prefix': 'train2017/',
+        'image_count': 118287,
+        'sha256': 'f552fb95e1f40129d9726146ddfbadcbf4fb931bf6c8631cf6425a6994999695',
+    }),
+    'validation_image_corpus': MappingProxyType({
+        'corpus_relative_path': 'coco/val2017',
+        'archive_role': 'validation_image_archive',
+        'archive_prefix': 'val2017/',
+        'image_count': 5000,
+        'sha256': '6bf5c46be73304e0e8d77af5cf5764eed9e598e1f815f844e3366675c23e610e',
+    }),
+})
+_INVENTORY_PROJECTION = MappingProxyType({
+    'coco-train2017': MappingProxyType({
+        'path': 'work_dirs/reproduction/downloads/train2017.zip',
+        'sha256': _CANONICAL_DATA_FILES['train_image_archive'][2],
+        'required_paths': ('data/coco/train2017',),
+    }),
+    'coco-val2017': MappingProxyType({
+        'path': 'work_dirs/reproduction/downloads/val2017.zip',
+        'sha256': _CANONICAL_DATA_FILES['validation_image_archive'][2],
+        'required_paths': ('data/coco/val2017',),
+    }),
+    'coco-annotations': MappingProxyType({
+        'path': 'work_dirs/reproduction/downloads/annotations_trainval2017.zip',
+        'sha256': _CANONICAL_DATA_FILES['annotation_archive'][2],
+        'required_paths': (
+            'data/coco/annotations/person_keypoints_train2017.json',
+            'data/coco/annotations/person_keypoints_val2017.json'),
+    }),
+    'coco-val-detections': MappingProxyType({
+        'path': 'data/' + _CANONICAL_DATA_FILES['detections'][1],
+        'sha256': _CANONICAL_DATA_FILES['detections'][2],
+        'required_paths': (
+            'data/' + _CANONICAL_DATA_FILES['detections'][1],),
+    }),
+})
+_CANONICAL_CONFIG_FILES = MappingProxyType({
+    'configs/optimization/formal_stage_c/_base_/paired_300ep.py': (
+        'ac32c37c4ec3c87a195e5ee6fd705da02212ed04c8c9f865b04af027091ba84b'),
+    'configs/reproduction/coco_s_v1.py': (
+        '7aa78c2b8394b57b16517380a479adb5c3b3161cadb802c26c2d2f66583a6b34'),
+    ('configs/body_2d_keypoint/tokenpose/'
+     'mamba_tokenpose_T2_coco_256x192_300ep.py'): (
+        'f04bba18bc32e5eec64173f9e1106a3bd9d0f19ed07e9a8db83f66d5ddda905b'),
+    'configs/_base_/default_runtime.py': (
+        'bb7df18270b1ca337192faae7a416b2dea23b45e798e832caab5781f41189d06'),
 })
 _PRIOR_FIELDS = frozenset({
     'link_root', 'target_root', 'bundle_manifest_sha256', 'source_commit',
@@ -152,6 +239,52 @@ class AssetBinding:
             asset_relative_path=relative,
             sha256=_require_sha256(
                 document['sha256'], 'asset binding SHA-256'))
+
+
+@dataclass(frozen=True)
+class CorpusBinding:
+    authority_root: Literal['data']
+    target_root: str
+    corpus_relative_path: Path
+    archive_role: Literal['train_image_archive', 'validation_image_archive']
+    archive_prefix: str
+    image_count: int
+    digest_algorithm: str
+    sha256: str
+
+    @property
+    def path(self) -> Path:
+        return Path(self.authority_root) / self.corpus_relative_path
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> CorpusBinding:
+        document = _require_mapping(value, 'image corpus authority')
+        _require_exact_fields(
+            document, _CORPUS_BINDING_FIELDS, 'image corpus authority')
+        if document['authority_root'] != 'data' \
+                or document['target_root'] != 'canonical-main/data':
+            raise FormalManifestError(
+                'image corpus authority root is not canonical')
+        relative = _safe_relative_path(
+            document['corpus_relative_path'], 'corpus_relative_path')
+        archive_role = document['archive_role']
+        if archive_role not in {
+                'train_image_archive', 'validation_image_archive'}:
+            raise FormalManifestError('image corpus archive role is invalid')
+        prefix = document['archive_prefix']
+        if not isinstance(prefix, str) or not prefix.endswith('/'):
+            raise FormalManifestError('image corpus archive prefix is invalid')
+        if document['digest_algorithm'] != _CORPUS_ALGORITHM:
+            raise FormalManifestError('image corpus digest algorithm is invalid')
+        return cls(
+            authority_root='data', target_root='canonical-main/data',
+            corpus_relative_path=relative, archive_role=archive_role,
+            archive_prefix=prefix,
+            image_count=_require_int(
+                document['image_count'], 'image_count', minimum=1),
+            digest_algorithm=_CORPUS_ALGORITHM,
+            sha256=_require_sha256(
+                document['sha256'], 'image corpus SHA-256'))
 
 
 @dataclass(frozen=True)
@@ -275,7 +408,7 @@ class FormalStageCManifest:
     experiment_id: str
     initialization: InitializationAuthority
     protocol: FormalProtocol
-    data_authority: Mapping[str, AssetBinding]
+    data_authority: Mapping[str, AssetBinding | CorpusBinding]
     prior_artifact: PriorArtifactAuthority
     runs: tuple[FormalRunSpec, ...]
     repository_root: Path
@@ -286,8 +419,9 @@ class FormalStageCManifest:
             repository_root: Path | str) -> FormalStageCManifest:
         document = _require_mapping(value, 'manifest')
         _require_exact_fields(document, _MANIFEST_FIELDS, 'manifest')
-        if document['schema_version'] != 1:
-            raise FormalManifestError('schema_version must be 1')
+        if isinstance(document['schema_version'], bool) \
+                or document['schema_version'] != 2:
+            raise FormalManifestError('schema_version must be 2')
         if document['experiment_id'] != 'mambapose-formal-stage-c':
             raise FormalManifestError(
                 'experiment_id must be mambapose-formal-stage-c')
@@ -333,7 +467,7 @@ class FormalStageCManifest:
             _validate_canonical_run(run)
 
         return cls(
-            schema_version=1,
+            schema_version=2,
             experiment_id='mambapose-formal-stage-c',
             initialization=initialization,
             protocol=protocol,
@@ -366,7 +500,9 @@ class FormalRunInit:
     @classmethod
     def from_dict(
             cls, value: Mapping[str, Any], *,
-            repository_root: Path | str) -> FormalRunInit:
+            repository_root: Path | str,
+            manifest: FormalStageCManifest | None = None,
+            expected_manifest_sha256: str | None = None) -> FormalRunInit:
         document = _require_mapping(value, 'run init')
         root = Path(repository_root).resolve(strict=False)
         fields = frozenset({
@@ -375,7 +511,8 @@ class FormalRunInit:
             'initialization',
         })
         _require_exact_fields(document, fields, 'run init')
-        if document['schema_version'] != 1:
+        if isinstance(document['schema_version'], bool) \
+                or document['schema_version'] != 1:
             raise FormalManifestError('run init schema_version must be 1')
 
         source = _require_mapping(document['source'], 'source')
@@ -396,13 +533,19 @@ class FormalRunInit:
         _validate_internal_relative_path(root, config_path, 'config path')
 
         data = _require_mapping(document['data_authority'], 'data authority')
-        expected_data = frozenset({
-            'inventory_sha256', 'train_annotations_sha256',
-            'validation_annotations_sha256', 'detections_sha256',
-        })
+        expected_data = frozenset(
+            f'{name}_sha256' for name in _DATA_FIELDS)
         _require_exact_fields(data, expected_data, 'data authority')
         normalized_data = {
             key: _require_sha256(item, key) for key, item in data.items()}
+        canonical_data = {
+            f'{name}_sha256': values[2]
+            for name, values in _CANONICAL_DATA_FILES.items()}
+        canonical_data.update({
+            f'{name}_sha256': values['sha256']
+            for name, values in _CANONICAL_CORPORA.items()})
+        if normalized_data != canonical_data:
+            raise FormalManifestError('run init data authority mismatch')
 
         run = _require_mapping(document['run'], 'run')
         run_fields = frozenset({
@@ -411,11 +554,19 @@ class FormalRunInit:
         })
         _require_exact_fields(run, run_fields, 'run')
         run_id, role, seed = _parse_run_identity(run)
+        expected_id, expected_config, expected_output = _canonical_run_identity(
+            role, seed)
+        if run_id != expected_id:
+            raise FormalManifestError('run identity is not canonical')
+        if config_path != expected_config:
+            raise FormalManifestError('run config is not canonical')
         epochs = _require_int(run['epochs'], 'epochs', minimum=1)
         if epochs != 300:
             raise FormalManifestError('formal training requires 300 epochs')
         worker_count = _require_int(
             run['worker_count'], 'worker_count', minimum=0)
+        if worker_count != 2:
+            raise FormalManifestError('formal worker count must be 2')
         if run['persistent_workers'] is not False:
             raise FormalManifestError('persistent workers must be disabled')
         output_root = _safe_formal_output_root(
@@ -423,16 +574,71 @@ class FormalRunInit:
         _validate_internal_relative_path(root, output_root, 'output_root')
         if output_root.name != run_id:
             raise FormalManifestError('output_root must end in the run id')
+        if output_root != expected_output:
+            raise FormalManifestError('run output_root is not canonical')
+        effective_batch_size = _require_int(
+            run['effective_batch_size'], 'effective_batch_size', minimum=1)
+        if effective_batch_size != 128:
+            raise FormalManifestError('formal effective batch must be 128')
+        closure_sha256 = _require_sha256(
+            config['closure_sha256'], 'config closure SHA-256')
+        try:
+            observed_closure = config_closure_sha256(root, config_path)
+        except (OSError, SyntaxError, ValueError) as error:
+            raise FormalManifestError(
+                f'run config closure cannot be verified: {error}') from error
+        if observed_closure != closure_sha256:
+            raise FormalManifestError('run config closure SHA-256 mismatch')
+        resolved_sha256 = _require_sha256(
+            config['resolved_sha256'], 'resolved config SHA-256')
+        expected_resolved = formal_resolved_config_sha256(
+            root, role=role, seed=seed)
+        if resolved_sha256 != expected_resolved:
+            raise FormalManifestError('run resolved config SHA-256 mismatch')
+
+        manifest_sha256 = _require_sha256(
+            document['manifest_sha256'], 'manifest_sha256')
+        initialization = _parse_initialization(
+            document['initialization'], repository_root=root)
+        if (manifest is None) != (expected_manifest_sha256 is None):
+            raise FormalManifestError(
+                'manifest and expected manifest SHA-256 must be supplied together')
+        if manifest is not None:
+            expected_manifest = _require_sha256(
+                expected_manifest_sha256, 'expected manifest SHA-256')
+            if manifest_sha256 != expected_manifest:
+                raise FormalManifestError('run init manifest SHA-256 mismatch')
+            matching = tuple(
+                item for item in manifest.runs if item.run_id == run_id)
+            if len(matching) != 1:
+                raise FormalManifestError(
+                    'run init is absent from the manifest authority')
+            spec = matching[0]
+            if (
+                    spec.role != role or spec.seed != seed
+                    or spec.config != config_path
+                    or spec.config_sha256 != closure_sha256
+                    or spec.output_root != output_root
+                    or manifest.protocol.epochs != epochs
+                    or manifest.protocol.worker_count != worker_count
+                    or manifest.protocol.effective_batch_size
+                    != effective_batch_size
+                    or manifest.initialization != initialization):
+                raise FormalManifestError(
+                    'run init does not match manifest authority')
+            manifest_data = {
+                f'{name}_sha256': binding.sha256
+                for name, binding in manifest.data_authority.items()}
+            if normalized_data != manifest_data:
+                raise FormalManifestError(
+                    'run init data authority does not match manifest')
 
         return cls(
-            manifest_sha256=_require_sha256(
-                document['manifest_sha256'], 'manifest_sha256'),
+            manifest_sha256=manifest_sha256,
             git_commit=commit,
             config=config_path,
-            config_closure_sha256=_require_sha256(
-                config['closure_sha256'], 'config closure SHA-256'),
-            resolved_config_sha256=_require_sha256(
-                config['resolved_sha256'], 'resolved config SHA-256'),
+            config_closure_sha256=closure_sha256,
+            resolved_config_sha256=resolved_sha256,
             environment_inventory_sha256=_require_sha256(
                 document['environment_inventory_sha256'],
                 'environment inventory SHA-256'),
@@ -441,13 +647,11 @@ class FormalRunInit:
             role=role,
             seed=seed,
             epochs=epochs,
-            effective_batch_size=_require_int(
-                run['effective_batch_size'], 'effective_batch_size', minimum=1),
+            effective_batch_size=effective_batch_size,
             worker_count=worker_count,
             persistent_workers=False,
             output_root=output_root,
-            initialization=_parse_initialization(
-                document['initialization'], repository_root=root),
+            initialization=initialization,
         )
 
 
@@ -469,7 +673,10 @@ class FormalTrainResult:
     @classmethod
     def from_dict(
             cls, value: Mapping[str, Any], *,
-            repository_root: Path | str) -> FormalTrainResult:
+            repository_root: Path | str,
+            verify_files: bool = False,
+            run_init: FormalRunInit | None = None,
+            expected_run_init_sha256: str | None = None) -> FormalTrainResult:
         document = _require_mapping(value, 'train result')
         root = Path(repository_root).resolve(strict=False)
         fields = frozenset({
@@ -478,7 +685,8 @@ class FormalTrainResult:
             'order_hashes', 'final_epoch', 'status',
         })
         _require_exact_fields(document, fields, 'train result')
-        if document['schema_version'] != 1:
+        if isinstance(document['schema_version'], bool) \
+                or document['schema_version'] != 1:
             raise FormalManifestError('train result schema_version must be 1')
         initialization = _parse_initialization(
             document['initialization'], repository_root=root)
@@ -487,11 +695,18 @@ class FormalTrainResult:
         _require_exact_fields(
             run, {'run_id', 'role', 'seed', 'output_root'}, 'run')
         run_id, role, seed = _parse_run_identity(run)
+        expected_id, _expected_config, expected_output = _canonical_run_identity(
+            role, seed)
+        if run_id != expected_id:
+            raise FormalManifestError('train result run identity is not canonical')
         output_root = _safe_formal_output_root(
             run['output_root'], 'output_root')
         _validate_internal_relative_path(root, output_root, 'output_root')
         if output_root.name != run_id:
             raise FormalManifestError('output_root must end in the run id')
+        if output_root != expected_output:
+            raise FormalManifestError(
+                'train result output_root is not canonical')
 
         best = _parse_file_binding(
             document['best_checkpoint'], 'best_checkpoint',
@@ -512,21 +727,80 @@ class FormalTrainResult:
             if binding.path.parent != output_root:
                 raise FormalManifestError(
                     'all train outputs must be under the declared output root')
+        resume_paths = tuple(binding.path for binding in resume)
+        resume_hashes = tuple(binding.sha256 for binding in resume)
+        if len(set(resume_paths)) != 2 or len(set(resume_hashes)) != 2:
+            raise FormalManifestError(
+                'resume checkpoints must be distinct')
+        expected_resume = (
+            output_root / 'epoch_299.pth', output_root / 'epoch_300.pth')
+        if resume_paths != expected_resume:
+            raise FormalManifestError(
+                'resume checkpoints must be the chronological latest two')
+        if best.path in set(resume_paths):
+            raise FormalManifestError(
+                'best checkpoint must not impersonate a resume checkpoint')
+        if not best.path.name.startswith('best_') or best.path.suffix != '.pth':
+            raise FormalManifestError('best checkpoint path is not canonical')
+        if log.path != output_root / 'training.jsonl':
+            raise FormalManifestError('structured log path is not canonical')
 
         raw_hashes = document['order_hashes']
         if not isinstance(raw_hashes, list) or len(raw_hashes) != 300:
             raise FormalManifestError('train result requires 300 order hashes')
-        order_hashes = tuple(
-            _require_sha256(item, f'order_hashes[{index}]')
-            for index, item in enumerate(raw_hashes))
+        order_hash_values: list[str] = []
+        for index, item in enumerate(raw_hashes, start=1):
+            record = _require_mapping(
+                item, f'order_hashes[{index - 1}]')
+            _require_exact_fields(
+                record, {'epoch', 'sha256'},
+                f'order_hashes[{index - 1}]')
+            epoch = _require_int(
+                record['epoch'], f'order_hashes[{index - 1}].epoch',
+                minimum=1)
+            if epoch != index:
+                raise FormalManifestError(
+                    'train result order hash epoch sequence is not canonical')
+            order_hash_values.append(_require_sha256(
+                record['sha256'],
+                f'order_hashes[{index - 1}].sha256'))
+        order_hashes = tuple(order_hash_values)
+        if len(set(order_hashes)) != 300:
+            raise FormalManifestError(
+                'train result order hashes must be distinct')
         if document['final_epoch'] != 300:
             raise FormalManifestError('final epoch must be 300')
         if document['status'] != 'complete':
             raise FormalManifestError('train result status must be complete')
+        if verify_files:
+            for field, binding in (
+                    ('best_checkpoint', best),
+                    ('resume_checkpoints[0]', resume[0]),
+                    ('resume_checkpoints[1]', resume[1]),
+                    ('structured_log', log)):
+                _verify_file(root, binding, field)
+
+        run_init_sha256 = _require_sha256(
+            document['run_init_sha256'], 'run_init_sha256')
+        if (run_init is None) != (expected_run_init_sha256 is None):
+            raise FormalManifestError(
+                'run init and expected run init SHA-256 must be supplied together')
+        if run_init is not None:
+            expected_init = _require_sha256(
+                expected_run_init_sha256, 'expected run init SHA-256')
+            if run_init_sha256 != expected_init:
+                raise FormalManifestError(
+                    'train result run init SHA-256 mismatch')
+            if (
+                    run_init.run_id != run_id or run_init.role != role
+                    or run_init.seed != seed
+                    or run_init.output_root != output_root
+                    or run_init.initialization != initialization):
+                raise FormalManifestError(
+                    'train result does not match run init authority')
 
         return cls(
-            run_init_sha256=_require_sha256(
-                document['run_init_sha256'], 'run_init_sha256'),
+            run_init_sha256=run_init_sha256,
             initialization=initialization,
             run_id=run_id,
             role=role,
@@ -566,23 +840,112 @@ def load_formal_manifest(
         if actual != run.config_sha256:
             raise FormalManifestError(
                 f'{run.run_id} config closure SHA-256 mismatch')
+    validate_canonical_formal_config_closure(root)
     canonical_root = canonical_main_root(root)
     validate_asset_binding(
         manifest.initialization.asset,
         repository_root=root,
         canonical_repository_root=canonical_root,
         field='initialization authority')
-    for name, binding in manifest.data_authority.items():
-        validate_asset_binding(
-            binding,
-            repository_root=root,
-            canonical_repository_root=canonical_root,
-            field=f'data authority {name}')
+    validate_data_authority(
+        manifest.data_authority, repository_root=root,
+        canonical_repository_root=canonical_root)
     validate_prior_artifact_authority(
         manifest.prior_artifact,
         repository_root=root,
         canonical_repository_root=canonical_root)
     return manifest
+
+
+def _load_runtime_json(
+        path: Path | str, *, repository_root: Path,
+        field: str) -> tuple[Path, Mapping[str, Any]]:
+    source = Path(path)
+    if not source.is_absolute():
+        source = repository_root / source
+    lexical = source.absolute()
+    try:
+        relative = lexical.relative_to(repository_root)
+    except ValueError as error:
+        raise FormalManifestError(
+            f'{field} must remain inside the worktree') from error
+    if not relative.parts:
+        raise FormalManifestError(f'{field} must name a file')
+    _reject_symlink_components(repository_root, relative, field)
+    if source.is_symlink() or not source.is_file():
+        raise FormalManifestError(f'{field} file is missing')
+    try:
+        document = json.loads(source.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise FormalManifestError(f'{field} is malformed: {error}') from error
+    return source, _require_mapping(document, field)
+
+
+def _validate_formal_source_authority(
+        repository_root: Path | str, expected_commit: str) -> None:
+    root = Path(repository_root).resolve(strict=True)
+    commit = _require_commit(expected_commit, 'formal source commit')
+    try:
+        head = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=root, text=True,
+            stderr=subprocess.DEVNULL).strip()
+        attached = subprocess.run(
+            ['git', 'symbolic-ref', '-q', 'HEAD'], cwd=root,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False)
+        status_output = subprocess.check_output(
+            ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+            cwd=root, text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise FormalManifestError(
+            'formal source Git authority cannot be verified') from error
+    if head != commit:
+        raise FormalManifestError('formal source HEAD commit mismatch')
+    if attached.returncode == 0:
+        raise FormalManifestError('formal source must be detached')
+    if attached.returncode != 1:
+        raise FormalManifestError('formal source attachment cannot be verified')
+    if status_output:
+        raise FormalManifestError('formal source tracked tree must be clean')
+
+
+def load_formal_run_init(
+        path: Path | str, *, repository_root: Path | str) -> FormalRunInit:
+    """Load one canonical run-init record and bind it to the tracked manifest."""
+    root = Path(repository_root).resolve(strict=True)
+    source, document = _load_runtime_json(
+        path, repository_root=root, field='formal run init')
+    manifest_path = root / 'optimization/formal_stage_c.json'
+    manifest = load_formal_manifest(manifest_path, repository_root=root)
+    manifest_sha256 = _sha256_file(manifest_path)
+    run_init = FormalRunInit.from_dict(
+        document, repository_root=root, manifest=manifest,
+        expected_manifest_sha256=manifest_sha256)
+    expected_path = root / run_init.output_root / 'run-init.json'
+    if source.absolute() != expected_path.absolute():
+        raise FormalManifestError('formal run init path is not canonical')
+    _validate_formal_source_authority(root, run_init.git_commit)
+    return run_init
+
+
+def load_formal_train_result(
+        path: Path | str, *, repository_root: Path | str,
+        verify_files: bool = True) -> FormalTrainResult:
+    """Load a canonical train result and bind it to its exact run-init bytes."""
+    root = Path(repository_root).resolve(strict=True)
+    source, document = _load_runtime_json(
+        path, repository_root=root, field='formal train result')
+    preliminary = FormalTrainResult.from_dict(
+        document, repository_root=root, verify_files=False)
+    expected_path = root / preliminary.output_root / 'train-result.json'
+    if source.absolute() != expected_path.absolute():
+        raise FormalManifestError('formal train result path is not canonical')
+    run_init_path = root / preliminary.output_root / 'run-init.json'
+    run_init = load_formal_run_init(run_init_path, repository_root=root)
+    return FormalTrainResult.from_dict(
+        document, repository_root=root, verify_files=verify_files,
+        run_init=run_init,
+        expected_run_init_sha256=_sha256_file(run_init_path))
 
 
 def config_closure_sha256(
@@ -629,6 +992,127 @@ def config_closure_sha256(
         [{'path': key, 'sha256': records[key]} for key in sorted(records)],
         sort_keys=True, separators=(',', ':')).encode('utf-8')
     return hashlib.sha256(payload).hexdigest()
+
+
+def validate_canonical_formal_config_closure(
+        repository_root: Path | str) -> None:
+    """Require the reviewed byte-exact common formal configuration closure."""
+    root = Path(repository_root).resolve(strict=False)
+    for relative_text, expected_sha256 in _CANONICAL_CONFIG_FILES.items():
+        relative = Path(relative_text)
+        _validate_internal_relative_path(root, relative, 'formal config closure')
+        path = root / relative
+        if not path.is_file() or path.is_symlink():
+            raise FormalManifestError(
+                f'canonical formal config closure is missing: {relative_text}')
+        if _sha256_file(path) != expected_sha256:
+            raise FormalManifestError(
+                f'canonical formal config closure drift: {relative_text}')
+    for seed in ALL_SEEDS:
+        for role in ROLES:
+            _validate_canonical_formal_leaf(root, role=role, seed=seed)
+
+
+def _config_literal(node: ast.AST) -> Any:
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [_config_literal(item) for item in node.elts]
+    if isinstance(node, ast.Dict):
+        return {
+            _config_literal(key): _config_literal(item)
+            for key, item in zip(node.keys, node.values)}
+    if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == 'dict' and not node.args):
+        return {
+            keyword.arg: _config_literal(keyword.value)
+            for keyword in node.keywords}
+    raise FormalManifestError(
+        'formal leaf config uses a non-literal assignment')
+
+
+def _validate_canonical_formal_leaf(
+        root: Path, *, role: str, seed: int) -> None:
+    run_id, relative, output_root = _canonical_run_identity(role, seed)
+    path = root / relative
+    _validate_internal_relative_path(root, relative, 'formal leaf config')
+    if not path.is_file() or path.is_symlink():
+        raise FormalManifestError('canonical formal leaf config is missing')
+    try:
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    except (OSError, SyntaxError) as error:
+        raise FormalManifestError('canonical formal leaf config is malformed') \
+            from error
+    actual: dict[str, Any] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1 \
+                or not isinstance(node.targets[0], ast.Name):
+            raise FormalManifestError(
+                'canonical formal leaf config has executable statements')
+        name = node.targets[0].id
+        if name in actual:
+            raise FormalManifestError(
+                'canonical formal leaf config has duplicate assignments')
+        actual[name] = _config_literal(node.value)
+    mode = 'full' if role == 'baseline' else 'disabled'
+    expected = {
+        '_base_': ['./_base_/paired_300ep.py'],
+        'formal_role': role,
+        'formal_seed': seed,
+        'experiment_id': f'formal-stage-c-{run_id}',
+        'work_dir': output_root.as_posix(),
+        'randomness': {'seed': seed, 'deterministic': True},
+        'train_dataloader': {'sampler': {'seed': seed}},
+        'val_dataloader': {'sampler': {'seed': seed}},
+        'test_dataloader': {'sampler': {'seed': seed}},
+        'model': {'head': {'tokenpose_cfg': {'pif_mode': mode}}},
+    }
+    if actual != expected:
+        raise FormalManifestError(
+            f'canonical formal leaf config drift: {relative.as_posix()}')
+
+
+def formal_resolved_config_sha256(
+        repository_root: Path | str, *, role: str, seed: int) -> str:
+    """Hash the exact resolved formal protocol projection for one run."""
+    if role not in ROLES or seed not in ALL_SEEDS:
+        raise FormalManifestError('resolved config identity is invalid')
+    validate_canonical_formal_config_closure(repository_root)
+    run_id, config, output_root = _canonical_run_identity(role, seed)
+    projection = {
+        'run_id': run_id,
+        'role': role,
+        'seed': seed,
+        'config': config.as_posix(),
+        'output_root': output_root.as_posix(),
+        'pif_mode': 'full' if role == 'baseline' else 'disabled',
+        'deterministic': True,
+        'epochs': 300,
+        'worker_count': 2,
+        'persistent_workers': False,
+        'per_device_batch_size': 128,
+        'world_size': 1,
+        'accumulation_steps': 1,
+        'effective_batch_size': 128,
+        'auto_scale_lr': False,
+        'optimizer': {'type': 'Adam', 'lr': '1e-3'},
+        'scheduler': {
+            'warmup_iterations': 500,
+            'milestones': [200, 260],
+            'gamma': 0.1,
+        },
+        'evaluation': {
+            'type': 'CocoMetric',
+            'detections': (
+                'data/coco/person_detection_results/'
+                'COCO_val2017_detections_AP_H_56_person.json'),
+            'flip_test': True,
+            'flip_mode': 'heatmap',
+            'shift_heatmap': True,
+        },
+    }
+    return canonical_json_sha256(projection)
 
 
 def canonical_json_sha256(value: Mapping[str, Any]) -> str:
@@ -703,6 +1187,213 @@ def validate_asset_binding(
         raise FormalManifestError(f'{field} SHA-256 mismatch')
 
 
+def _verify_zip_corpus(
+        archive: Path | str, image_root: Path | str, *, prefix: str,
+        expected_count: int) -> str:
+    """Byte-compare an extracted image corpus with its official ZIP members."""
+    archive_path = Path(archive)
+    corpus_root = Path(image_root)
+    if archive_path.is_symlink() or not archive_path.is_file():
+        raise FormalManifestError('image corpus archive is missing or unsafe')
+    if corpus_root.is_symlink() or not corpus_root.is_dir():
+        raise FormalManifestError('live image corpus is missing or unsafe')
+    if not isinstance(prefix, str) or not prefix.endswith('/'):
+        raise FormalManifestError('image corpus archive prefix is invalid')
+    if isinstance(expected_count, bool) or not isinstance(expected_count, int) \
+            or expected_count < 1:
+        raise FormalManifestError('image corpus expected count is invalid')
+
+    try:
+        with zipfile.ZipFile(archive_path) as packed:
+            members: dict[str, zipfile.ZipInfo] = {}
+            for info in packed.infolist():
+                name = info.filename
+                pure = PurePosixPath(name)
+                if (
+                        '\\' in name or pure.is_absolute()
+                        or '..' in pure.parts):
+                    raise FormalManifestError(
+                        'image corpus archive has an unsafe member')
+                if info.is_dir():
+                    continue
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == stat.S_IFLNK:
+                    raise FormalManifestError(
+                        'image corpus archive has a symlink member')
+                if not name.startswith(prefix) or not name.lower().endswith('.jpg'):
+                    raise FormalManifestError(
+                        'image corpus archive has an unexpected member')
+                relative = name[len(prefix):]
+                if not relative or '/' in relative:
+                    raise FormalManifestError(
+                        'image corpus archive layout is not canonical')
+                if name in members:
+                    raise FormalManifestError(
+                        'image corpus archive has duplicate members')
+                members[name] = info
+            if len(members) != expected_count:
+                raise FormalManifestError(
+                    'image corpus archive count mismatch')
+
+            live: dict[str, Path] = {}
+            for candidate in corpus_root.rglob('*'):
+                relative = candidate.relative_to(corpus_root)
+                if candidate.is_symlink():
+                    raise FormalManifestError(
+                        'live image corpus must not contain symlinks')
+                if candidate.is_dir():
+                    continue
+                if not candidate.is_file() or candidate.suffix.lower() != '.jpg':
+                    raise FormalManifestError(
+                        'live image corpus has an unexpected file')
+                name = prefix + relative.as_posix()
+                live[name] = candidate
+            if set(live) != set(members):
+                raise FormalManifestError(
+                    'live image corpus inventory differs from archive')
+
+            digest = hashlib.sha256()
+            for name in sorted(members):
+                info = members[name]
+                digest.update(name.encode('utf-8'))
+                digest.update(b'\0')
+                digest.update(str(info.file_size).encode('ascii'))
+                digest.update(b'\0')
+                with packed.open(info, 'r') as source, live[name].open('rb') as target:
+                    observed_size = 0
+                    while True:
+                        source_block = source.read(8 * 1024 * 1024)
+                        target_block = target.read(8 * 1024 * 1024)
+                        if source_block != target_block:
+                            raise FormalManifestError(
+                                'live image corpus differs from archive')
+                        if not source_block:
+                            break
+                        observed_size += len(source_block)
+                        digest.update(source_block)
+                    if observed_size != info.file_size:
+                        raise FormalManifestError(
+                            'image corpus member size mismatch')
+            return digest.hexdigest()
+    except FormalManifestError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+        raise FormalManifestError(
+            f'image corpus archive cannot be verified: {error}') from error
+
+
+def _verify_archive_member(
+        archive: Path, member_name: str, extracted: Path, field: str) -> None:
+    if archive.is_symlink() or extracted.is_symlink() \
+            or not archive.is_file() or not extracted.is_file():
+        raise FormalManifestError(f'{field} archive linkage is unavailable')
+    try:
+        with zipfile.ZipFile(archive) as packed:
+            info = packed.getinfo(member_name)
+            with packed.open(info, 'r') as source, extracted.open('rb') as target:
+                while True:
+                    source_block = source.read(8 * 1024 * 1024)
+                    target_block = target.read(8 * 1024 * 1024)
+                    if source_block != target_block:
+                        raise FormalManifestError(
+                            f'{field} differs from its official archive')
+                    if not source_block:
+                        break
+    except FormalManifestError:
+        raise
+    except (KeyError, OSError, RuntimeError, zipfile.BadZipFile) as error:
+        raise FormalManifestError(
+            f'{field} archive linkage cannot be verified: {error}') from error
+
+
+def validate_data_authority(
+        authority: Mapping[str, AssetBinding | CorpusBinding], *,
+        repository_root: Path | str,
+        canonical_repository_root: Path | str) -> None:
+    """Authenticate exact COCO files, archives, inventory, and live images."""
+    if set(authority) != set(_DATA_FIELDS):
+        raise FormalManifestError('data authority roles are not exact')
+    runtime = Path(repository_root).resolve(strict=True)
+    canonical = Path(canonical_repository_root).absolute()
+    for name in _DATA_FILE_FIELDS:
+        binding = authority[name]
+        if not isinstance(binding, AssetBinding):
+            raise FormalManifestError(f'data authority {name} has wrong type')
+        validate_asset_binding(
+            binding, repository_root=runtime,
+            canonical_repository_root=canonical,
+            field=f'data authority {name}')
+
+    inventory_binding = authority['inventory']
+    assert isinstance(inventory_binding, AssetBinding)
+    inventory_path = (
+        canonical / inventory_binding.authority_root
+        / inventory_binding.asset_relative_path)
+    try:
+        inventory = json.loads(inventory_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise FormalManifestError('data inventory is malformed') from error
+    if not isinstance(inventory, dict) \
+            or isinstance(inventory.get('schema_version'), bool) \
+            or inventory.get('schema_version') != 1 \
+            or not isinstance(inventory.get('assets'), list):
+        raise FormalManifestError('data inventory schema is invalid')
+    records: dict[str, Mapping[str, Any]] = {}
+    for item in inventory['assets']:
+        if not isinstance(item, dict) or not isinstance(item.get('id'), str):
+            raise FormalManifestError('data inventory asset is malformed')
+        if item['id'] in records:
+            raise FormalManifestError('data inventory asset ids are not unique')
+        records[item['id']] = item
+    for asset_id, expected in _INVENTORY_PROJECTION.items():
+        record = records.get(asset_id)
+        if record is None or (
+                record.get('path') != expected['path']
+                or record.get('sha256') != expected['sha256']
+                or tuple(record.get('required_paths', ()))
+                != expected['required_paths']):
+            raise FormalManifestError(
+                f'data inventory authority mismatch for {asset_id}')
+
+    annotation_archive = authority['annotation_archive']
+    train_annotations = authority['train_annotations']
+    validation_annotations = authority['validation_annotations']
+    assert isinstance(annotation_archive, AssetBinding)
+    assert isinstance(train_annotations, AssetBinding)
+    assert isinstance(validation_annotations, AssetBinding)
+    annotation_zip = (
+        canonical / annotation_archive.authority_root
+        / annotation_archive.asset_relative_path)
+    _verify_archive_member(
+        annotation_zip,
+        'annotations/person_keypoints_train2017.json',
+        canonical / train_annotations.authority_root
+        / train_annotations.asset_relative_path,
+        'train annotations')
+    _verify_archive_member(
+        annotation_zip,
+        'annotations/person_keypoints_val2017.json',
+        canonical / validation_annotations.authority_root
+        / validation_annotations.asset_relative_path,
+        'validation annotations')
+
+    for name in _DATA_CORPUS_FIELDS:
+        corpus = authority[name]
+        if not isinstance(corpus, CorpusBinding):
+            raise FormalManifestError(f'data authority {name} has wrong type')
+        archive_binding = authority[corpus.archive_role]
+        assert isinstance(archive_binding, AssetBinding)
+        digest = _verify_zip_corpus(
+            canonical / archive_binding.authority_root
+            / archive_binding.asset_relative_path,
+            canonical / corpus.authority_root / corpus.corpus_relative_path,
+            prefix=corpus.archive_prefix,
+            expected_count=corpus.image_count)
+        if digest != corpus.sha256:
+            raise FormalManifestError(
+                f'data authority {name} SHA-256 mismatch')
+
+
 def validate_prior_artifact_authority(
         authority: PriorArtifactAuthority, *,
         repository_root: Path | str,
@@ -722,6 +1413,9 @@ def validate_prior_artifact_authority(
         canonical, target_relative, 'canonical prior artifact root')
     if not expected_target.is_dir():
         raise FormalManifestError('canonical prior artifact bundle is missing')
+    if expected_target.stat().st_mode & stat.S_IWUSR:
+        raise FormalManifestError(
+            'canonical prior artifact bundle root is not read-only')
 
     link = runtime / authority.link_root
     _reject_parent_symlinks(runtime, authority.link_root, 'prior artifact')
@@ -771,6 +1465,7 @@ def validate_prior_artifact_authority(
         raise FormalManifestError('prior bundle artifact roles mismatch')
 
     allowed = {'bundle.json'}
+    allowed_directories: set[str] = set()
     for name, binding in authority.artifacts.items():
         record = _require_mapping(entries[name], f'prior bundle {name}')
         _require_exact_fields(
@@ -795,15 +1490,33 @@ def validate_prior_artifact_authority(
             raise FormalManifestError(
                 f'prior bundle {name} is not read-only')
         allowed.add(binding.path.as_posix())
+        parent = binding.path.parent
+        while parent != Path('.'):
+            allowed_directories.add(parent.as_posix())
+            parent = parent.parent
     if bundle_manifest.stat().st_mode & stat.S_IWUSR:
         raise FormalManifestError(
             'prior artifact bundle manifest is not read-only')
-    actual = {
-        path.relative_to(expected_target).as_posix()
-        for path in expected_target.rglob('*') if path.is_file()}
-    if actual != allowed:
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+    for path in expected_target.rglob('*'):
+        relative = path.relative_to(expected_target).as_posix()
+        if path.is_symlink():
+            raise FormalManifestError(
+                'prior artifact bundle contains an unexpected symlink')
+        if path.is_dir():
+            actual_directories.add(relative)
+            if path.stat().st_mode & stat.S_IWUSR:
+                raise FormalManifestError(
+                    'prior artifact bundle directory is not read-only')
+        elif path.is_file():
+            actual_files.add(relative)
+        else:
+            raise FormalManifestError(
+                'prior artifact bundle contains a non-file entry')
+    if actual_files != allowed or actual_directories != allowed_directories:
         raise FormalManifestError(
-            'prior artifact bundle contains unexpected files')
+            'prior artifact bundle contains unexpected entries')
 
 
 def _validate_tracked_path(root: Path, candidate: Path, field: str) -> None:
@@ -885,6 +1598,8 @@ def _parse_protocol(value: Any) -> FormalProtocol:
         raise FormalManifestError('formal protocol requires 300 epochs')
     workers = _require_int(
         document['worker_count'], 'worker_count', minimum=0)
+    if workers != 2:
+        raise FormalManifestError('formal worker count must be 2')
     if document['persistent_workers'] is not False:
         raise FormalManifestError('persistent workers must be disabled')
     effective_batch = _require_int(
@@ -927,14 +1642,36 @@ def _parse_protocol(value: Any) -> FormalProtocol:
 
 
 def _parse_data_authority(
-        value: Any, *, repository_root: Path) -> dict[str, AssetBinding]:
+        value: Any, *, repository_root: Path,
+        ) -> dict[str, AssetBinding | CorpusBinding]:
     document = _require_mapping(value, 'data authority')
     _require_exact_fields(document, _DATA_FIELDS, 'data authority')
-    return {
-        name: AssetBinding.from_dict(
-            item, repository_root=repository_root)
-        for name, item in document.items()
-    }
+    parsed: dict[str, AssetBinding | CorpusBinding] = {}
+    for name in _DATA_FILE_FIELDS:
+        binding = AssetBinding.from_dict(
+            document[name], repository_root=repository_root)
+        authority, relative, sha256 = _CANONICAL_DATA_FILES[name]
+        if (
+                binding.authority_root != authority
+                or binding.asset_relative_path != Path(relative)
+                or binding.sha256 != sha256):
+            raise FormalManifestError(
+                f'data authority {name} is not canonical')
+        parsed[name] = binding
+    for name in _DATA_CORPUS_FIELDS:
+        binding = CorpusBinding.from_dict(document[name])
+        expected = _CANONICAL_CORPORA[name]
+        if (
+                binding.corpus_relative_path
+                != Path(expected['corpus_relative_path'])
+                or binding.archive_role != expected['archive_role']
+                or binding.archive_prefix != expected['archive_prefix']
+                or binding.image_count != expected['image_count']
+                or binding.sha256 != expected['sha256']):
+            raise FormalManifestError(
+                f'data authority {name} is not canonical')
+        parsed[name] = binding
+    return parsed
 
 
 def _parse_run(
@@ -980,22 +1717,29 @@ def _parse_run_identity(
 
 
 def _validate_canonical_run(run: FormalRunSpec) -> None:
-    stem = 'full' if run.role == 'baseline' else 'no_pif'
-    run_stem = stem.replace('_', '-')
-    expected_id = f'{run_stem}-seed{run.seed}'
+    expected_id, expected_config, expected_output = _canonical_run_identity(
+        run.role, run.seed)
     if run.run_id != expected_id:
         raise FormalManifestError(
             f'run id must be canonical for role and seed: {expected_id}')
-    expected_config = Path(
-        f'configs/optimization/formal_stage_c/{stem}_seed{run.seed}.py')
     if run.config != expected_config:
         raise FormalManifestError(
             f'{run.run_id} config path must be {expected_config.as_posix()}')
-    expected_output = Path(
-        f'work_dirs/optimization/formal-stage-c/{expected_id}')
     if run.output_root != expected_output:
         raise FormalManifestError(
             f'{run.run_id} output_root must be {expected_output.as_posix()}')
+
+
+def _canonical_run_identity(
+        role: str, seed: int) -> tuple[str, Path, Path]:
+    stem = 'full' if role == 'baseline' else 'no_pif'
+    run_stem = stem.replace('_', '-')
+    run_id = f'{run_stem}-seed{seed}'
+    config = Path(
+        f'configs/optimization/formal_stage_c/{stem}_seed{seed}.py')
+    output_root = Path(
+        f'work_dirs/optimization/formal-stage-c/{run_id}')
+    return run_id, config, output_root
 
 
 def _parse_file_binding(
@@ -1034,6 +1778,12 @@ def _require_exact_fields(
 def _require_sha256(value: Any, field: str) -> str:
     if not isinstance(value, str) or not _SHA256.fullmatch(value):
         raise FormalManifestError(f'{field} must be a lowercase SHA-256')
+    return value
+
+
+def _require_commit(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not _COMMIT.fullmatch(value):
+        raise FormalManifestError(f'{field} must be a full lowercase commit')
     return value
 
 
@@ -1099,7 +1849,8 @@ def _relative_to_root(root: Path, candidate: Path, field: str) -> Path:
 
 def _verify_file(root: Path, binding: FileBinding, field: str) -> None:
     candidate = root / binding.path
-    if not candidate.is_file():
+    _validate_internal_relative_path(root, binding.path, field)
+    if candidate.is_symlink() or not candidate.is_file():
         raise FormalManifestError(f'{field} file is missing: {binding.path}')
     digest = hashlib.sha256()
     with candidate.open('rb') as stream:

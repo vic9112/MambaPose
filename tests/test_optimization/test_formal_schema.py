@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import zipfile
 
 from mmengine.config import Config
 import pytest
 
+import mambapose_opt.formal_schema as formal_schema
 from mambapose_opt.formal_schema import (
     AssetBinding,
     FormalManifestError,
@@ -95,6 +97,71 @@ def _binding(name: str) -> dict[str, str]:
     }
 
 
+def _data_authority() -> dict[str, object]:
+    files = {
+        'inventory': (
+            'data', 'inventory.json',
+            '2a82ab3cfe05a514d141c17921463e72f22741d67eaf978d93317155bbeaf0ed'),
+        'train_annotations': (
+            'data', 'coco/annotations/person_keypoints_train2017.json',
+            '7fc1549d934547c470384d8a207c38707ca33fc016d00e33b795e408603af83e'),
+        'validation_annotations': (
+            'data', 'coco/annotations/person_keypoints_val2017.json',
+            '788e2dae83c86bd547be7fab269d6399df5671063d29a61360cdb2cc370d2b14'),
+        'detections': (
+            'data',
+            ('coco/person_detection_results/'
+             'COCO_val2017_detections_AP_H_56_person.json'),
+            '53ba0ad8d0fd461c5a000cd90797fa8c39cd8c38cd125125c0412626ff592d59'),
+        'annotation_archive': (
+            'work_dirs/reproduction',
+            'downloads/annotations_trainval2017.zip',
+            '113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268'),
+        'train_image_archive': (
+            'work_dirs/reproduction', 'downloads/train2017.zip',
+            '69a8bb58ea5f8f99d24875f21416de2e9ded3178e903f1f7603e283b9e06d929'),
+        'validation_image_archive': (
+            'work_dirs/reproduction', 'downloads/val2017.zip',
+            '4f7e2ccb2866ec5041993c9cf2a952bbed69647b115d0f74da7ce8f4bef82f05'),
+    }
+    result: dict[str, object] = {
+        name: {
+            'authority_root': authority,
+            'target_root': f'canonical-main/{authority}',
+            'asset_relative_path': relative,
+            'sha256': sha256,
+        }
+        for name, (authority, relative, sha256) in files.items()
+    }
+    result.update({
+        'train_image_corpus': {
+            'authority_root': 'data',
+            'target_root': 'canonical-main/data',
+            'corpus_relative_path': 'coco/train2017',
+            'archive_role': 'train_image_archive',
+            'archive_prefix': 'train2017/',
+            'image_count': 118287,
+            'digest_algorithm': (
+                'sha256-zip-member-and-extracted-content-v1'),
+            'sha256': (
+                'f552fb95e1f40129d9726146ddfbadcbf4fb931bf6c8631cf6425a6994999695'),
+        },
+        'validation_image_corpus': {
+            'authority_root': 'data',
+            'target_root': 'canonical-main/data',
+            'corpus_relative_path': 'coco/val2017',
+            'archive_role': 'validation_image_archive',
+            'archive_prefix': 'val2017/',
+            'image_count': 5000,
+            'digest_algorithm': (
+                'sha256-zip-member-and-extracted-content-v1'),
+            'sha256': (
+                '6bf5c46be73304e0e8d77af5cf5764eed9e598e1f815f844e3366675c23e610e'),
+        },
+    })
+    return result
+
+
 def _run(role: str, seed: int) -> dict[str, object]:
     stem = 'full' if role == 'baseline' else 'no_pif'
     run_id = f'{stem.replace("_", "-")}-seed{seed}'
@@ -112,7 +179,7 @@ def _run(role: str, seed: int) -> dict[str, object]:
 
 def _manifest_document() -> dict[str, object]:
     return {
-        'schema_version': 1,
+        'schema_version': 2,
         'experiment_id': 'mambapose-formal-stage-c',
         'initialization': {
             'id': 'vmamba-t-imagenet-262',
@@ -135,12 +202,7 @@ def _manifest_document() -> dict[str, object]:
             'primary_seeds': [0, 1, 2],
             'conditional_seeds': [3, 4],
         },
-        'data_authority': {
-            'inventory': _binding('inventory'),
-            'train_annotations': _binding('train'),
-            'validation_annotations': _binding('validation'),
-            'detections': _binding('detections'),
-        },
+        'data_authority': _data_authority(),
         'prior_artifact': _prior_artifact(),
         'runs': [
             _run(role, seed)
@@ -151,21 +213,24 @@ def _manifest_document() -> dict[str, object]:
 
 
 def _run_init_document() -> dict[str, object]:
+    closure = formal_schema.config_closure_sha256(
+        ROOT, 'configs/optimization/formal_stage_c/full_seed0.py')
+    resolved = formal_schema.formal_resolved_config_sha256(
+        ROOT, role='baseline', seed=0)
+    data = _data_authority()
     return {
         'schema_version': 1,
         'manifest_sha256': _sha(b'manifest'),
         'source': {'git_commit': 'a' * 40, 'clean_tree': True},
         'config': {
             'path': 'configs/optimization/formal_stage_c/full_seed0.py',
-            'closure_sha256': _sha(b'closure'),
-            'resolved_sha256': _sha(b'resolved'),
+            'closure_sha256': closure,
+            'resolved_sha256': resolved,
         },
         'environment_inventory_sha256': _sha(b'environment'),
         'data_authority': {
-            'inventory_sha256': _sha(b'inventory'),
-            'train_annotations_sha256': _sha(b'train'),
-            'validation_annotations_sha256': _sha(b'validation'),
-            'detections_sha256': _sha(b'detections'),
+            f'{name}_sha256': record['sha256']
+            for name, record in data.items()
         },
         'run': {
             'run_id': 'full-seed0',
@@ -223,7 +288,9 @@ def _train_result_document() -> dict[str, object]:
             'path': f'{output}/training.jsonl',
             'sha256': _sha(b'log'),
         },
-        'order_hashes': [_sha(f'epoch:{epoch}'.encode()) for epoch in range(300)],
+        'order_hashes': [
+            {'epoch': epoch, 'sha256': _sha(f'epoch:{epoch}'.encode())}
+            for epoch in range(1, 301)],
         'final_epoch': 300,
         'status': 'complete',
     }
@@ -334,6 +401,80 @@ def test_manifest_rejects_wrong_conditional_flag(tmp_path):
     document['runs'][6]['conditional'] = False
     with pytest.raises(FormalManifestError, match='conditional flag'):
         FormalStageCManifest.from_dict(document, repository_root=tmp_path)
+
+
+def test_manifest_requires_exact_worker_count(tmp_path):
+    document = _manifest_document()
+    document['protocol']['worker_count'] = 99
+    with pytest.raises(FormalManifestError, match='worker count'):
+        FormalStageCManifest.from_dict(document, repository_root=tmp_path)
+
+
+def test_manifest_rejects_swapped_data_roles(tmp_path):
+    document = _manifest_document()
+    data = document['data_authority']
+    data['train_annotations'], data['validation_annotations'] = (
+        data['validation_annotations'], data['train_annotations'])
+    with pytest.raises(FormalManifestError, match='data authority'):
+        FormalStageCManifest.from_dict(document, repository_root=tmp_path)
+
+
+def test_tracked_manifest_binds_archives_and_live_image_corpora():
+    document = json.loads(MANIFEST.read_text())
+    assert document['schema_version'] == 2
+    assert set(document['data_authority']) == {
+        'inventory', 'train_annotations', 'validation_annotations',
+        'detections', 'annotation_archive', 'train_image_archive',
+        'validation_image_archive', 'train_image_corpus',
+        'validation_image_corpus',
+    }
+    assert document['data_authority']['train_image_corpus'] == {
+        'authority_root': 'data',
+        'target_root': 'canonical-main/data',
+        'corpus_relative_path': 'coco/train2017',
+        'archive_role': 'train_image_archive',
+        'archive_prefix': 'train2017/',
+        'image_count': 118287,
+        'digest_algorithm': 'sha256-zip-member-and-extracted-content-v1',
+        'sha256': 'f552fb95e1f40129d9726146ddfbadcbf4fb931bf6c8631cf6425a6994999695',
+    }
+    assert document['data_authority']['validation_image_corpus'][
+        'image_count'] == 5000
+
+
+def test_zip_corpus_verifier_binds_member_bytes_count_and_digest(tmp_path):
+    archive = tmp_path / 'images.zip'
+    image_root = tmp_path / 'images'
+    image_root.mkdir()
+    members = {'train2017/0002.jpg': b'second',
+               'train2017/0001.jpg': b'first'}
+    with zipfile.ZipFile(archive, 'w') as stream:
+        for name, payload in members.items():
+            stream.writestr(name, payload)
+            (image_root / Path(name).name).write_bytes(payload)
+    digest = formal_schema._verify_zip_corpus(
+        archive, image_root, prefix='train2017/', expected_count=2)
+    expected = hashlib.sha256()
+    for name in sorted(members):
+        payload = members[name]
+        expected.update(name.encode())
+        expected.update(b'\0')
+        expected.update(str(len(payload)).encode())
+        expected.update(b'\0')
+        expected.update(payload)
+    assert digest == expected.hexdigest()
+
+
+def test_zip_corpus_verifier_rejects_live_byte_drift(tmp_path):
+    archive = tmp_path / 'images.zip'
+    image_root = tmp_path / 'images'
+    image_root.mkdir()
+    with zipfile.ZipFile(archive, 'w') as stream:
+        stream.writestr('val2017/0001.jpg', b'official')
+    (image_root / '0001.jpg').write_bytes(b'changed!')
+    with pytest.raises(FormalManifestError, match='differs from archive'):
+        formal_schema._verify_zip_corpus(
+            archive, image_root, prefix='val2017/', expected_count=1)
 
 
 def test_manifest_rejects_output_root_alias(tmp_path):
@@ -509,6 +650,62 @@ def test_run_init_rejects_malformed_lineage(mutation, match):
         FormalRunInit.from_dict(document, repository_root=ROOT)
 
 
+@pytest.mark.parametrize(
+    ('mutation', 'match'),
+    [
+        (lambda value: value['run'].update(effective_batch_size=1),
+         'effective batch'),
+        (lambda value: value['run'].update(worker_count=99), 'worker count'),
+        (lambda value: value['run'].update(
+            run_id='no-pif-seed0', role='baseline',
+            output_root=(
+                'work_dirs/optimization/formal-stage-c/no-pif-seed0')),
+         'canonical'),
+        (lambda value: value['config'].update(
+            path='configs/optimization/formal_stage_c/no_pif_seed0.py'),
+         'config'),
+    ],
+)
+def test_run_init_rejects_noncanonical_manifest_identity(mutation, match):
+    document = _run_init_document()
+    mutation(document)
+    with pytest.raises(FormalManifestError, match=match):
+        FormalRunInit.from_dict(document, repository_root=ROOT)
+
+
+def test_run_init_rejects_manifest_or_data_authority_rebinding():
+    manifest_document = _manifest_document()
+    manifest_document['runs'][0]['config_sha256'] = (
+        formal_schema.config_closure_sha256(
+            ROOT, 'configs/optimization/formal_stage_c/full_seed0.py'))
+    manifest = FormalStageCManifest.from_dict(
+        manifest_document, repository_root=ROOT)
+    manifest_sha256 = formal_schema.canonical_json_sha256(manifest_document)
+    document = _run_init_document()
+    document['manifest_sha256'] = manifest_sha256
+    result = FormalRunInit.from_dict(
+        document, repository_root=ROOT, manifest=manifest,
+        expected_manifest_sha256=manifest_sha256)
+    assert result.run_id == 'full-seed0'
+
+    document['data_authority']['train_image_corpus_sha256'] = '0' * 64
+    with pytest.raises(FormalManifestError, match='data authority'):
+        FormalRunInit.from_dict(
+            document, repository_root=ROOT, manifest=manifest,
+            expected_manifest_sha256=manifest_sha256)
+
+
+def test_run_init_requires_exact_manifest_sha256_when_authority_is_given():
+    manifest_document = _manifest_document()
+    manifest = FormalStageCManifest.from_dict(
+        manifest_document, repository_root=ROOT)
+    document = _run_init_document()
+    with pytest.raises(FormalManifestError, match='manifest SHA-256'):
+        FormalRunInit.from_dict(
+            document, repository_root=ROOT, manifest=manifest,
+            expected_manifest_sha256='f' * 64)
+
+
 def test_train_result_cannot_rebind_initialization():
     document = _train_result_document()
     document['initialization']['asset']['sha256'] = '0' * 64
@@ -541,6 +738,107 @@ def test_train_result_requires_outputs_under_declared_root():
     document['structured_log']['path'] = 'work_dirs/optimization/other/log.jsonl'
     with pytest.raises(FormalManifestError, match='declared output root'):
         FormalTrainResult.from_dict(document, repository_root=ROOT)
+
+
+def test_train_result_rejects_role_run_id_mismatch():
+    document = _train_result_document()
+    document['run'].update(
+        run_id='no-pif-seed0', role='baseline',
+        output_root='work_dirs/optimization/formal-stage-c/no-pif-seed0')
+    output = document['run']['output_root']
+    document['best_checkpoint']['path'] = f'{output}/best_coco_AP_epoch_300.pth'
+    document['resume_checkpoints'][0]['path'] = f'{output}/epoch_299.pth'
+    document['resume_checkpoints'][1]['path'] = f'{output}/epoch_300.pth'
+    document['structured_log']['path'] = f'{output}/training.jsonl'
+    with pytest.raises(FormalManifestError, match='canonical'):
+        FormalTrainResult.from_dict(document, repository_root=ROOT)
+
+
+def test_train_result_rejects_duplicate_resume_binding():
+    document = _train_result_document()
+    document['resume_checkpoints'][1] = copy.deepcopy(
+        document['resume_checkpoints'][0])
+    with pytest.raises(FormalManifestError, match='distinct'):
+        FormalTrainResult.from_dict(document, repository_root=ROOT)
+
+
+def test_train_result_rejects_reversed_or_nonlatest_resume_sequence():
+    document = _train_result_document()
+    document['resume_checkpoints'].reverse()
+    with pytest.raises(FormalManifestError, match='chronological|latest'):
+        FormalTrainResult.from_dict(document, repository_root=ROOT)
+
+
+def test_train_result_rejects_best_checkpoint_as_resume():
+    document = _train_result_document()
+    document['best_checkpoint'] = copy.deepcopy(
+        document['resume_checkpoints'][1])
+    with pytest.raises(FormalManifestError, match='best checkpoint'):
+        FormalTrainResult.from_dict(document, repository_root=ROOT)
+
+
+def test_train_result_rejects_duplicate_order_hashes():
+    document = _train_result_document()
+    document['order_hashes'][1]['sha256'] = (
+        document['order_hashes'][0]['sha256'])
+    with pytest.raises(FormalManifestError, match='order hashes.*distinct'):
+        FormalTrainResult.from_dict(document, repository_root=ROOT)
+
+
+def test_train_result_rejects_noncanonical_order_hash_sequence():
+    document = _train_result_document()
+    document['order_hashes'].reverse()
+    with pytest.raises(FormalManifestError, match='order hash.*sequence'):
+        FormalTrainResult.from_dict(document, repository_root=ROOT)
+
+
+def test_train_result_rejects_nonexistent_or_unhashed_outputs():
+    with pytest.raises(FormalManifestError, match='file is missing'):
+        FormalTrainResult.from_dict(
+            _train_result_document(), repository_root=ROOT,
+            verify_files=True)
+
+
+def test_train_result_rejects_run_init_identity_rebinding():
+    run_init_document = _run_init_document()
+    run_init = FormalRunInit.from_dict(
+        run_init_document, repository_root=ROOT)
+    run_init_sha256 = formal_schema.canonical_json_sha256(run_init_document)
+    document = _train_result_document()
+    document['run_init_sha256'] = run_init_sha256
+    result = FormalTrainResult.from_dict(
+        document, repository_root=ROOT, run_init=run_init,
+        expected_run_init_sha256=run_init_sha256)
+    assert result.run_id == run_init.run_id
+
+    document['run']['role'] = 'no_pif'
+    with pytest.raises(FormalManifestError, match='run init|canonical'):
+        FormalTrainResult.from_dict(
+            document, repository_root=ROOT, run_init=run_init,
+            expected_run_init_sha256=run_init_sha256)
+
+
+def test_train_result_requires_exact_run_init_sha256_when_authority_is_given():
+    run_init = FormalRunInit.from_dict(
+        _run_init_document(), repository_root=ROOT)
+    with pytest.raises(FormalManifestError, match='run init SHA-256'):
+        FormalTrainResult.from_dict(
+            _train_result_document(), repository_root=ROOT,
+            run_init=run_init, expected_run_init_sha256='f' * 64)
+
+
+@pytest.mark.parametrize('factory', [
+    _manifest_document, _run_init_document, _train_result_document])
+def test_formal_schema_rejects_boolean_schema_version(factory):
+    document = factory()
+    document['schema_version'] = True
+    parser = {
+        _manifest_document: FormalStageCManifest,
+        _run_init_document: FormalRunInit,
+        _train_result_document: FormalTrainResult,
+    }[factory]
+    with pytest.raises(FormalManifestError, match='schema_version'):
+        parser.from_dict(document, repository_root=ROOT)
 
 
 def test_tracked_manifest_and_configs_form_exact_pair_matrix():
@@ -632,3 +930,96 @@ def test_manifest_builder_detects_config_pair_asymmetry(tmp_path):
         module.validate_paired_config_symmetry(
             root, config_dir / 'full_seed0.py',
             config_dir / 'no_pif_seed0.py', seed=0)
+
+
+def _copy_formal_config_closure(destination):
+    relative_paths = (
+        'configs/optimization/formal_stage_c/_base_/paired_300ep.py',
+        'configs/optimization/formal_stage_c/full_seed0.py',
+        'configs/optimization/formal_stage_c/no_pif_seed0.py',
+        'configs/reproduction/coco_s_v1.py',
+        ('configs/body_2d_keypoint/tokenpose/'
+         'mamba_tokenpose_T2_coco_256x192_300ep.py'),
+        'configs/_base_/default_runtime.py',
+    )
+    for relative in relative_paths:
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((ROOT / relative).read_bytes())
+
+
+@pytest.mark.parametrize(
+    ('relative', 'old', 'new'),
+    [
+        ('configs/optimization/formal_stage_c/_base_/paired_300ep.py',
+         "_base_ = ['../../../reproduction/coco_s_v1.py']",
+         "_base_ = ['../../../reproduction/coco_s_v1.py', "
+         "'../../../reproduction/coco_s_v2.py']"),
+        ('configs/optimization/formal_stage_c/_base_/paired_300ep.py',
+         'formal_protocol = dict(',
+         'auto_scale_lr = dict(base_batch_size=64)\nformal_protocol = dict('),
+        ('configs/optimization/formal_stage_c/_base_/paired_300ep.py',
+         'accumulation_steps=1', 'accumulation_steps=2'),
+        ('configs/optimization/formal_stage_c/_base_/paired_300ep.py',
+         'batch_size=128', 'batch_size=64'),
+        ('configs/optimization/formal_stage_c/_base_/paired_300ep.py',
+         'num_workers=2', 'num_workers=3'),
+        ('configs/body_2d_keypoint/tokenpose/'
+         'mamba_tokenpose_T2_coco_256x192_300ep.py',
+         "type='Adam'", "type='AdamW'"),
+        ('configs/body_2d_keypoint/tokenpose/'
+         'mamba_tokenpose_T2_coco_256x192_300ep.py',
+         'milestones=[200, 260]', 'milestones=[199, 260]'),
+        ('configs/body_2d_keypoint/tokenpose/'
+         'mamba_tokenpose_T2_coco_256x192_300ep.py',
+         'flip_test=True', 'flip_test=False'),
+        ('configs/body_2d_keypoint/tokenpose/'
+         'mamba_tokenpose_T2_coco_256x192_300ep.py',
+         "type='CocoMetric'", "type='OtherMetric'"),
+    ],
+)
+def test_paired_config_validator_rejects_common_closure_drift(
+        tmp_path, relative, old, new):
+    _copy_formal_config_closure(tmp_path)
+    path = tmp_path / relative
+    content = path.read_text()
+    assert old in content
+    path.write_text(content.replace(old, new, 1))
+    spec = importlib.util.spec_from_file_location('formal_builder_drift', BUILDER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    with pytest.raises(ValueError, match='canonical|symmetry|closure'):
+        module.validate_paired_config_symmetry(
+            tmp_path,
+            'configs/optimization/formal_stage_c/full_seed0.py',
+            'configs/optimization/formal_stage_c/no_pif_seed0.py', seed=0)
+
+
+def test_public_run_init_and_train_result_loaders_exist():
+    assert callable(getattr(formal_schema, 'load_formal_run_init'))
+    assert callable(getattr(formal_schema, 'load_formal_train_result'))
+
+
+def test_formal_source_authority_requires_clean_detached_exact_head(tmp_path):
+    repository = tmp_path / 'repo'
+    repository.mkdir()
+    subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'formal@example.invalid'],
+        cwd=repository, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.name', 'Formal Fixture'],
+        cwd=repository, check=True)
+    tracked = repository / 'tracked.txt'
+    tracked.write_text('frozen\n')
+    subprocess.run(['git', 'add', 'tracked.txt'], cwd=repository, check=True)
+    subprocess.run(['git', 'commit', '-qm', 'fixture'], cwd=repository, check=True)
+    commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=repository, text=True).strip()
+    subprocess.run(['git', 'checkout', '--detach', '-q'], cwd=repository, check=True)
+    formal_schema._validate_formal_source_authority(repository, commit)
+
+    tracked.write_text('drift\n')
+    with pytest.raises(FormalManifestError, match='clean'):
+        formal_schema._validate_formal_source_authority(repository, commit)
