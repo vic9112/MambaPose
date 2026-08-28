@@ -300,6 +300,81 @@ def test_prepare_bundle_rejects_symlinked_audit_parent_before_mutation(
     assert not destination.exists()
 
 
+def test_prepare_bundle_rejects_source_parent_traversal_before_mutation(
+        tmp_path):
+    tool = _load_tool()
+    alternate = tmp_path / 'alternate-source-parent'
+    alternate.mkdir()
+    source, audit, commit, hashes = _fake_source(alternate)
+    trusted = tmp_path / 'trusted-source-parent'
+    trusted.mkdir()
+    escaped_source = (
+        f'{trusted}/../{alternate.name}/{source.name}')
+    destination = tmp_path / 'canonical/no-pif-seed0'
+
+    with pytest.raises(tool.PriorBundleError, match='source root.*lexical'):
+        tool._prepare_prior_bundle(
+            source_root=escaped_source,
+            destination=destination,
+            logical_link=tmp_path / 'runtime/prior-stage-b',
+            audit_report=audit,
+            expected_source_commit=commit,
+            expected_hashes=hashes,
+            unpruned_parent_sha256='1' * 64)
+
+    assert not destination.exists()
+
+
+def test_prepare_bundle_rejects_audit_parent_traversal_before_mutation(
+        tmp_path):
+    tool = _load_tool()
+    alternate = tmp_path / 'alternate-audit-parent'
+    alternate.mkdir()
+    source, audit, commit, hashes = _fake_source(alternate)
+    trusted = tmp_path / 'trusted-audit-parent'
+    trusted.mkdir()
+    escaped_audit = f'{trusted}/../{alternate.name}/{audit.name}'
+    destination = tmp_path / 'canonical/no-pif-seed0'
+
+    with pytest.raises(tool.PriorBundleError, match='audit report.*lexical'):
+        tool._prepare_prior_bundle(
+            source_root=source,
+            destination=destination,
+            logical_link=tmp_path / 'runtime/prior-stage-b',
+            audit_report=escaped_audit,
+            expected_source_commit=commit,
+            expected_hashes=hashes,
+            unpruned_parent_sha256='1' * 64)
+
+    assert not destination.exists()
+
+
+def test_lexical_authority_validator_rejects_normalizing_aliases(tmp_path):
+    tool = _load_tool()
+    authority = tmp_path / 'authority'
+    authority.mkdir()
+    (authority / 'audit.md').write_text('audit')
+    aliases = (
+        (tmp_path / 'trusted' / '..' / authority.name, True),
+        (f'{authority}/./audit.md', False),
+        ('', True),
+    )
+
+    for alias, require_directory in aliases:
+        with pytest.raises(tool.PriorBundleError, match='lexical'):
+            tool._validate_lexical_authority_path(
+                alias, 'test authority',
+                require_directory=require_directory)
+
+
+def test_lexical_authority_validator_accepts_exact_production_paths():
+    tool = _load_tool()
+    tool._validate_lexical_authority_path(
+        tool.DEFAULT_SOURCE_ROOT, 'source root', require_directory=True)
+    tool._validate_lexical_authority_path(
+        tool.DEFAULT_AUDIT_REPORT, 'audit report', require_directory=False)
+
+
 def test_existing_bundle_rejects_writable_root(tmp_path):
     tool = _load_tool()
     source, audit, commit, hashes = _fake_source(tmp_path)
