@@ -51,6 +51,7 @@
 - Create: `configs/optimization/formal_stage_c/no_pif_seed4.py`
 - Create: `tools/optimization/prepare_formal_prior_bundle.py`
 - Create: `tools/optimization/build_formal_manifest.py`
+- Create: `tests/test_optimization/test_formal_prior.py`
 - Create: `tests/test_optimization/test_formal_schema.py`
 
 **Interfaces:**
@@ -106,7 +107,7 @@ The builder hashes the entire config inheritance closure, dataset/annotation/det
 - [ ] **Step 5: Run focused and adjacent GREEN tests**
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 .venv/bin/python -B -m pytest -p no:cacheprovider tests/test_optimization/test_formal_schema.py tests/test_optimization/test_schema.py tests/test_reproduction/test_configs.py -q
+PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 .venv/bin/python -B -m pytest -p no:cacheprovider tests/test_optimization/test_formal_prior.py tests/test_optimization/test_formal_schema.py tests/test_optimization/test_schema.py tests/test_reproduction/test_configs.py -q
 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 .venv/bin/python -B tools/optimization/prepare_formal_prior_bundle.py --check work_dirs/optimization/prior-stage-b/bundle.json
 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 .venv/bin/python -B tools/optimization/build_formal_manifest.py --check optimization/formal_stage_c.json
 git diff --check
@@ -117,7 +118,7 @@ Expected: all tests pass; `--check` reports the tracked manifest is canonical an
 - [ ] **Step 6: Commit and review the contract**
 
 ```bash
-git add mambapose_opt/formal_schema.py optimization/formal_stage_c.json configs/optimization/formal_stage_c tools/optimization/prepare_formal_prior_bundle.py tools/optimization/build_formal_manifest.py tests/test_optimization/test_formal_schema.py
+git add mambapose_opt/formal_schema.py optimization/formal_stage_c.json configs/optimization/formal_stage_c tools/optimization/prepare_formal_prior_bundle.py tools/optimization/build_formal_manifest.py tests/test_optimization/test_formal_prior.py tests/test_optimization/test_formal_schema.py
 git commit -m "feat: add formal paired experiment contract"
 ```
 
