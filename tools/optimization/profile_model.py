@@ -24,6 +24,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from mambapose_opt.inventory import collect_module_inventory, count_parameters
+from mambapose_opt.checkpoints import build_manifest_authorized_model
 from mambapose_opt.numeric_conversion import NumericRuntimeHook
 from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
@@ -131,12 +132,15 @@ def profile(
             f'checkpoint sha256 mismatch for {candidate.id}: '
             f'expected {candidate.checkpoint_sha256}, got {actual_checksum}')
 
-    from mmpose.apis import init_model
-
     config_path = runtime['config_path']
     config = Config.fromfile(config_path)
-    model = init_model(str(config_path),
-                       str(checkpoint), device=device)
+    if candidate.features.get('numeric_kind') == 'pwl':
+        model = build_manifest_authorized_model(
+            REPOSITORY_ROOT, manifest_path, candidate,
+            config=config, device=device)
+    else:
+        from mmpose.apis import init_model
+        model = init_model(str(config_path), str(checkpoint), device=device)
     numeric = config.get('numeric_optimization')
     if numeric is not None:
         NumericRuntimeHook.apply_to_model(model, numeric)

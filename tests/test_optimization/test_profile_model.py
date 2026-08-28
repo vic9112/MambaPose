@@ -64,7 +64,7 @@ def test_formal_numeric_profile_places_model_and_input_on_logical_cuda(
     seen = []
     original_zeros = torch.zeros
 
-    def fake_init_model(*args, device, **kwargs):
+    def fake_safe_model(*args, device, **kwargs):
         seen.append(('model', device))
         return Dummy()
 
@@ -77,7 +77,7 @@ def test_formal_numeric_profile_places_model_and_input_on_logical_cuda(
     monkeypatch.setattr(tool, 'clean_git_commit', lambda _root: 'a' * 40)
     monkeypatch.setattr(
         tool, 'build_numeric_source_binding', lambda **kwargs: {'bound': True})
-    monkeypatch.setattr('mmpose.apis.init_model', fake_init_model)
+    monkeypatch.setattr(tool, 'build_manifest_authorized_model', fake_safe_model)
     monkeypatch.setattr(tool.torch, 'zeros', fake_zeros)
     monkeypatch.setattr(tool.torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(

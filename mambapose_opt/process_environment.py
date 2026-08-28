@@ -9,6 +9,7 @@ from pathlib import Path
 def deterministic_child_environment(repository_root: Path) -> dict[str, str]:
     """Return a deterministic child environment with local imports first."""
     environment = os.environ.copy()
+    environment.pop('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', None)
     repo_root = str(repository_root)
     pythonpath = environment.get('PYTHONPATH')
     path_entries = [] if not pythonpath else pythonpath.split(os.pathsep)

@@ -881,6 +881,59 @@ def test_direct_evaluation_child_disables_bytecode_independent_of_parent(
     assert captured_environment['MAMBAPOSE_OPTIMIZATION_SEED'] == '0'
 
 
+def test_pwl_evaluation_child_requires_manifest_safe_checkpoint_path(
+        tmp_path, monkeypatch):
+    import tools.optimization.evaluate_candidate as tool
+    from mambapose_opt.schema import CandidateSpec
+
+    checkpoint = tmp_path / 'model.pth'
+    checkpoint.write_bytes(b'checkpoint')
+    manifest = tmp_path / 'optimization/candidates.json'
+    candidate = CandidateSpec.from_dict({
+        'id': 'pwl-silu-s-v1', 'route': 'ssm-quant-pwl', 'kind': 'pwl',
+        'config': 'config.py', 'checkpoint': 'model.pth',
+        'checkpoint_sha256': hashlib.sha256(b'checkpoint').hexdigest(),
+        'seed': 0, 'features': {'numeric_kind': 'pwl'},
+    })
+    config = tool.Config(dict(
+        test_dataloader=dict(
+            batch_size=1, num_workers=0, persistent_workers=False)))
+    monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(tool, '_deterministic_config', lambda *args: config)
+    monkeypatch.setattr(
+        tool, 'validate_coco_val_protocol',
+        lambda *args, **kwargs: {
+            'inventory_projection': {'inventory_sha256': 'b' * 64}})
+    monkeypatch.setattr(
+        tool, 'repeated_order_hash', lambda *args, **kwargs: 'c' * 64)
+    monkeypatch.setattr(
+        tool, 'load_coco_metrics',
+        lambda *args, **kwargs: type(
+            'Metrics', (), {'to_dict': lambda self: {'AP': 1.0}})())
+    monkeypatch.setattr(
+        tool, 'build_determinism_record',
+        lambda **kwargs: {'provenance': kwargs})
+    monkeypatch.setenv('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
+    captured = {}
+
+    def capture_run(argv, **kwargs):
+        captured['argv'] = argv
+        captured['environment'] = kwargs['env']
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(tool.subprocess, 'run', capture_run)
+    tool._evaluate_mode(
+        candidate, tmp_path / 'evaluate.json', flip_test=True,
+        checkpoint_sha256=candidate.checkpoint_sha256,
+        git_commit='d' * 40, checkpoint=checkpoint,
+        manifest_path=manifest)
+
+    assert captured['argv'][-4:] == [
+        '--safe-manifest', str(manifest),
+        '--safe-candidate', candidate.id]
+    assert 'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD' not in captured['environment']
+
+
 def _coco_fixture(tmp_path):
     subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
     annotation = tmp_path / 'data/coco/annotations/person_keypoints_val2017.json'

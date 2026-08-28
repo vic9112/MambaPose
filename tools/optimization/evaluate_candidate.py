@@ -99,7 +99,8 @@ def _evaluate_mode(
         checkpoint_sha256: str, git_commit: str,
         checkpoint: Path,
         config_path: Path | None = None,
-        checkpoint_name: str | None = None) -> dict:
+        checkpoint_name: str | None = None,
+        manifest_path: Path | None = None) -> dict:
     config_path = config_path or REPO_ROOT / candidate.config
     config = _deterministic_config(candidate, flip_test, config_path)
     protocol = validate_coco_val_protocol(config, repository_root=REPO_ROOT)
@@ -119,14 +120,23 @@ def _evaluate_mode(
         config.test_dataloader, seed=candidate.seed, epoch=0)
     environment = _child_environment()
     environment['MAMBAPOSE_OPTIMIZATION_SEED'] = str(candidate.seed)
-    subprocess.run([
+    command = [
         sys.executable,
         str(REPO_ROOT / 'tools/test.py'),
         str(resolved),
         str(checkpoint),
         '--work-dir', str(work_dir),
         '--out', str(raw_metrics),
-    ], cwd=REPO_ROOT, env=environment, check=True, shell=False)
+    ]
+    if candidate.features.get('numeric_kind') == 'pwl':
+        if manifest_path is None:
+            raise ValueError('PWL evaluation requires its candidate manifest')
+        command.extend([
+            '--safe-manifest', str(manifest_path),
+            '--safe-candidate', candidate.id,
+        ])
+    subprocess.run(
+        command, cwd=REPO_ROOT, env=environment, check=True, shell=False)
     metrics = load_coco_metrics(raw_metrics, provenance=provenance)
     determinism = build_determinism_record(
         seed=candidate.seed,
@@ -178,7 +188,8 @@ def evaluate(
             candidate, output, flip_test=mode == 'flip',
             checkpoint_sha256=checkpoint_sha256, git_commit=git_commit,
             checkpoint=checkpoint, config_path=config_path,
-            checkpoint_name=runtime['checkpoint_name'])
+            checkpoint_name=runtime['checkpoint_name'],
+            manifest_path=manifest)
         for mode in modes
     }
     if (candidate.route == 'ssm-quant-pwl'

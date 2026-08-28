@@ -24,7 +24,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from mambapose_opt.artifacts import optimization_output_path
-from mambapose_opt.checkpoints import authorize_manifest_candidate
+from mambapose_opt.checkpoints import (
+    authorize_manifest_candidate, build_manifest_authorized_model)
 from mambapose_opt.determinism import seed_deterministic_root
 from mambapose_opt.numeric_calibration import (
     CalibrationTargets, calibration_identity, discover_calibration_targets,
@@ -103,18 +104,20 @@ def audit(
     """CPU checkpoint/config load audit; no dataset iteration or artifact write."""
     target = target_candidate or candidate
     policy = _require_target_policy(target, policy)
-    from mmpose.apis import init_model
-
     manifest = manifest_path or REPOSITORY_ROOT / 'optimization/candidates.json'
     authorized = authorize_manifest_candidate(
         REPOSITORY_ROOT, manifest, candidate.id)
     if authorized.candidate != candidate:
         raise ValueError('calibration candidate differs from authorized manifest')
     identity = _identity(candidate, policy)
-    model = init_model(
-        str(authorized.config_path),
-        str(authorized.checkpoint_path),
-        device='cpu')
+    if getattr(target, 'features', {}).get('numeric_kind') == 'pwl':
+        model = build_manifest_authorized_model(
+            REPOSITORY_ROOT, manifest, candidate, device='cpu')
+    else:
+        from mmpose.apis import init_model
+        model = init_model(
+            str(authorized.config_path), str(authorized.checkpoint_path),
+            device='cpu')
     model.eval()
     targets = discover_calibration_targets(model)
     return {
@@ -360,17 +363,20 @@ def calibrate(
     identity_before = _identity(candidate, policy)
     from mmengine.config import Config
     from mmengine.runner import Runner
-    from mmpose.apis import init_model
-
     config = Config.fromfile(authorized.config_path)
     loader_config = dict(config.train_dataloader)
     loader_config.update(batch_size=1, num_workers=0, persistent_workers=False)
     loader_config['sampler'] = dict(type='DefaultSampler', shuffle=False)
     root_determinism = seed_deterministic_root(candidate.seed)
-    model = init_model(
-        str(authorized.config_path),
-        str(authorized.checkpoint_path),
-        device=device)
+    if getattr(target, 'features', {}).get('numeric_kind') == 'pwl':
+        model = build_manifest_authorized_model(
+            REPOSITORY_ROOT, manifest, candidate,
+            config=config, device=device)
+    else:
+        from mmpose.apis import init_model
+        model = init_model(
+            str(authorized.config_path), str(authorized.checkpoint_path),
+            device=device)
     model.eval()
     if any(parameter.requires_grad for parameter in model.parameters()):
         model.requires_grad_(False)

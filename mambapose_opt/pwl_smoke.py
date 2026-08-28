@@ -755,8 +755,10 @@ def _prepare_smoke_output_directory(output: Path) -> None:
         raise FileExistsError('PWL smoke output is not a directory')
     unexpected = tuple(
         path.name for path in output.iterdir()
-        if not (path.is_file() and re.fullmatch(r'attempt-[1-9][0-9]*\.log',
-                                                path.name)))
+        if not (
+            not path.is_symlink()
+            and path.is_file()
+            and re.fullmatch(r'attempt-[1-9][0-9]*\.log', path.name)))
     if unexpected:
         raise FileExistsError(
             f'PWL smoke output contains unexpected entries: {unexpected}')
@@ -785,32 +787,18 @@ def _smoke_dataloader(value: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _neutralized(value: Any) -> Any:
-    result = copy.deepcopy(value)
-
-    def visit(item):
-        if isinstance(item, Mapping):
-            for name in tuple(item):
-                if name in {'init_cfg', 'pretrained'}:
-                    item[name] = None
-                else:
-                    visit(item[name])
-        elif isinstance(item, list):
-            for child in item:
-                visit(child)
-    visit(result)
-    return result
-
-
 def _build_model(config, state, device, *, install: bool):
     from mmengine.registry import init_default_scope
     from mmpose.registry import MODELS
 
+    from .checkpoints import (
+        load_tensor_state_strict, neutralize_model_initializers)
     from .numeric_conversion import NumericRuntimeHook
 
     init_default_scope(config.get('default_scope', 'mmpose'))
-    model = MODELS.build(_neutralized(config.model))
-    model.load_state_dict(dict(state), strict=True)
+    safe_config = neutralize_model_initializers(config)
+    model = MODELS.build(safe_config.model)
+    load_tensor_state_strict(model, state)
     if install:
         NumericRuntimeHook.apply_to_model(
             model, config.numeric_optimization)

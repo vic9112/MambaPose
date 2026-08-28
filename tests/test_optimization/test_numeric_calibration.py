@@ -553,7 +553,8 @@ def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
         id='full-s-v1', seed=7,
         config=Path('configs/reproduction/coco_s_v1.py'))
     target = SimpleNamespace(
-        id='w8a8', seed=7, config=Path('policy.py'))
+        id='pwl-silu-s-v1', seed=7, config=Path('policy.py'),
+        features={'numeric_kind': 'pwl'})
     authorized = SimpleNamespace(
         candidate=source, config_path=tmp_path / 'config.py',
         checkpoint_path=tmp_path / 'checkpoint.pth')
@@ -633,7 +634,9 @@ def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
                         lambda **_kwargs: {})
     monkeypatch.setattr('mmengine.config.Config.fromfile',
                         lambda _path: config)
-    monkeypatch.setattr('mmpose.apis.init_model', init_model)
+    monkeypatch.setattr(
+        tool, 'build_manifest_authorized_model',
+        lambda *_args, **_kwargs: init_model())
     monkeypatch.setattr('mmengine.runner.Runner.build_dataloader',
                         build_dataloader)
     original_algorithms = torch.are_deterministic_algorithms_enabled()
@@ -651,7 +654,7 @@ def test_calibrate_seeds_candidate_before_model_and_worker_zero_loader(
 
     assert calls == [('seed', 7), ('model', None), ('loader', 7, False)]
     assert identity_candidates == ['full-s-v1', 'full-s-v1']
-    assert artifact['candidate_id'] == 'w8a8'
+    assert artifact['candidate_id'] == 'pwl-silu-s-v1'
     assert artifact['schema_version'] == 2
     assert artifact['protocol']['root_determinism']['seed'] == 7
 

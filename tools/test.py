@@ -2,6 +2,7 @@
 import argparse
 import os
 import os.path as osp
+from pathlib import Path
 
 import mmengine
 from mmengine.config import Config, DictAction
@@ -14,6 +15,12 @@ def parse_args():
         description='MMPose test (and eval) model')
     parser.add_argument('config', help='test config file path')
     parser.add_argument('checkpoint', help='checkpoint file')
+    parser.add_argument(
+        '--safe-manifest',
+        help='candidate manifest required for restricted checkpoint loading')
+    parser.add_argument(
+        '--safe-candidate',
+        help='candidate id required for restricted checkpoint loading')
     parser.add_argument(
         '--work-dir', help='the directory to save evaluation results')
     parser.add_argument('--out', help='the file to save metric results.')
@@ -144,6 +151,26 @@ def main():
     # load config
     cfg = Config.fromfile(args.config)
     cfg = merge_args(cfg, args)
+
+    safe_requested = bool(args.safe_manifest or args.safe_candidate)
+    if safe_requested:
+        if not args.safe_manifest or not args.safe_candidate:
+            raise ValueError(
+                'safe checkpoint loading requires manifest and candidate')
+        from mambapose_opt.checkpoints import (
+            authorize_manifest_candidate, build_manifest_authorized_model)
+
+        repository_root = Path(__file__).resolve().parents[1]
+        authorized = authorize_manifest_candidate(
+            repository_root, Path(args.safe_manifest), args.safe_candidate)
+        if Path(args.checkpoint).resolve(strict=True) != \
+                authorized.checkpoint_path:
+            raise ValueError(
+                'checkpoint argument differs from manifest-authorized path')
+        cfg.load_from = None
+        cfg.model = build_manifest_authorized_model(
+            repository_root, Path(args.safe_manifest), args.safe_candidate,
+            config=cfg, device='cpu')
 
     # build the runner from config
     runner = Runner.from_cfg(cfg)

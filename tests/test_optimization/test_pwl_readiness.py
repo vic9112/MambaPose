@@ -853,7 +853,8 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
     model.layer = nn.SiLU()
     monkeypatch.setattr(convert_numeric, 'REPOSITORY_ROOT', tmp_path)
     monkeypatch.setattr(
-        'mmpose.apis.init_model', lambda *_args, **_kwargs: model)
+        convert_numeric, 'build_manifest_authorized_model',
+        lambda *_args, **_kwargs: model)
     monkeypatch.setattr(
         convert_numeric, 'validate_calibration_provenance',
         lambda value, **_kwargs: value)

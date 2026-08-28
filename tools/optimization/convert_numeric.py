@@ -23,7 +23,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from mambapose_opt.artifacts import optimization_output_path
-from mambapose_opt.checkpoints import authorize_manifest_candidate
+from mambapose_opt.checkpoints import (
+    authorize_manifest_candidate, build_manifest_authorized_model)
 from mambapose_opt.numeric_conversion import (
     bind_numeric_inputs, install_pwl_fit, quant_policy_from_config,
     verify_numeric_inputs)
@@ -172,8 +173,13 @@ def convert(
     binding = bind_numeric_inputs(runtime_paths)
     verify_numeric_inputs(binding)
 
-    from mmpose.apis import init_model
-    model = init_model(str(config_path), str(checkpoint_path), device='cpu')
+    if kind == 'pwl':
+        model = build_manifest_authorized_model(
+            REPOSITORY_ROOT, manifest_path, candidate,
+            config=config, device='cpu')
+    else:
+        from mmpose.apis import init_model
+        model = init_model(str(config_path), str(checkpoint_path), device='cpu')
     if kind == 'pwl':
         pwl_policy = config.numeric_optimization.pwl
         if pwl_policy.get('candidate_id') != candidate.id:

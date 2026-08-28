@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -73,15 +74,34 @@ class SubprocessStageRunner:
 
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
+        environment.pop('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', None)
         environment.update({
             'PYTHONNOUSERSITE': '1',
             'PYTHONDONTWRITEBYTECODE': '1',
             'CUBLAS_WORKSPACE_CONFIG': ':4096:8',
             'CUDA_VISIBLE_DEVICES': str(self.device_index),
             'MAMBAPOSE_PHYSICAL_DEVICE_INDEX': str(self.device_index),
-            'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1',
         })
         return environment
+
+    @staticmethod
+    def _open_attempt_log(path: Path):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, 'O_NOFOLLOW', 0)
+        try:
+            descriptor = os.open(path, flags, 0o640)
+        except OSError as error:
+            raise FileExistsError(
+                f'attempt log must be a nonsymlink regular file: {path}') \
+                from error
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise FileExistsError(
+                    f'attempt log must be a regular file: {path}')
+            return os.fdopen(descriptor, 'a', encoding='utf-8')
+        except Exception:
+            os.close(descriptor)
+            raise
 
     def wait_with_heartbeat(
             self, process: subprocess.Popen, heartbeat_path: Path,
@@ -197,7 +217,7 @@ class SubprocessStageRunner:
         log_path = stage_dir / f'attempt-{attempt}.log'
         heartbeat_path = self.campaign_root / 'heartbeat.json'
         environment = self.environment()
-        with log_path.open('a', encoding='utf-8') as log:
+        with self._open_attempt_log(log_path) as log:
             process = subprocess.Popen(
                 command,
                 cwd=REPO_ROOT,

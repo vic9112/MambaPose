@@ -52,6 +52,7 @@ from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 from mambapose_opt.numeric_conversion import NumericRuntimeHook
 from mambapose_opt.source import clean_git_commit
 from mambapose_opt.numeric_runtime import resolve_numeric_runtime
+from mambapose_opt.checkpoints import build_manifest_authorized_model
 
 
 LEASE_MAX_AGE = timedelta(seconds=LEASE_MAX_AGE_SECONDS)
@@ -211,7 +212,7 @@ def measure_candidate(
     data_protocol = validate_coco_val_protocol(
         config, repository_root=REPO_ROOT)
     config.randomness = dict(seed=candidate.seed, deterministic=True)
-    from mmpose.apis import inference_topdown, init_model
+    from mmpose.apis import inference_topdown
     import torch
 
     random.seed(candidate.seed)
@@ -220,7 +221,12 @@ def measure_candidate(
     torch.cuda.manual_seed_all(candidate.seed)
     torch.use_deterministic_algorithms(True)
 
-    model = init_model(config, str(checkpoint), device='cuda:0')
+    if candidate.features.get('numeric_kind') == 'pwl':
+        model = build_manifest_authorized_model(
+            REPO_ROOT, manifest, candidate, config=config, device='cuda:0')
+    else:
+        from mmpose.apis import init_model
+        model = init_model(config, str(checkpoint), device='cuda:0')
     numeric = config.get('numeric_optimization')
     if numeric is not None:
         NumericRuntimeHook.apply_to_model(model, numeric)

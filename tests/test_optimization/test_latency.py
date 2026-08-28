@@ -324,8 +324,9 @@ def test_pwl_latency_producer_serializes_exact_stage_a_binding(
     monkeypatch.setattr(tool.Config, 'fromfile', lambda _path: config)
     monkeypatch.setattr(tool, 'validate_coco_val_protocol',
                         lambda *args, **kwargs: {'authority': True})
-    monkeypatch.setattr('mmpose.apis.init_model',
-                        lambda *args, **kwargs: model)
+    monkeypatch.setattr(
+        tool, 'build_manifest_authorized_model',
+        lambda *args, **kwargs: model)
     monkeypatch.setattr('mmpose.apis.inference_topdown',
                         lambda *args, **kwargs: None)
     monkeypatch.setattr(tool.NumericRuntimeHook, 'apply_to_model',

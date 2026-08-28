@@ -297,7 +297,8 @@ def test_production_dependencies_reads_canonical_calibration_envelope(
 
 
 def test_nested_pretrain_initializers_are_neutralized_without_mutating_input():
-    from mambapose_opt.pwl_smoke import _neutralized
+    from mmengine.config import Config
+    from mambapose_opt.checkpoints import neutralize_model_initializers
 
     source = {
         'type': 'TopdownPoseEstimator',
@@ -306,7 +307,7 @@ def test_nested_pretrain_initializers_are_neutralized_without_mutating_input():
             'child': {'init_cfg': {'type': 'Pretrained'}}},
         'head': {'init_cfg': {'type': 'Normal'}, 'channels': 17}}
 
-    result = _neutralized(source)
+    result = neutralize_model_initializers(Config(dict(model=source))).model
 
     assert result['backbone']['pretrained'] is None
     assert result['backbone']['child']['init_cfg'] is None
@@ -344,6 +345,20 @@ def test_controller_precreated_smoke_directory_preserves_only_attempt_log(
     assert log.read_text(encoding='utf-8') == 'controller owned\n'
     (output / 'unexpected.json').write_text('{}', encoding='utf-8')
     with pytest.raises(FileExistsError, match='unexpected'):
+        _prepare_smoke_output_directory(output)
+
+
+def test_controller_precreated_smoke_directory_rejects_attempt_log_symlink(
+        tmp_path):
+    from mambapose_opt.pwl_smoke import _prepare_smoke_output_directory
+
+    output = tmp_path / 'smoke-stage-a'
+    output.mkdir()
+    outside = tmp_path / 'outside.log'
+    outside.write_text('sentinel\n', encoding='utf-8')
+    (output / 'attempt-1.log').symlink_to(outside)
+
+    with pytest.raises(FileExistsError, match='unexpected|symlink'):
         _prepare_smoke_output_directory(output)
 
 
