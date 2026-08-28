@@ -12,6 +12,7 @@ from .numeric_source import (
     file_sha256, resolve_numeric_file, validate_numeric_config_closure,
     validate_numeric_source_binding)
 from .schema import CandidateSpec
+from .pwl_paths import canonical_relative_path
 
 
 class NumericRuntimeError(ValueError):
@@ -272,9 +273,10 @@ def validate_numeric_convert_artifact(
 def _file(root: Path, record: object, label: str) -> Path:
     if not isinstance(record, Mapping) or set(record) != {'path', 'sha256'}:
         raise NumericRuntimeError(f'{label} reference is invalid')
-    relative = Path(str(record['path']))
-    if relative.is_absolute() or any(part in {'.', '..'} for part in relative.parts):
-        raise NumericRuntimeError(f'{label} path is unsafe')
+    try:
+        relative = canonical_relative_path(record['path'], label=label)
+    except ValueError as error:
+        raise NumericRuntimeError(str(error)) from error
     try:
         cursor = resolve_numeric_file(root, relative, label)
     except ValueError as error:

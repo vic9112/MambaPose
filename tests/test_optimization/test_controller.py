@@ -117,6 +117,68 @@ def _outcome(stage, artifact, *, exit_code=0, valid=True, fingerprint='ok'):
     )
 
 
+def test_pwl_smoke_controller_owns_one_outer_gpu_lease_and_precreates_dir(
+        tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from mambapose_opt import controller as controller_module
+    from mambapose_opt.controller import OptimizationController, StageOutcome
+    from mambapose_opt.gpu_guard import GpuLease
+    from mambapose_opt.schema import CandidateSpec
+
+    parent = _candidate(tmp_path)
+    candidate = CandidateSpec.from_dict({
+        'id': parent.id, 'route': 'ssm-quant-pwl', 'kind': 'pwl',
+        'config': parent.config.as_posix(),
+        'checkpoint': parent.checkpoint.as_posix(),
+        'checkpoint_sha256': parent.checkpoint_sha256,
+        'seed': parent.seed, 'features': {'numeric_kind': 'pwl'},
+    })
+    calls = []
+    lease = GpuLease(
+        stage_id='fixture:smoke-stage-a', pid=os.getpid(),
+        boot_id='11111111-1111-1111-1111-111111111111',
+        timestamp='2026-08-28T00:00:00+00:00', device_index=0,
+        allowed_pids=(os.getpid(),), lease_id='7' * 64)
+
+    @contextmanager
+    def owned(*args, **kwargs):
+        calls.append((args, kwargs))
+        yield lease
+
+    def runner(_candidate, stage, stage_dir, attempt):
+        assert stage_dir.is_dir()
+        artifact = stage_dir / 'smoke.json'
+        artifact.write_text('{}', encoding='utf-8')
+        return StageOutcome(
+            'fixture:smoke-stage-a', stage, 'fixture', 0, 'ok',
+            artifacts_valid=True, artifacts=(artifact,),
+            artifact_sha256={str(artifact): _sha256(artifact)},
+            attempt=attempt)
+
+    monkeypatch.setattr(controller_module, 'authorize_manifest_candidate',
+                        lambda *args, **kwargs: SimpleNamespace(
+                            candidate=candidate))
+    monkeypatch.setattr(controller_module, 'exclusive_cuda_stage', owned)
+    monkeypatch.setattr(
+        OptimizationController, '_artifact_schema',
+        lambda self, stage, path, **kwargs:
+        'pwl-stage-a-full-model-smoke-v1')
+    controller = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path,
+        manifest_path=tmp_path / 'optimization/candidates.json',
+        stages=('smoke-stage-a',), now=lambda: datetime(
+            2026, 8, 28, tzinfo=timezone.utc))
+
+    outcome = controller.run_next()
+
+    assert outcome.exit_code == 0
+    assert outcome.gpu_lease == lease
+    assert len(calls) == 1
+
+
 def _write_generic_artifact(
         path, stage, candidate_id='fixture', *, device_index=0):
     path.parent.mkdir(parents=True, exist_ok=True)

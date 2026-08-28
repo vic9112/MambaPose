@@ -36,8 +36,9 @@ from .schema import CandidateSpec
 
 
 STAGES = ('profile', 'calibrate', 'train', 'evaluate', 'latency', 'compare')
-_KNOWN_STAGES = frozenset(STAGES) | {'convert', 'export'}
-CUDA_STAGES = frozenset(STAGES) - {'compare'}
+_KNOWN_STAGES = frozenset(STAGES) | {
+    'convert', 'export', 'pwl-selection', 'smoke-stage-a'}
+CUDA_STAGES = (frozenset(STAGES) - {'compare'}) | {'smoke-stage-a'}
 StageRunner = Callable[[CandidateSpec, str, Path, int], 'StageOutcome']
 ArtifactValidator = Callable[[str, 'StageOutcome'], bool]
 
@@ -306,6 +307,32 @@ class OptimizationController:
         if not isinstance(value, dict):
             raise ArtifactValidationError(
                 f'{stage} artifact root must be an object: {path}')
+        if stage == 'pwl-selection':
+            try:
+                from .pwl_selection import validate_pwl_selection_artifact
+                validate_pwl_selection_artifact(
+                    value, repository_root=self.repository_root,
+                    manifest_path=self.manifest_path)
+            except ValueError as error:
+                raise ArtifactValidationError(
+                    f'PWL selection artifact is invalid: {error}') from error
+            return 'pwl-four-candidate-selection-v1'
+        if stage == 'smoke-stage-a':
+            try:
+                from .pwl_smoke import validate_pwl_stage_a_artifact
+                validated_smoke = validate_pwl_stage_a_artifact(
+                    path, repository_root=self.repository_root,
+                    manifest_path=self.manifest_path)
+                if expected_gpu_lease is None:
+                    raise MetricError(
+                        'PWL smoke requires controller lease evidence')
+                self._match_latency_lease(
+                    validated_smoke['gpu']['lease'], expected_gpu_lease,
+                    validated_at=lease_validated_at)
+            except (MetricError, OSError, ValueError) as error:
+                raise ArtifactValidationError(
+                    f'PWL smoke artifact is invalid: {error}') from error
+            return 'pwl-stage-a-full-model-smoke-v1'
         if stage == 'calibrate' and self.candidate.route == 'ssm-quant-pwl':
             try:
                 from .numeric_calibration import validate_calibration_provenance
@@ -334,6 +361,8 @@ class OptimizationController:
                 base_required | {'device', 'parent', 'runtime'})
             if self.candidate.route == 'ssm-quant-pwl':
                 required.add('source')
+                if self.candidate.features.get('numeric_kind') == 'pwl':
+                    required.add('pwl_stage_a')
             if set(value) != required:
                 raise ArtifactValidationError(
                     'profile artifact fields do not match its schema version')
@@ -369,6 +398,11 @@ class OptimizationController:
                     expected_config_sha = runtime['config_sha256']
                     expected_checkpoint = runtime['checkpoint_name']
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
+                    if (self.candidate.features.get('numeric_kind') == 'pwl'
+                            and value.get('pwl_stage_a') !=
+                            runtime.get('pwl_stage_a')):
+                        raise ValueError(
+                            'profile PWL Stage-A binding mismatch')
                     validate_numeric_source_binding(
                         value['source'], repository_root=self.repository_root,
                         candidate=self.candidate,
@@ -595,6 +629,9 @@ class OptimizationController:
                         self.repository_root).as_posix()
                     expected_checkpoint = runtime['checkpoint_name']
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
+                    expected_pwl_stage_a = runtime.get('pwl_stage_a')
+                else:
+                    expected_pwl_stage_a = None
                 validated_evaluation = validate_evaluation_envelope(
                     value,
                     expected_candidate_id=self.candidate.id,
@@ -608,6 +645,7 @@ class OptimizationController:
                     expected_source_binding=source,
                     expected_authority=authority,
                     require_source_binding=True,
+                    expected_pwl_stage_a=expected_pwl_stage_a,
                 )
                 from mmengine.config import Config
                 config = Config.fromfile(
@@ -643,6 +681,9 @@ class OptimizationController:
                     expected_checkpoint = runtime['checkpoint_name']
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
                     expected_config_sha = runtime['config_sha256']
+                    expected_pwl_stage_a = runtime.get('pwl_stage_a')
+                else:
+                    expected_pwl_stage_a = None
                 validated_latency = validate_latency_envelope(
                     value,
                     expected_candidate_id=self.candidate.id,
@@ -657,6 +698,7 @@ class OptimizationController:
                     expected_source_binding=source,
                     expected_authority=authority,
                     require_source_binding=True,
+                    expected_pwl_stage_a=expected_pwl_stage_a,
                 )
                 if expected_gpu_lease is None:
                     raise MetricError(
@@ -686,9 +728,13 @@ class OptimizationController:
             'allowed_pids': tuple(expected.allowed_pids),
             'lease_id': expected.lease_id,
         }
+        actual_identity = dict(actual)
+        if isinstance(actual_identity.get('allowed_pids'), (list, tuple)):
+            actual_identity['allowed_pids'] = tuple(
+                actual_identity['allowed_pids'])
         mismatched = tuple(
             name for name, value in expected_identity.items()
-            if actual.get(name) != value)
+            if actual_identity.get(name) != value)
         if mismatched:
             raise MetricError(
                 'latency GPU lease does not match controller acquisition: '
@@ -755,10 +801,11 @@ class OptimizationController:
         hashes: dict[str, str] = {}
         try:
             stored_lease = (
-                self._stored_gpu_lease(run) if stage == 'latency' else None)
+                self._stored_gpu_lease(run)
+                if stage in {'latency', 'smoke-stage-a'} else None)
             lease_validated_at = (
                 self._stored_lease_validated_at(run)
-                if stage == 'latency' else None)
+                if stage in {'latency', 'smoke-stage-a'} else None)
             for record in evidence:
                 if not isinstance(record, dict):
                     return False
@@ -1061,7 +1108,8 @@ class OptimizationController:
             self._record(normalized, 'blocked')
             return normalized
         try:
-            lease_validated_at = self.now() if stage == 'latency' else None
+            lease_validated_at = (
+                self.now() if stage in {'latency', 'smoke-stage-a'} else None)
             evidence = self._validate_artifacts(
                 stage, outcome, lease_validated_at=lease_validated_at)
         except Exception as error:

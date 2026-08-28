@@ -23,5 +23,7 @@ numeric_optimization = dict(
              grid_points=4097, saturation='clamp', qat_form='differentiable',
              selection_policy='observed-range-max-then-mean-v1'),
     attention_softmax='exact-floating',
-    stage_order=('calibrate', 'convert', 'profile', 'evaluate', 'latency'),
+    stage_order=(
+        'calibrate', 'pwl-selection', 'convert', 'smoke-stage-a',
+        'profile', 'evaluate', 'latency'),
 )

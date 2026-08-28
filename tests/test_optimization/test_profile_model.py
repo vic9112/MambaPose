@@ -34,10 +34,10 @@ def test_formal_numeric_profile_places_model_and_input_on_logical_cuda(
     checkpoint_sha = tool._sha256(checkpoint)
     candidate = CandidateSpec.from_dict({
         'id': 'numeric-fixture', 'route': 'ssm-quant-pwl',
-        'kind': 'fake-quant', 'config': 'configs/numeric.py',
+        'kind': 'pwl', 'config': 'configs/numeric.py',
         'checkpoint': 'approved/model.pth',
         'checkpoint_sha256': checkpoint_sha, 'seed': 0,
-        'features': {'numeric_kind': 'weight-only'},
+        'features': {'numeric_kind': 'pwl'},
     })
     runtime = {
         'config_path': config_path,
@@ -46,6 +46,11 @@ def test_formal_numeric_profile_places_model_and_input_on_logical_cuda(
         'checkpoint_name': 'approved/model.pth',
         'checkpoint_sha256': checkpoint_sha,
         'train': None,
+        'pwl_stage_a': {
+            'path': ('work_dirs/optimization/ssm-quant-pwl/'
+                     'numeric-fixture/0/smoke-stage-a/smoke.json'),
+            'sha256': '9' * 64,
+        },
     }
 
     class Dummy(torch.nn.Module):
@@ -104,6 +109,7 @@ def test_formal_numeric_profile_places_model_and_input_on_logical_cuda(
             'sha256': checkpoint_sha,
         },
     }
+    assert result['pwl_stage_a'] == runtime['pwl_stage_a']
 
 
 def test_profile_cli_is_directly_executable_from_repository_root():

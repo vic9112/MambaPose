@@ -2,27 +2,33 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import copy
+from datetime import datetime, timedelta, timezone
+import fcntl
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 from typing import Any, Callable, Mapping, Sequence
 
 import torch
 
-from .latency import LatencyError, validate_gpu_lease
+from .gpu_guard import controller_process_tree
+from .latency import (
+    LEASE_MAX_AGE_SECONDS, LEASE_MAX_FUTURE_SKEW_SECONDS,
+    LatencyError, validate_gpu_lease)
 from .pwl_artifacts import (
     load_pwl_fit_reference, load_pwl_installation_reference)
 from .pwl_selection import load_pwl_selection_reference
+from .pwl_paths import canonical_path, canonical_relative_path
 
 
 _SHA256 = re.compile(r'^[0-9a-f]{64}$')
+_LEASE_MAX_AGE = timedelta(seconds=LEASE_MAX_AGE_SECONDS)
+_LEASE_MAX_FUTURE_SKEW = timedelta(seconds=LEASE_MAX_FUTURE_SKEW_SECONDS)
 
 
 def _sha256(path: Path) -> str:
@@ -364,12 +370,7 @@ def execute_pwl_stage_a_model(
 
 
 def _strict_file(root: Path, value: object, *, label: str) -> Path:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f'{label} path is invalid')
-    relative = Path(value)
-    if relative.is_absolute() or any(part in {'.', '..'}
-                                     for part in relative.parts):
-        raise ValueError(f'{label} path is unsafe')
+    relative = canonical_relative_path(value, label=label)
     cursor = root
     for part in relative.parts:
         cursor = cursor / part
@@ -385,11 +386,13 @@ def _binding(value: object, *, label: str) -> dict[str, str]:
             or set(value) != {'path', 'sha256'}
             or not isinstance(value.get('path'), str)
             or not isinstance(value.get('sha256'), str)
-            or not _SHA256.fullmatch(value['sha256'])
-            or Path(value['path']).is_absolute()
-            or any(part in {'.', '..'} for part in Path(value['path']).parts)):
+            or not _SHA256.fullmatch(value['sha256'])):
         raise ValueError(f'{label} binding is invalid')
-    return dict(value)
+    try:
+        relative = canonical_relative_path(value['path'], label=label)
+    except ValueError as error:
+        raise ValueError(f'{label} binding is invalid: {error}') from error
+    return {'path': relative.as_posix(), 'sha256': value['sha256']}
 
 
 def _policy(config) -> dict[str, Any]:
@@ -484,7 +487,9 @@ def validate_pwl_stage_a_artifact(
         manifest_path: Path) -> dict[str, Any]:
     """Public validator reconstructing tracked fit, policy and selection."""
     root = Path(repository_root).resolve(strict=True)
-    supplied = Path(artifact_path)
+    supplied = canonical_path(
+        str(artifact_path), label='PWL Stage-A artifact',
+        allow_absolute=True)
     if supplied.is_absolute():
         try:
             relative = supplied.absolute().relative_to(root)
@@ -553,7 +558,7 @@ def validate_pwl_stage_a_artifact(
         lease = validate_gpu_lease(gpu['lease'])
     except LatencyError as error:
         raise ValueError(f'PWL Stage-A GPU lease is invalid: {error}') from error
-    if (lease['stage_id'] != f'pwl-smoke:{value["candidate_id"]}'
+    if (lease['stage_id'] != f'{value["candidate_id"]}:smoke-stage-a'
             or lease['device_index'] != gpu['physical_index']):
         raise ValueError('PWL Stage-A GPU lease identity is invalid')
     execution = value['execution']
@@ -699,6 +704,64 @@ def _canonical_gpu_lock(repository_root: Path) -> Path:
     return common_path.parent / 'work_dirs/optimization/gpu.lock'
 
 
+def _active_controller_lease(
+        candidate_id: str, device_index: int, *, repository_root: Path,
+        now: Callable[[], datetime] | None = None) -> dict[str, Any]:
+    """Read the controller's already-held lease without acquiring it again."""
+    lock_path = _canonical_gpu_lock(repository_root)
+    try:
+        stream = lock_path.open('r+', encoding='utf-8')
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            stream.seek(0)
+            value = json.load(stream)
+        else:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            raise ValueError('canonical GPU lease is not actively held')
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f'cannot read active GPU lease: {error}') from error
+    finally:
+        if 'stream' in locals():
+            stream.close()
+    value = validate_gpu_lease(value)
+    if value['stage_id'] != f'{candidate_id}:smoke-stage-a':
+        raise ValueError('active GPU lease does not match PWL smoke stage')
+    boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    if value['boot_id'] != boot_id:
+        raise ValueError('active GPU lease belongs to a different boot')
+    if value['device_index'] != device_index:
+        raise ValueError('active GPU lease device does not match PWL smoke')
+    timestamp = datetime.fromisoformat(value['timestamp'])
+    current = now() if now is not None else datetime.now(timezone.utc)
+    if current - timestamp > _LEASE_MAX_AGE:
+        raise ValueError('active GPU lease timestamp is stale')
+    if timestamp - current > _LEASE_MAX_FUTURE_SKEW:
+        raise ValueError('active GPU lease timestamp is in the future')
+    if os.getpid() not in controller_process_tree({value['pid']}):
+        raise ValueError('PWL smoke process is not a controller descendant')
+    return value
+
+
+def _prepare_smoke_output_directory(output: Path) -> None:
+    """Admit the controller-created directory while preserving its log."""
+    output = Path(output)
+    if output.is_symlink():
+        raise FileExistsError('PWL smoke output must not be a symlink')
+    if not output.exists():
+        output.mkdir(parents=True)
+        return
+    if not output.is_dir():
+        raise FileExistsError('PWL smoke output is not a directory')
+    unexpected = tuple(
+        path.name for path in output.iterdir()
+        if not (path.is_file() and re.fullmatch(r'attempt-[1-9][0-9]*\.log',
+                                                path.name)))
+    if unexpected:
+        raise FileExistsError(
+            f'PWL smoke output contains unexpected entries: {unexpected}')
+
+
 def _smoke_dataloader(value: Mapping[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(dict(value))
     dataset = result.get('dataset')
@@ -774,20 +837,16 @@ def run_pwl_stage_a_smoke(
     if device_index < 0:
         raise ValueError('PWL smoke device index must be non-negative')
     root = Path(repository_root).resolve(strict=True)
-    relative = Path(output_relative)
-    if (relative.is_absolute() or any(part in {'.', '..'}
-                                      for part in relative.parts)
-            or relative.parts[:2] != ('work_dirs', 'optimization')
+    relative = canonical_relative_path(
+        str(output_relative), label='PWL smoke output')
+    if (relative.parts[:2] != ('work_dirs', 'optimization')
             or relative.name != 'smoke-stage-a'):
         raise ValueError('PWL smoke output path is invalid')
     output = root / relative
-    if output.exists() or output.is_symlink():
-        raise FileExistsError(f'refusing to overwrite PWL smoke: {relative}')
     from mmengine.config import Config
     from mmengine.runner import Runner
 
     from .checkpoints import authorize_manifest_candidate, tensor_state
-    from .gpu_guard import exclusive_cuda_stage
     from .numeric_runtime import validate_numeric_convert_artifact
 
     authorized = authorize_manifest_candidate(root, manifest_path, candidate_id)
@@ -824,102 +883,102 @@ def run_pwl_stage_a_smoke(
         raise ValueError('PWL smoke candidate is not selected')
     loader_config = _smoke_dataloader(config.train_dataloader)
     state = tensor_state(authorized.checkpoint_path)
-    output.mkdir(parents=True)
+    _prepare_smoke_output_directory(output)
     try:
-        stage_id = f'pwl-smoke:{candidate.id}'
-        with exclusive_cuda_stage(
-                _canonical_gpu_lock(root), device_index, (os.getpid(),),
-                stage_id=stage_id) as lease:
-            if os.environ.get('CUDA_VISIBLE_DEVICES') != str(device_index):
-                raise RuntimeError(
-                    'CUDA_VISIBLE_DEVICES must expose exactly the leased GPU')
-            if not torch.cuda.is_available():
-                raise RuntimeError('CUDA is unavailable for PWL Stage-A smoke')
-            torch.manual_seed(candidate.seed)
-            torch.cuda.manual_seed_all(candidate.seed)
-            torch.use_deterministic_algorithms(True)
-            device = torch.device('cuda:0')
-            model = _build_model(config, state, device, install=True)
-            loader = Runner.build_dataloader(
-                loader_config, seed=candidate.seed, diff_rank_seed=False)
-            batch = next(iter(loader))
-            processed = model.data_preprocessor(batch, training=True)
-            inputs, samples = processed['inputs'], processed['data_samples']
-            if (not isinstance(inputs, torch.Tensor)
-                    or list(inputs.shape) != [1, 3, 256, 192]
-                    or not isinstance(samples, list) or len(samples) != 1):
-                raise RuntimeError('PWL Stage-A packed batch is invalid')
+        lease_value = _active_controller_lease(
+            candidate.id, device_index, repository_root=root)
+        if os.environ.get('CUDA_VISIBLE_DEVICES') != str(device_index):
+            raise RuntimeError(
+                'CUDA_VISIBLE_DEVICES must expose exactly the leased GPU')
+        if not torch.cuda.is_available():
+            raise RuntimeError('CUDA is unavailable for PWL Stage-A smoke')
+        torch.manual_seed(candidate.seed)
+        torch.cuda.manual_seed_all(candidate.seed)
+        torch.use_deterministic_algorithms(True)
+        device = torch.device('cuda:0')
+        model = _build_model(config, state, device, install=True)
+        loader = Runner.build_dataloader(
+            loader_config, seed=candidate.seed, diff_rank_seed=False)
+        batch = next(iter(loader))
+        processed = model.data_preprocessor(batch, training=True)
+        inputs, samples = processed['inputs'], processed['data_samples']
+        if (not isinstance(inputs, torch.Tensor)
+                or list(inputs.shape) != [1, 3, 256, 192]
+                or not isinstance(samples, list) or len(samples) != 1):
+            raise RuntimeError('PWL Stage-A packed batch is invalid')
 
-            def fitted_factory():
-                empty = {name: torch.empty_like(value)
-                         for name, value in state.items()}
-                return _build_model(
-                    config, empty, torch.device('cpu'), install=True)
+        def fitted_factory():
+            empty = {name: torch.empty_like(value)
+                     for name, value in state.items()}
+            return _build_model(
+                config, empty, torch.device('cpu'), install=True)
 
-            def identity_factory():
-                empty = {name: torch.empty_like(value)
-                         for name, value in state.items()}
-                return _build_model(
-                    config, empty, torch.device('cpu'), install=False)
+        def identity_factory():
+            empty = {name: torch.empty_like(value)
+                     for name, value in state.items()}
+            return _build_model(
+                config, empty, torch.device('cpu'), install=False)
 
-            execution = execute_pwl_stage_a_model(
-                model=model, inputs=inputs, data_samples=samples,
-                optimizer=build_stage_a_optimizer(model, config.optim_wrapper),
-                model_factory=fitted_factory,
-                optimizer_factory=lambda restored: build_stage_a_optimizer(
-                    restored, config.optim_wrapper),
-                identity_factory=identity_factory,
-                export_path=output / 'round-trip.pth',
-                function_name=policy['enabled_function'],
-                roles=policy['roles'], coefficients=fit['coefficients'],
-                operation_manifest=installation['operation_manifest'])
-            execution['export']['path'] = (
-                output / 'round-trip.pth').relative_to(root).as_posix()
-            sample_id = samples[0].metainfo.get('img_id')
-            if isinstance(sample_id, bool) or not isinstance(sample_id, int):
-                raise RuntimeError('PWL Stage-A sample image id is invalid')
-            lease_value = asdict(lease)
-            lease_value['allowed_pids'] = list(lease_value['allowed_pids'])
-            artifact = {
-                'schema_version': 1,
-                'artifact_kind': 'pwl-stage-a-full-model-smoke',
-                'candidate_id': candidate.id,
-                'source': {'git_commit': authorized.source['git_commit']},
-                'config': {'path': candidate.config.as_posix(),
-                           'sha256': _sha256(authorized.config_path)},
-                'checkpoint': {'path': candidate.checkpoint.as_posix(),
-                               'sha256': candidate.checkpoint_sha256},
-                'fit_artifact': fit_reference,
-                'selection_artifact': selection_reference,
-                'installation': installation_reference,
-                'policy': policy,
-                'data': {
-                    'dataset': 'coco', 'split': 'train2017', 'batch_size': 1,
-                    'packed_production_pipeline': True,
-                    'input_shape': list(inputs.shape),
-                    'sample_ids': [sample_id]},
-                'gpu': {'logical': 'cuda:0',
-                        'physical_index': device_index, 'lease': lease_value},
-                'execution': execution,
-                'claim_limits': {
-                    'hardware_latency_claimed': False,
-                    'fpga_speedup_claimed': False,
-                    'fastmamba_composite_mechanisms_inherited': False},
-            }
-            artifact_path = output / 'smoke.json'
-            temporary = output / f'.smoke.{os.getpid()}.tmp'
-            with temporary.open('w', encoding='utf-8') as stream:
-                json.dump(artifact, stream, indent=2, sort_keys=True,
-                          allow_nan=False)
-                stream.write('\n')
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, artifact_path)
+        execution = execute_pwl_stage_a_model(
+            model=model, inputs=inputs, data_samples=samples,
+            optimizer=build_stage_a_optimizer(model, config.optim_wrapper),
+            model_factory=fitted_factory,
+            optimizer_factory=lambda restored: build_stage_a_optimizer(
+                restored, config.optim_wrapper),
+            identity_factory=identity_factory,
+            export_path=output / 'round-trip.pth',
+            function_name=policy['enabled_function'],
+            roles=policy['roles'], coefficients=fit['coefficients'],
+            operation_manifest=installation['operation_manifest'])
+        execution['export']['path'] = (
+            output / 'round-trip.pth').relative_to(root).as_posix()
+        sample_id = samples[0].metainfo.get('img_id')
+        if isinstance(sample_id, bool) or not isinstance(sample_id, int):
+            raise RuntimeError('PWL Stage-A sample image id is invalid')
+        artifact = {
+            'schema_version': 1,
+            'artifact_kind': 'pwl-stage-a-full-model-smoke',
+            'candidate_id': candidate.id,
+            'source': {'git_commit': authorized.source['git_commit']},
+            'config': {'path': candidate.config.as_posix(),
+                       'sha256': _sha256(authorized.config_path)},
+            'checkpoint': {'path': candidate.checkpoint.as_posix(),
+                           'sha256': candidate.checkpoint_sha256},
+            'fit_artifact': fit_reference,
+            'selection_artifact': selection_reference,
+            'installation': installation_reference,
+            'policy': policy,
+            'data': {
+                'dataset': 'coco', 'split': 'train2017', 'batch_size': 1,
+                'packed_production_pipeline': True,
+                'input_shape': list(inputs.shape),
+                'sample_ids': [sample_id]},
+            'gpu': {'logical': 'cuda:0',
+                    'physical_index': device_index, 'lease': lease_value},
+            'execution': execution,
+            'claim_limits': {
+                'hardware_latency_claimed': False,
+                'fpga_speedup_claimed': False,
+                'fastmamba_composite_mechanisms_inherited': False},
+        }
+        artifact_path = output / 'smoke.json'
+        temporary = output / f'.smoke.{os.getpid()}.tmp'
+        with temporary.open('w', encoding='utf-8') as stream:
+            json.dump(artifact, stream, indent=2, sort_keys=True,
+                      allow_nan=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, artifact_path)
         validate_pwl_stage_a_artifact(
             artifact_path, repository_root=root, manifest_path=manifest_path)
         return artifact_path
     except BaseException:
-        shutil.rmtree(output, ignore_errors=True)
+        for path in (
+                output / 'smoke.json', output / 'round-trip.pth'):
+            path.unlink(missing_ok=True)
+        for path in output.glob('.smoke.*.tmp'):
+            path.unlink(missing_ok=True)
         raise
 
 

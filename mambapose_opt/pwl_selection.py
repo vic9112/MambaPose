@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from .pwl_artifacts import (
     PWLArtifactError, require_pwl_fit_admitted, validate_pwl_fit_report)
+from .pwl_paths import canonical_path, canonical_relative_path
 
 
 class PWLSelectionError(ValueError):
@@ -65,11 +66,10 @@ def _reference(value: object, *, label: str) -> dict[str, str]:
             or not isinstance(value.get('sha256'), str)
             or not _SHA256.fullmatch(value['sha256'])):
         raise PWLSelectionError(f'{label} reference is invalid')
-    relative = Path(value['path'])
-    if relative.is_absolute():
-        raise PWLSelectionError(f'{label} path must be repository-relative')
-    if any(part in {'', '.', '..'} for part in relative.parts):
-        raise PWLSelectionError(f'{label} path is unsafe')
+    try:
+        relative = canonical_relative_path(value['path'], label=label)
+    except ValueError as error:
+        raise PWLSelectionError(str(error)) from error
     return {'path': relative.as_posix(), 'sha256': value['sha256']}
 
 
@@ -319,7 +319,8 @@ def validate_pwl_selection_artifact(
         manifest_path: Path) -> dict[str, Any]:
     """Reconstruct a production decision from tracked source and four fits."""
     root = Path(repository_root).resolve(strict=True)
-    supplied = Path(manifest_path)
+    supplied = canonical_path(
+        str(manifest_path), label='PWL source manifest', allow_absolute=True)
     lexical = supplied if supplied.is_absolute() else root / supplied
     lexical = lexical.absolute()
     try:
@@ -359,7 +360,8 @@ def build_pwl_selection_artifact(
             for candidate_id, _ in CANONICAL_PWL_CANDIDATES]
     }
     root = Path(repository_root).resolve(strict=True)
-    supplied = Path(manifest_path)
+    supplied = canonical_path(
+        str(manifest_path), label='PWL source manifest', allow_absolute=True)
     lexical = supplied if supplied.is_absolute() else root / supplied
     lexical = lexical.absolute()
     try:

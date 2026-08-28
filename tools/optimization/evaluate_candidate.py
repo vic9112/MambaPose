@@ -185,12 +185,15 @@ def evaluate(
             and (_sha256(config_path) != runtime['config_sha256']
                  or _sha256(checkpoint) != runtime['checkpoint_sha256'])):
         raise ValueError('evaluation runtime inputs changed during execution')
-    return stage_envelope(candidate.id, 'evaluate', {
+    result = {
         'route': candidate.route,
         'calibration_split': None,
         'modes': rows,
         'source': source,
-    })
+    }
+    if candidate.features.get('numeric_kind') == 'pwl':
+        result['pwl_stage_a'] = dict(runtime['pwl_stage_a'])
+    return stage_envelope(candidate.id, 'evaluate', result)
 
 
 def main() -> int:

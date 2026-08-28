@@ -29,6 +29,7 @@ from mambapose_opt.schema import (
 )
 from mambapose_repro.orchestrator import PERMANENT_EXIT, failure_fingerprint
 from mambapose_opt.numeric_conversion import numeric_stage_plan
+from mambapose_opt.pwl_selection import CANONICAL_PWL_CANDIDATES
 
 
 CAMPAIGN_ROOT = REPO_ROOT / 'work_dirs/optimization'
@@ -62,11 +63,13 @@ class SubprocessStageRunner:
 
     def __init__(
             self, campaign_root: Path, manifest_path: Path,
-            *, device_index: int = 0, heartbeat_interval: float = 30.0):
+            *, device_index: int = 0, heartbeat_interval: float = 30.0,
+            pwl_candidates: Sequence[CandidateSpec] = ()):
         self.campaign_root = campaign_root
         self.manifest_path = manifest_path
         self.device_index = device_index
         self.heartbeat_interval = heartbeat_interval
+        self.pwl_candidates = tuple(pwl_candidates)
 
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -103,6 +106,29 @@ class SubprocessStageRunner:
             artifact: Path) -> list[str]:
         python = str(REPO_ROOT / '.venv/bin/python')
         common = [candidate.id, '--output', self._relative(artifact)]
+        if stage == 'pwl-selection':
+            command = [
+                python,
+                str(REPO_ROOT / 'tools/optimization/select_pwl_candidate.py'),
+                '--manifest', str(self.manifest_path),
+                '--output', self._relative(artifact),
+            ]
+            for item in self.pwl_candidates:
+                calibration = (
+                    self.campaign_root / item.route / item.id /
+                    str(item.seed) / 'calibrate/calibrate.json')
+                command.extend([
+                    '--calibration',
+                    f'{item.id}={self._relative(calibration)}'])
+            return command
+        if stage == 'smoke-stage-a':
+            return [
+                python, str(REPO_ROOT / 'tools/optimization/smoke_pwl.py'),
+                '--candidate', candidate.id,
+                '--manifest', str(self.manifest_path),
+                '--output-root', self._relative(artifact.parent),
+                '--device-index', str(self.device_index),
+            ]
         if stage in {'convert', 'export'}:
             command = [
                 python, str(REPO_ROOT / 'tools/optimization/convert_numeric.py'),
@@ -153,6 +179,12 @@ class SubprocessStageRunner:
             self, candidate: CandidateSpec, stage: str,
             stage_dir: Path, attempt: int) -> StageOutcome:
         artifact = stage_dir / f'{stage}.json'
+        if stage == 'pwl-selection':
+            artifact = (
+                self.campaign_root / candidate.route /
+                'pwl-selection/selection.json')
+        elif stage == 'smoke-stage-a':
+            artifact = stage_dir / 'smoke.json'
         command = self._command(candidate, stage, artifact)
         missing_tool = Path(command[1])
         if not missing_tool.is_file():
@@ -254,6 +286,80 @@ def _stages_for_candidate(candidate: CandidateSpec) -> tuple[str, ...]:
         recovery=candidate.features.get('recovery_candidate') is True)
 
 
+def _canonical_pwl_candidates(
+        candidates: Sequence[CandidateSpec]) -> tuple[CandidateSpec, ...]:
+    selected = tuple(
+        candidate for candidate in candidates
+        if candidate.features.get('numeric_kind') == 'pwl')
+    actual = tuple(
+        (candidate.id, candidate.features.get('pwl_function'))
+        for candidate in selected)
+    # Test fixtures may omit the redundant feature, while production manifests
+    # must preserve it. Candidate IDs still make the scheduling authority exact.
+    actual_ids = tuple(candidate.id for candidate in selected)
+    expected_ids = tuple(item[0] for item in CANONICAL_PWL_CANDIDATES)
+    if actual_ids != expected_ids:
+        raise CandidateManifestError(
+            'PWL campaign requires exactly four canonical candidates in order')
+    if any(function is not None and function != expected_function
+           for (_, function), (_, expected_function) in zip(
+               actual, CANONICAL_PWL_CANDIDATES)):
+        raise CandidateManifestError(
+            'PWL candidate function differs from canonical manifest')
+    return selected
+
+
+_PWL_DOWNSTREAM_STAGES = (
+    'convert', 'smoke-stage-a', 'profile', 'evaluate', 'latency')
+
+
+def _pwl_campaign_phases(
+        candidates: Sequence[CandidateSpec], *,
+        selected_candidate_id: str | None = None,
+        ) -> tuple[tuple[CandidateSpec, tuple[str, ...]], ...]:
+    canonical = _canonical_pwl_candidates(candidates)
+    phases = tuple((candidate, ('calibrate',)) for candidate in canonical) + (
+        (canonical[0], ('pwl-selection',)),)
+    if selected_candidate_id is None:
+        return phases
+    selected = tuple(
+        candidate for candidate in canonical
+        if candidate.id == selected_candidate_id)
+    if len(selected) != 1:
+        raise CandidateManifestError(
+            'PWL selection chose a non-canonical candidate')
+    return phases + ((selected[0], _PWL_DOWNSTREAM_STAGES),)
+
+
+def _pwl_expected_run_ids(
+        candidates: Sequence[CandidateSpec]) -> tuple[str, ...]:
+    canonical = _canonical_pwl_candidates(candidates)
+    return (
+        tuple(f'{candidate.id}:calibrate' for candidate in canonical)
+        + (f'{canonical[0].id}:pwl-selection',)
+        + tuple(
+            f'{candidate.id}:{stage}'
+            for candidate in canonical
+            for stage in _PWL_DOWNSTREAM_STAGES))
+
+
+def _advance_controller(controller: OptimizationController) -> int:
+    while True:
+        outcome = controller.run_next()
+        print(json.dumps({
+            'stage_id': outcome.stage_id,
+            'exit_code': outcome.exit_code,
+            'fingerprint': outcome.fingerprint,
+            'message': outcome.message,
+            'retry_not_before': outcome.retry_not_before,
+            'retry_remaining_seconds': outcome.retry_remaining_seconds,
+        }, sort_keys=True))
+        if outcome.exit_code != 0:
+            return outcome.exit_code
+        if outcome.stage == 'complete':
+            return 0
+
+
 def _canonical_checkout_root() -> Path:
     result = subprocess.run(
         ['git', 'rev-parse', '--git-common-dir'],
@@ -328,14 +434,24 @@ def main() -> int:
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
         print(f'cannot derive canonical GPU lock: {error}', file=sys.stderr)
         return PERMANENT_EXIT
-    expected_run_ids = tuple(
-        f'{candidate.id}:{stage}'
-        for candidate in candidates
-        for stage in _stages_for_candidate(candidate))
     try:
+        pwl_candidates = tuple(
+            item for item in candidates
+            if item.features.get('numeric_kind') == 'pwl')
+        regular_candidates = tuple(
+            item for item in candidates
+            if item.features.get('numeric_kind') != 'pwl')
+        expected_run_ids = tuple(
+            f'{candidate.id}:{stage}'
+            for candidate in regular_candidates
+            for stage in _stages_for_candidate(candidate))
+        if pwl_candidates:
+            expected_run_ids += _pwl_expected_run_ids(pwl_candidates)
         runner = SubprocessStageRunner(
-            args.campaign_root, args.manifest, device_index=args.device_index)
-        for candidate in candidates:
+            args.campaign_root, args.manifest, device_index=args.device_index,
+            pwl_candidates=pwl_candidates)
+
+        def advance(candidate: CandidateSpec, stages: tuple[str, ...]) -> int:
             controller = OptimizationController(
                 args.campaign_root,
                 candidate,
@@ -345,23 +461,37 @@ def main() -> int:
                 device_index=args.device_index,
                 gpu_lock_path=gpu_lock_path,
                 shared_lock_root=shared_lock_root,
-                stages=_stages_for_candidate(candidate),
+                stages=stages,
                 expected_run_ids=expected_run_ids,
             )
-            while True:
-                outcome = controller.run_next()
-                print(json.dumps({
-                    'stage_id': outcome.stage_id,
-                    'exit_code': outcome.exit_code,
-                    'fingerprint': outcome.fingerprint,
-                    'message': outcome.message,
-                    'retry_not_before': outcome.retry_not_before,
-                    'retry_remaining_seconds': outcome.retry_remaining_seconds,
-                }, sort_keys=True))
-                if outcome.exit_code != 0:
-                    return outcome.exit_code
-                if outcome.stage == 'complete':
-                    break
+            return _advance_controller(controller)
+
+        for candidate in regular_candidates:
+            exit_code = advance(candidate, _stages_for_candidate(candidate))
+            if exit_code:
+                return exit_code
+        if pwl_candidates:
+            phases = _pwl_campaign_phases(pwl_candidates)
+            for candidate, stages in phases:
+                exit_code = advance(candidate, stages)
+                if exit_code:
+                    return exit_code
+            selection_path = (
+                args.campaign_root / 'ssm-quant-pwl/'
+                'pwl-selection/selection.json')
+            from mambapose_opt.pwl_selection import (
+                validate_pwl_selection_artifact)
+            selection = validate_pwl_selection_artifact(
+                json.loads(selection_path.read_text(encoding='utf-8')),
+                repository_root=REPO_ROOT, manifest_path=args.manifest)
+            selected_id = selection.get('selected_candidate_id')
+            if selected_id is not None:
+                candidate, stages = _pwl_campaign_phases(
+                    pwl_candidates,
+                    selected_candidate_id=str(selected_id))[-1]
+                exit_code = advance(candidate, stages)
+                if exit_code:
+                    return exit_code
     except (OSError, RuntimeError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return PERMANENT_EXIT

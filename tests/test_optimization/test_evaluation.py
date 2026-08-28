@@ -124,6 +124,59 @@ def test_profile_loader_accepts_bound_v2_cuda_runtime_and_rejects_cpu(tmp_path):
             expected_source=source)
 
 
+def test_pwl_downstream_validators_require_exact_stage_a_binding(tmp_path):
+    from mambapose_opt.evaluation import (
+        MetricError, _load_profile, validate_evaluation_envelope,
+        validate_latency_envelope)
+
+    smoke = {
+        'path': ('work_dirs/optimization/ssm-quant-pwl/pwl-silu-s-v1/0/'
+                 'smoke-stage-a/smoke.json'),
+        'sha256': '9' * 64,
+    }
+    profile_path = tmp_path / 'profile.json'
+    profile = _profile('pwl-silu-s-v1')
+    runtime = {
+        'config': {'path': profile['config'], 'sha256': 'b' * 64},
+        'checkpoint': {
+            'path': profile['checkpoint'], 'sha256': 'a' * 64},
+    }
+    profile.update({
+        'schema_version': 2,
+        'device': {'logical': 'cuda:0', 'physical_index': 0, 'kind': 'cuda'},
+        'parent': {
+            'config': 'configs/optimization/numeric/pwl_silu.py',
+            'checkpoint': profile['checkpoint'],
+            'checkpoint_sha256': 'a' * 64,
+        },
+        'runtime': runtime,
+        'pwl_stage_a': smoke,
+    })
+    _write_json(profile_path, profile)
+    assert _load_profile(
+        profile_path, candidate_id='pwl-silu-s-v1',
+        provenance=_provenance(), expected_runtime=runtime,
+        expected_parent=profile['parent'], expected_pwl_stage_a=smoke)[
+            'pwl_stage_a'] == smoke
+
+    evaluation = _evaluation('pwl-silu-s-v1')
+    evaluation['result']['pwl_stage_a'] = smoke
+    assert validate_evaluation_envelope(
+        evaluation, expected_pwl_stage_a=smoke)['pwl_stage_a'] == smoke
+    latency = _latency('pwl-silu-s-v1')
+    latency['result']['gpu_lease']['stage_id'] = 'pwl-silu-s-v1:latency'
+    latency['result']['pwl_stage_a'] = smoke
+    assert validate_latency_envelope(
+        latency, expected_pwl_stage_a=smoke)['pwl_stage_a'] == smoke
+
+    forged = dict(smoke, sha256='8' * 64)
+    with pytest.raises(MetricError, match='Stage-A|smoke'):
+        validate_evaluation_envelope(
+            evaluation, expected_pwl_stage_a=forged)
+    with pytest.raises(MetricError, match='Stage-A|smoke'):
+        validate_latency_envelope(latency, expected_pwl_stage_a=forged)
+
+
 def _latency(candidate_id='full-s-v1'):
     summary = {
         'median_ms': 1.0, 'p90_ms': 1.2, 'p95_ms': 1.3,
@@ -725,12 +778,14 @@ def test_formal_evaluation_runs_flip_and_no_flip_before_envelope(
 
     checkpoint = tmp_path / 'model.pth'
     checkpoint.write_bytes(b'checkpoint')
+    config_path = tmp_path / 'config.py'
+    config_path.write_text('model = dict(type="Fixture")\n', encoding='utf-8')
     import hashlib
     candidate = CandidateSpec.from_dict({
-        'id': 'fixture', 'route': 'accuracy-first', 'kind': 'float',
+        'id': 'fixture', 'route': 'ssm-quant-pwl', 'kind': 'pwl',
         'config': 'config.py', 'checkpoint': 'model.pth',
         'checkpoint_sha256': hashlib.sha256(b'checkpoint').hexdigest(),
-        'seed': 0, 'features': {},
+        'seed': 0, 'features': {'numeric_kind': 'pwl'},
     })
     monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
     monkeypatch.setattr(tool, '_git_commit', lambda: 'd' * 40)
@@ -738,11 +793,17 @@ def test_formal_evaluation_runs_flip_and_no_flip_before_envelope(
         tool, 'resolve_numeric_runtime',
         lambda *args, **kwargs: {
             'config_path': tmp_path / candidate.config,
-            'config_sha256': None,
+            'config_sha256': hashlib.sha256(
+                config_path.read_bytes()).hexdigest(),
             'checkpoint_path': checkpoint,
             'checkpoint_name': candidate.checkpoint.as_posix(),
             'checkpoint_sha256': candidate.checkpoint_sha256,
             'train': None,
+            'pwl_stage_a': {
+                'path': ('work_dirs/optimization/ssm-quant-pwl/fixture/0/'
+                         'smoke-stage-a/smoke.json'),
+                'sha256': '9' * 64,
+            },
         })
     monkeypatch.setattr(
         tool, 'build_source_binding',
@@ -759,6 +820,7 @@ def test_formal_evaluation_runs_flip_and_no_flip_before_envelope(
 
     assert seen == [True, False]
     assert set(envelope['result']['modes']) == {'flip', 'no_flip'}
+    assert envelope['result']['pwl_stage_a']['sha256'] == '9' * 64
 
 
 def test_direct_evaluation_child_disables_bytecode_independent_of_parent(

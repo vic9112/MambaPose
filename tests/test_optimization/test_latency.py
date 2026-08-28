@@ -268,6 +268,82 @@ def test_latency_admission_rejects_unlocked_lease_before_model_or_cuda(
         tool.measure_candidate(candidate, warmup=50, repeats=200)
 
 
+def test_pwl_latency_producer_serializes_exact_stage_a_binding(
+        tmp_path, monkeypatch):
+    import hashlib
+    import sys
+    from types import SimpleNamespace
+
+    import tools.optimization.measure_latency as tool
+    from mambapose_opt.schema import CandidateSpec
+
+    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '1')
+    monkeypatch.setenv('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    monkeypatch.setattr(sys, 'dont_write_bytecode', True)
+    config_path = tmp_path / 'config.py'
+    config_path.write_text('model = dict()\n', encoding='utf-8')
+    checkpoint = tmp_path / 'model.pth'
+    checkpoint.write_bytes(b'checkpoint')
+    candidate = CandidateSpec.from_dict({
+        'id': 'pwl-silu-s-v1', 'route': 'ssm-quant-pwl', 'kind': 'pwl',
+        'config': 'config.py', 'checkpoint': 'model.pth',
+        'checkpoint_sha256': hashlib.sha256(b'checkpoint').hexdigest(),
+        'seed': 0, 'features': {'numeric_kind': 'pwl'},
+    })
+    smoke = {
+        'path': ('work_dirs/optimization/ssm-quant-pwl/pwl-silu-s-v1/0/'
+                 'smoke-stage-a/smoke.json'), 'sha256': '9' * 64}
+    runtime = {
+        'config_path': config_path,
+        'config_sha256': tool._sha256(config_path),
+        'checkpoint_path': checkpoint,
+        'checkpoint_name': 'model.pth',
+        'checkpoint_sha256': candidate.checkpoint_sha256,
+        'pwl_stage_a': smoke,
+    }
+    lease = {
+        'stage_id': 'pwl-silu-s-v1:latency', 'pid': 123,
+        'boot_id': '11111111-1111-1111-1111-111111111111',
+        'timestamp': '2026-08-28T00:00:00+00:00', 'device_index': 0,
+        'allowed_pids': [123], 'lease_id': '7' * 64,
+    }
+    config = tool.Config(dict(
+        randomness={}, model=dict(test_cfg=dict(flip_test=False))))
+    model = SimpleNamespace(cfg=config, test_cfg={})
+    monkeypatch.setattr(tool, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(tool, 'resolve_numeric_runtime',
+                        lambda *args, **kwargs: runtime)
+    monkeypatch.setattr(tool, '_latency_admission', lambda *args, **kwargs: {
+        'git_commit': 'd' * 40,
+        'checkpoint_sha256': candidate.checkpoint_sha256,
+        'config_sha256': runtime['config_sha256'],
+        'data_inventory_sha256': 'c' * 64,
+        'gpu_lease': lease})
+    monkeypatch.setattr(tool, 'build_source_binding',
+                        lambda **kwargs: {'bound': True})
+    monkeypatch.setattr(tool.Config, 'fromfile', lambda _path: config)
+    monkeypatch.setattr(tool, 'validate_coco_val_protocol',
+                        lambda *args, **kwargs: {'authority': True})
+    monkeypatch.setattr('mmpose.apis.init_model',
+                        lambda *args, **kwargs: model)
+    monkeypatch.setattr('mmpose.apis.inference_topdown',
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(tool.NumericRuntimeHook, 'apply_to_model',
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(tool, 'measure_latency_samples',
+                        lambda *args, **kwargs: tuple([1.0] * 200))
+    monkeypatch.setattr('torch.cuda.manual_seed_all', lambda _seed: None)
+    monkeypatch.setattr('torch.use_deterministic_algorithms',
+                        lambda _enabled: None)
+
+    envelope = tool.measure_candidate(
+        candidate, warmup=50, repeats=200, device_index=0,
+        manifest_path=tmp_path / 'optimization/candidates.json',
+        output=tmp_path / 'work_dirs/optimization/latency.json')
+
+    assert envelope['result']['pwl_stage_a'] == smoke
+
+
 def test_active_gpu_lease_checks_boot_device_and_live_descendant(
         tmp_path, monkeypatch):
     import fcntl

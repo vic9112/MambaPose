@@ -249,6 +249,8 @@ def measure_candidate(
         },
         'source': source,
     })
+    if candidate.features.get('numeric_kind') == 'pwl':
+        result['pwl_stage_a'] = dict(runtime['pwl_stage_a'])
     result['protocol']['data'] = data_protocol
     result['protocol'].update({
         'source_config': config_path.relative_to(REPO_ROOT).as_posix(),

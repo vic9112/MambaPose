@@ -21,6 +21,7 @@ from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.pwl_selection import (
     CANONICAL_PWL_CANDIDATES, build_pwl_selection_artifact,
     validate_pwl_selection_artifact)
+from mambapose_opt.pwl_paths import canonical_path, canonical_relative_path
 
 
 def _sha256(path: Path) -> str:
@@ -57,7 +58,8 @@ def _calibrations(values: list[str]) -> dict[str, dict[str, str]]:
         if not separator or candidate_id not in expected or candidate_id in result:
             raise ValueError(
                 '--calibration must be one unique canonical candidate=path')
-        supplied = Path(raw_path)
+        supplied = canonical_relative_path(
+            raw_path, label=f'{candidate_id} calibration')
         if not supplied.is_absolute():
             supplied = REPOSITORY_ROOT / supplied
         path = supplied.resolve(strict=True)
@@ -70,16 +72,32 @@ def _calibrations(values: list[str]) -> dict[str, dict[str, str]]:
     return result
 
 
+def _manifest_path(value: str) -> Path:
+    try:
+        return canonical_path(
+            value, label='PWL source manifest', allow_absolute=True)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _selection_output(value: str) -> str:
+    try:
+        return canonical_relative_path(
+            value, label='PWL selection output').as_posix()
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        '--manifest', type=Path,
+        '--manifest', type=_manifest_path,
         default=REPOSITORY_ROOT / 'optimization/candidates.json')
     parser.add_argument(
         '--calibration', action='append', default=[],
         help='canonical-candidate-id=repository-relative-calibrate.json')
     parser.add_argument(
-        '--output', default=(
+        '--output', type=_selection_output, default=(
             'work_dirs/optimization/ssm-quant-pwl/'
             'pwl-selection/selection.json'))
     args = parser.parse_args()

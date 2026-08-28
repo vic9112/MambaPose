@@ -89,7 +89,9 @@ def numeric_stage_plan(
     if kind == 'pwl':
         if not conditional:
             raise ValueError(f'{kind} requires explicit conditional admission')
-        return ('calibrate', 'convert', 'profile', 'evaluate', 'latency')
+        return (
+            'calibrate', 'pwl-selection', 'convert', 'smoke-stage-a',
+            'profile', 'evaluate', 'latency')
     if kind == 'binary-qk':
         if not conditional:
             raise ValueError(f'{kind} requires explicit conditional admission')

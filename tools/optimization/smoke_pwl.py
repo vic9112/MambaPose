@@ -25,11 +25,15 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from mambapose_opt.pwl_paths import canonical_relative_path
+
 
 def _output_root(value: str) -> Path:
-    path = Path(value)
-    if (path.is_absolute() or any(part in {'.', '..'} for part in path.parts)
-            or path.parts[:2] != ('work_dirs', 'optimization')
+    try:
+        path = canonical_relative_path(value, label='output-root')
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    if (path.parts[:2] != ('work_dirs', 'optimization')
             or path.name != 'smoke-stage-a'):
         raise argparse.ArgumentTypeError(
             'output-root must be repository-relative smoke-stage-a')

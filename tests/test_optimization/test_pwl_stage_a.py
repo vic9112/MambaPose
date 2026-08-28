@@ -216,7 +216,7 @@ def test_public_pwl_stage_a_validator_reconstructs_all_authority(
             'installation': installation})
     monkeypatch.setattr(
         pwl_smoke, 'validate_gpu_lease',
-        lambda value: {'stage_id': 'pwl-smoke:pwl-silu-s-v1',
+        lambda value: {'stage_id': 'pwl-silu-s-v1:smoke-stage-a',
                        'device_index': 0})
 
     assert pwl_smoke.validate_pwl_stage_a_artifact(
@@ -329,3 +329,49 @@ def test_pwl_stage_a_cli_is_directly_executable():
     assert '--candidate' in result.stdout
     assert '--output-root' in result.stdout
     assert '--device-index' in result.stdout
+
+
+def test_controller_precreated_smoke_directory_preserves_only_attempt_log(
+        tmp_path):
+    from mambapose_opt.pwl_smoke import _prepare_smoke_output_directory
+
+    output = tmp_path / 'smoke-stage-a'
+    output.mkdir()
+    log = output / 'attempt-1.log'
+    log.write_text('controller owned\n', encoding='utf-8')
+
+    _prepare_smoke_output_directory(output)
+    assert log.read_text(encoding='utf-8') == 'controller owned\n'
+    (output / 'unexpected.json').write_text('{}', encoding='utf-8')
+    with pytest.raises(FileExistsError, match='unexpected'):
+        _prepare_smoke_output_directory(output)
+
+
+def test_pwl_smoke_consumes_controller_lease_without_relocking(
+        tmp_path, monkeypatch):
+    from dataclasses import asdict
+    from datetime import datetime, timezone
+    import fcntl
+    import os
+
+    from mambapose_opt.gpu_guard import GpuLease
+    from mambapose_opt import pwl_smoke
+
+    lock = tmp_path / 'gpu.lock'
+    timestamp = datetime.now(timezone.utc)
+    lease = GpuLease(
+        stage_id='pwl-silu-s-v1:smoke-stage-a', pid=os.getpid(),
+        boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+        timestamp=timestamp.isoformat(), device_index=2,
+        allowed_pids=(os.getpid(),), lease_id='7' * 64)
+    lock.write_text(json.dumps({
+        **asdict(lease), 'allowed_pids': list(lease.allowed_pids)}),
+        encoding='utf-8')
+    monkeypatch.setattr(pwl_smoke, '_canonical_gpu_lock', lambda _root: lock)
+    with lock.open('r+', encoding='utf-8') as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        observed = pwl_smoke._active_controller_lease(
+            'pwl-silu-s-v1', 2, repository_root=tmp_path,
+            now=lambda: timestamp)
+
+    assert observed['lease_id'] == lease.lease_id

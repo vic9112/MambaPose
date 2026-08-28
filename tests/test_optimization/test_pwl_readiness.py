@@ -588,7 +588,7 @@ def test_numeric_runtime_installs_only_hash_bound_fit_and_manifest(
 
 
 @pytest.mark.parametrize('name', ['silu', 'gelu', 'softplus', 'exp'])
-def test_pwl_configs_declare_artifact_ranking_and_five_stage_campaign(name):
+def test_pwl_configs_declare_artifact_ranking_and_global_campaign(name):
     from mmengine.config import Config
 
     from mambapose_opt.numeric_conversion import numeric_stage_plan
@@ -596,12 +596,65 @@ def test_pwl_configs_declare_artifact_ranking_and_five_stage_campaign(name):
     config = Config.fromfile(f'configs/optimization/numeric/pwl_{name}.py')
     numeric = config.numeric_optimization
     assert tuple(numeric.stage_order) == (
-        'calibrate', 'convert', 'profile', 'evaluate', 'latency')
+        'calibrate', 'pwl-selection', 'convert', 'smoke-stage-a',
+        'profile', 'evaluate', 'latency')
     assert numeric.pwl.selection_policy == (
         'observed-range-max-then-mean-v1')
     assert numeric.calibration.artifact_schema_version == 3
     assert numeric_stage_plan('pwl', conditional=True) == tuple(
         numeric.stage_order)
+
+
+@pytest.mark.parametrize('raw', [
+    'work_dirs/./optimization/x.json',
+    'work_dirs//optimization/x.json',
+    'work_dirs/optimization/x.json/',
+])
+def test_pwl_public_references_reject_lexical_aliases(raw, tmp_path):
+    from mambapose_opt.pwl_artifacts import _strict_reference
+    from mambapose_opt.pwl_selection import (
+        _reference, validate_pwl_selection_artifact)
+    from mambapose_opt.pwl_smoke import (
+        _binding, validate_pwl_stage_a_artifact)
+    from mambapose_opt.numeric_runtime import _file
+
+    value = {'path': raw, 'sha256': 'a' * 64}
+    with pytest.raises(ValueError, match='invalid|unsafe|canonical'):
+        _reference(value, label='selection')
+    with pytest.raises(ValueError, match='invalid|unsafe|canonical'):
+        _strict_reference(value, repository_root=Path.cwd(), label='fit')
+    with pytest.raises(ValueError, match='invalid|unsafe|canonical'):
+        _binding(value, label='smoke')
+    with pytest.raises(ValueError, match='invalid|unsafe|canonical'):
+        _file(tmp_path, value, 'numeric export')
+    with pytest.raises(ValueError, match='invalid|unsafe|canonical'):
+        validate_pwl_selection_artifact(
+            {}, repository_root=tmp_path,
+            manifest_path='optimization/./candidates.json')
+    with pytest.raises(ValueError, match='invalid|unsafe|canonical'):
+        validate_pwl_stage_a_artifact(
+            'work_dirs/./optimization/x/smoke-stage-a/smoke.json',
+            repository_root=tmp_path,
+            manifest_path='optimization/candidates.json')
+
+
+def test_pwl_cli_rejects_lexical_aliases_before_resolution():
+    import argparse
+    from tools.optimization.select_pwl_candidate import _calibrations
+    from tools.optimization.smoke_pwl import _output_root
+
+    with pytest.raises(ValueError, match='canonical|relative|unsafe'):
+        _calibrations([
+            'pwl-silu-s-v1=work_dirs/./optimization/a.json',
+            'pwl-gelu-s-v1=work_dirs/optimization/b.json',
+            'pwl-softplus-s-v1=work_dirs/optimization/c.json',
+            'pwl-exp-s-v1=work_dirs/optimization/d.json'])
+    with pytest.raises(
+            argparse.ArgumentTypeError,
+            match='canonical|relative|unsafe|smoke-stage-a'):
+        _output_root(
+            'work_dirs/./optimization/ssm-quant-pwl/pwl-silu-s-v1/0/'
+            'smoke-stage-a')
 
 
 def test_pwl_convert_requires_fit_artifact_before_model_load(

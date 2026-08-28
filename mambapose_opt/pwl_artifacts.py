@@ -11,6 +11,8 @@ import re
 from typing import Any, Iterable, Mapping, Sequence
 
 import torch
+
+from .pwl_paths import canonical_relative_path
 import torch.nn.functional as F
 
 from mmpose.models.utils.hardware_friendly.pwl import (
@@ -721,11 +723,10 @@ def _strict_reference(
             or not isinstance(reference.get('sha256'), str)
             or not _SHA256.fullmatch(reference['sha256'])):
         raise PWLArtifactError(f'{label} reference is invalid')
-    relative = Path(reference['path'])
-    if relative.is_absolute():
-        raise PWLArtifactError(f'{label} path must be repository-relative')
-    if any(part in {'', '.', '..'} for part in relative.parts):
-        raise PWLArtifactError(f'{label} path is unsafe')
+    try:
+        relative = canonical_relative_path(reference['path'], label=label)
+    except ValueError as error:
+        raise PWLArtifactError(str(error)) from error
     if relative.parts[:2] != ('work_dirs', 'optimization'):
         raise PWLArtifactError(
             f'{label} path must be under work_dirs/optimization')

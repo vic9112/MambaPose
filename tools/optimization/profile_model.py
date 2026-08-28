@@ -198,6 +198,8 @@ def profile(
             manifest_path=manifest_path,
             policy_path=REPOSITORY_ROOT / candidate.config,
             git_commit=commit)
+        if candidate.features.get('numeric_kind') == 'pwl':
+            result['pwl_stage_a'] = dict(runtime['pwl_stage_a'])
     return result
 
 

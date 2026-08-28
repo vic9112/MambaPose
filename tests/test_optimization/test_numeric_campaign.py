@@ -2110,8 +2110,134 @@ def test_initial_conditional_candidates_do_not_depend_on_recovery_training():
     assert _stages_for_candidate(w8a8) == (
         'calibrate', 'convert', 'profile', 'evaluate', 'latency')
     assert _stages_for_candidate(pwl) == (
-        'calibrate', 'convert', 'profile', 'evaluate', 'latency')
+        'calibrate', 'pwl-selection', 'convert', 'smoke-stage-a',
+        'profile', 'evaluate', 'latency')
     assert Path('tools/optimization/train_candidate.py').is_file()
+
+
+def test_pwl_campaign_has_global_barrier_and_selected_only_downstream():
+    from tools.optimization.run_campaign import (
+        _pwl_campaign_phases, _pwl_expected_run_ids)
+
+    candidates = tuple(_candidate(
+        candidate_id, 'pwl', {
+            'numeric_kind': 'pwl', 'auto_run': False, 'conditional': True})
+        for candidate_id in (
+            'pwl-silu-s-v1', 'pwl-gelu-s-v1',
+            'pwl-softplus-s-v1', 'pwl-exp-s-v1'))
+
+    before = _pwl_campaign_phases(candidates)
+    assert before == tuple(
+        (candidate, ('calibrate',)) for candidate in candidates) + (
+            (candidates[0], ('pwl-selection',)),)
+    after = _pwl_campaign_phases(
+        candidates, selected_candidate_id='pwl-gelu-s-v1')
+    assert after[:-1] == before
+    assert after[-1] == (
+        candidates[1],
+        ('convert', 'smoke-stage-a', 'profile', 'evaluate', 'latency'))
+    expected = _pwl_expected_run_ids(candidates)
+    assert expected[:5] == tuple(
+        f'{candidate.id}:calibrate' for candidate in candidates) + (
+            'pwl-silu-s-v1:pwl-selection',)
+    assert set(expected[5:]) == {
+        f'{candidate.id}:{stage}'
+        for candidate in candidates
+        for stage in (
+            'convert', 'smoke-stage-a', 'profile', 'evaluate', 'latency')}
+
+
+def test_pwl_runner_wires_selection_and_smoke_as_canonical_stages(
+        tmp_path, monkeypatch):
+    from tools.optimization import run_campaign
+    from tools.optimization.run_campaign import SubprocessStageRunner
+
+    candidates = tuple(_candidate(
+        candidate_id, 'pwl', {
+            'numeric_kind': 'pwl', 'auto_run': False, 'conditional': True})
+        for candidate_id in (
+            'pwl-silu-s-v1', 'pwl-gelu-s-v1',
+            'pwl-softplus-s-v1', 'pwl-exp-s-v1'))
+    monkeypatch.setattr(run_campaign, 'REPO_ROOT', tmp_path)
+    runner = SubprocessStageRunner(
+        tmp_path / 'work_dirs/optimization',
+        tmp_path / 'optimization/candidates.json',
+        pwl_candidates=candidates)
+    selection = runner._command(
+        candidates[0], 'pwl-selection',
+        tmp_path / 'work_dirs/optimization/ssm-quant-pwl/pwl-selection/'
+        'selection.json')
+    smoke = runner._command(
+        candidates[1], 'smoke-stage-a',
+        tmp_path / 'work_dirs/optimization/ssm-quant-pwl/'
+        'pwl-gelu-s-v1/0/smoke-stage-a/smoke.json')
+
+    assert selection[1].endswith('select_pwl_candidate.py')
+    assert selection.count('--calibration') == 4
+    assert smoke[1].endswith('smoke_pwl.py')
+    assert smoke[-2:] == ['--device-index', '0']
+
+
+def test_mocked_campaign_advances_selection_then_selected_smoke_without_seed(
+        tmp_path, monkeypatch):
+    import sys
+
+    from mambapose_opt.controller import StageOutcome
+    from tools.optimization import run_campaign
+
+    candidates = tuple(_candidate(
+        candidate_id, 'pwl', {
+            'numeric_kind': 'pwl', 'auto_run': False, 'conditional': True,
+            'pwl_function': function})
+        for candidate_id, function in (
+            ('pwl-silu-s-v1', 'silu'), ('pwl-gelu-s-v1', 'gelu'),
+            ('pwl-softplus-s-v1', 'softplus'), ('pwl-exp-s-v1', 'exp')))
+    campaign_root = tmp_path / 'work_dirs/optimization'
+    manifest = tmp_path / 'optimization/candidates.json'
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{}', encoding='utf-8')
+    seen = []
+
+    class FakeController:
+        def __init__(self, _root, candidate, _runner, *, stages, **unused):
+            self.candidate = candidate
+            self.stages = tuple(stages)
+
+        def run_next(self):
+            seen.append((self.candidate.id, self.stages))
+            if self.stages == ('pwl-selection',):
+                selection = (
+                    campaign_root / 'ssm-quant-pwl/pwl-selection/'
+                    'selection.json')
+                selection.parent.mkdir(parents=True)
+                selection.write_text('{}', encoding='utf-8')
+            return StageOutcome(
+                f'{self.candidate.id}:complete', 'complete',
+                self.candidate.id, 0, 'complete', artifacts_valid=True)
+
+    monkeypatch.setattr(run_campaign, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(run_campaign, 'load_candidate_manifest',
+                        lambda _path: candidates)
+    monkeypatch.setattr(run_campaign, 'OptimizationController', FakeController)
+    monkeypatch.setattr(
+        run_campaign, '_validated_gpu_lock',
+        lambda _override: (tmp_path, campaign_root / 'gpu.lock'))
+    monkeypatch.setattr(
+        'mambapose_opt.pwl_selection.validate_pwl_selection_artifact',
+        lambda *args, **kwargs: {
+            'selected_candidate_id': 'pwl-softplus-s-v1'})
+    argv = ['run_campaign.py', '--run', '--admit-conditional',
+            '--manifest', str(manifest), '--campaign-root', str(campaign_root)]
+    for candidate in candidates:
+        argv.extend(['--candidate', candidate.id])
+    monkeypatch.setattr(sys, 'argv', argv)
+
+    assert run_campaign.main() == 0
+    assert seen == (
+        [(candidate.id, ('calibrate',)) for candidate in candidates]
+        + [('pwl-silu-s-v1', ('pwl-selection',))]
+        + [('pwl-softplus-s-v1', (
+            'convert', 'smoke-stage-a', 'profile', 'evaluate', 'latency'))])
 
 
 def test_explicit_recovery_candidate_trains_before_derived_runtime_stages():
