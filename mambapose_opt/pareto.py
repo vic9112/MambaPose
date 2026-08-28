@@ -41,6 +41,24 @@ _CANONICAL_ARTIFACT_ROLES = {
     'smoke': Path('smoke-stage-a/smoke.json'),
     'formal_authority': Path('formal/formal-authority.json'),
 }
+_FORMAL_RUN_FIELDS = {
+    'run_id', 'role', 'seed', 'conditional', 'config', 'config_sha256',
+    'initialization_id', 'output_root',
+}
+_PUBLIC_EVALUATION_PROTOCOL_FIELDS = {
+    'dataset', 'split', 'complete_split', 'batch_size',
+    'authority_path', 'authority_sha256', 'authority_image_count',
+    'authority_annotation_count', 'authority_detection_count',
+    'inventory_authority_sha256', 'annotation_authority_sha256',
+    'detection_authority_sha256', 'image_corpus_digest_algorithm',
+    'image_corpus_authority_sha256', 'image_corpus_sha256',
+    'inventory_annotation_archive_sha256',
+    'inventory_image_archive_sha256', 'annotation_sha256',
+    'detection_sha256', 'inventory_detection_sha256',
+    'annotation_image_count', 'annotation_record_count',
+    'detection_record_count', 'verified_image_count', 'source_config',
+    'checkpoint', 'data_inventory', 'inventory_projection',
+}
 
 
 def _sha256(path: Path) -> str:
@@ -227,6 +245,92 @@ def _candidate_row_sha256(manifest: Path, candidate_id: str, seed: int) -> str:
     return canonical_json_sha256(matches[0])
 
 
+def _formal_run_authority(
+        manifest: Mapping[str, Any], *, role: str, seed: int,
+        config: str, config_sha256: str, initialization_id: str,
+        output_root: str) -> dict[str, Any]:
+    runs = manifest.get('runs')
+    if not isinstance(runs, list):
+        raise ValueError('formal Stage-C manifest run rows are missing')
+    if any(
+            not isinstance(row, Mapping) or set(row) != _FORMAL_RUN_FIELDS
+            for row in runs):
+        raise ValueError('formal Stage-C manifest run row fields are invalid')
+    run_ids = [row['run_id'] for row in runs]
+    if (
+            any(not isinstance(run_id, str) or not run_id for run_id in run_ids)
+            or len(run_ids) != len(set(run_ids))):
+        raise ValueError('formal Stage-C manifest run row ids are invalid')
+    matches = [
+        row for row in runs
+        if row.get('role') == role and row.get('seed') == seed]
+    expected = {
+        'role': role,
+        'seed': seed,
+        'conditional': seed in (3, 4),
+        'config': config,
+        'config_sha256': config_sha256,
+        'initialization_id': initialization_id,
+        'output_root': output_root,
+    }
+    if (
+            len(matches) != 1
+            or any(matches[0].get(name) != value
+                   for name, value in expected.items())):
+        raise ValueError(
+            'formal Stage-C exact role/seed run row authority mismatch')
+    return _plain(matches[0])
+
+
+def _resolved_protocol_semantics(
+        value: Mapping[str, Any], protocol: Mapping[str, Any]) -> dict[str, Any]:
+    train_cfg = value.get('train_cfg')
+    dataloader = value.get('train_dataloader')
+    randomness = value.get('randomness')
+    evaluator = value.get('val_evaluator')
+    if (
+            not isinstance(train_cfg, Mapping)
+            or train_cfg.get('max_epochs') != protocol['epochs']
+            or not isinstance(dataloader, Mapping)
+            or dataloader.get('batch_size') !=
+            protocol['per_device_batch_size']
+            or dataloader.get('num_workers') != protocol['worker_count']
+            or dataloader.get('persistent_workers') is not
+            protocol['persistent_workers']
+            or not isinstance(randomness, Mapping)
+            or randomness.get('deterministic') is not protocol['deterministic']
+            or not isinstance(evaluator, Mapping)
+            or not isinstance(evaluator.get('type'), str)
+            or not evaluator['type'].endswith('CocoMetric')):
+        raise ValueError(
+            'formal resolved config contradicts the recorded protocol')
+    return {
+        'epochs': train_cfg['max_epochs'],
+        'per_device_batch_size': dataloader['batch_size'],
+        'worker_count': dataloader['num_workers'],
+        'persistent_workers': dataloader['persistent_workers'],
+        'deterministic': randomness['deterministic'],
+        'evaluator': protocol['evaluator'],
+        'tta_modes': _plain(protocol['tta_modes']),
+    }
+
+
+def _paired_resolved_config(value: Mapping[str, Any]) -> dict[str, Any]:
+    paired = _plain(value)
+    for name in (
+            'experiment_id', 'formal_role', 'formal_run_id',
+            'numeric_optimization', 'work_dir'):
+        paired.pop(name, None)
+    try:
+        tokenpose = paired['model']['head']['tokenpose_cfg']
+    except (KeyError, TypeError):
+        tokenpose = None
+    if isinstance(tokenpose, dict):
+        tokenpose.pop('pif_mode', None)
+        tokenpose.pop('qk_mode', None)
+    return paired
+
+
 def _identity(
         value: object, *, result: Any, role: str,
         label: str) -> dict[str, Any]:
@@ -251,13 +355,15 @@ def _result_mode_authority(result: Any, *, mode: str) -> dict[str, str]:
         raise ValueError(f'formal {mode} evaluation authority is incomplete')
     if (
             getattr(result, 'flip_test', None) is not (mode == 'flip')
-            or protocol.get('evaluator') != 'mmpose.CocoMetric'
-            or protocol.get('tta') != {
-                'mode': mode, 'flip_test': mode == 'flip'}):
-        raise ValueError(f'formal {mode} evaluator/TTA authority is invalid')
+            or set(protocol) != _PUBLIC_EVALUATION_PROTOCOL_FIELDS
+            or protocol.get('dataset') != 'coco'
+            or protocol.get('split') != 'val2017'
+            or protocol.get('complete_split') is not True):
+        raise ValueError(
+            f'formal {mode} public evaluation protocol is invalid')
     return {
-        'protocol_sha256': canonical_json_sha256(protocol),
-        'determinism_sha256': canonical_json_sha256(determinism),
+        'protocol_sha256': canonical_json_sha256(_plain(protocol)),
+        'determinism_sha256': canonical_json_sha256(_plain(determinism)),
     }
 
 
@@ -362,7 +468,7 @@ def _validate_formal_authority(
             or formal_manifest.read_bytes() != _tracked_bytes(
                 root, commit, source['formal_manifest_path'],
                 label='formal Stage-C manifest')
-            or formal_manifest_value.get('schema_version') != 1
+            or formal_manifest_value.get('schema_version') != 2
             or formal_manifest_value.get('experiment_id') !=
             'mambapose-formal-stage-c'):
         raise ValueError('formal Stage-C manifest authority mismatch')
@@ -404,15 +510,22 @@ def _validate_formal_authority(
         del base_path
         base_closure = list(validate_numeric_config_closure(
             root, Path(base_relative), git_commit=commit))
-        resolved = Config.fromfile(config_path).dump()
+        resolved_config = Config.fromfile(config_path)
+        resolved = resolved_config.dump()
+        resolved_value = _plain(resolved_config.to_dict())
     except ValueError as error:
         raise ValueError(f'formal config closure is invalid: {error}') from error
     if (
             config.get('config_closure') != config_closure
             or config.get('paired_base_config_closure') != base_closure
             or config.get('resolved_config_sha256') != hashlib.sha256(
-                resolved.encode('utf-8')).hexdigest()):
+                    resolved.encode('utf-8')).hexdigest()):
         raise ValueError('formal config closure/resolved identity mismatch')
+    formal_run = _formal_run_authority(
+        formal_manifest_value, role=role, seed=flip.seed,
+        config=config_relative, config_sha256=result_source['config_sha256'],
+        initialization_id=initialization['id'],
+        output_root=artifact_root.relative_to(root).as_posix())
 
     protocol = run.get('protocol')
     protocol_fields = {
@@ -444,21 +557,31 @@ def _validate_formal_authority(
                 and _SHA256.fullmatch(protocol[name])
                 for name in ('environment_inventory_sha256',))):
         raise ValueError('formal 300-epoch protocol authority is invalid')
+    resolved_protocol = _resolved_protocol_semantics(resolved_value, protocol)
+    paired_config_sha256 = canonical_json_sha256(
+        _paired_resolved_config(resolved_value))
     flip_protocol = getattr(flip, 'protocol', None)
+    no_flip_protocol = getattr(no_flip, 'protocol', None)
     flip_provenance = getattr(flip, 'provenance', None)
     no_flip_provenance = getattr(no_flip, 'provenance', None)
+    paired_provenance_fields = {
+        'checkpoint_sha256', 'data_inventory_sha256', 'git_commit'}
     if (
             not isinstance(flip_protocol, Mapping)
+            or not isinstance(no_flip_protocol, Mapping)
             or not isinstance(flip_provenance, Mapping)
             or not isinstance(no_flip_provenance, Mapping)
-            or _plain(no_flip_provenance) != _plain(flip_provenance)
+            or _plain(no_flip_protocol) != _plain(flip_protocol)
+            or any(
+                no_flip_provenance.get(name) != flip_provenance.get(name)
+                for name in paired_provenance_fields)
             or data.get('authority_path') != flip_protocol.get('authority_path')
             or data.get('authority_sha256') !=
             flip_protocol.get('authority_sha256')
             or data.get('data_inventory_sha256') !=
             flip_provenance.get('data_inventory_sha256')
             or data.get('detections_sha256') !=
-            flip_protocol.get('detections_sha256')):
+            flip_protocol.get('detection_sha256')):
         raise ValueError('formal COCO/detections authority mismatch')
     for mode, result in (('flip', flip), ('no_flip', no_flip)):
         determinism = getattr(result, 'determinism', None)
@@ -562,6 +685,9 @@ def _validate_formal_authority(
         'paired_base_config_path': config['paired_base_config_path'],
         'paired_base_config_closure': _plain(
             config['paired_base_config_closure']),
+        'formal_manifest_run': formal_run,
+        'resolved_protocol_semantics': resolved_protocol,
+        'paired_resolved_config_sha256': paired_config_sha256,
         'protocol': _plain(protocol),
         'order_hashes': list(order_hashes),
         'best_checkpoint': best,
@@ -633,7 +759,8 @@ def _load_seed_rows(
             flip=candidate, no_flip=candidate_no_flip, role='candidate')
         paired_fields = {
             'source_pair', 'initialization', 'paired_base_config_path',
-            'paired_base_config_closure', 'protocol', 'order_hashes'}
+            'paired_base_config_closure', 'resolved_protocol_semantics',
+            'paired_resolved_config_sha256', 'protocol', 'order_hashes'}
         if any(
                 _plain(baseline_formal[name]) !=
                 _plain(candidate_formal[name])
@@ -658,6 +785,8 @@ def _load_seed_rows(
                 'paired_base_config_path'],
             'paired_base_config_closure': baseline_formal[
                 'paired_base_config_closure'],
+            'resolved_protocol_semantics': baseline_formal[
+                'resolved_protocol_semantics'],
             'protocol': baseline_formal['protocol'],
         }
         if common_formal_experiment is None:
@@ -687,6 +816,12 @@ def _load_seed_rows(
             'candidate_source_sha256': canonical_json_sha256(candidate_source),
             'baseline_formal_authority': baseline_formal['authority'],
             'candidate_formal_authority': candidate_formal['authority'],
+            'baseline_formal_manifest_run': baseline_formal[
+                'formal_manifest_run'],
+            'candidate_formal_manifest_run': candidate_formal[
+                'formal_manifest_run'],
+            'paired_resolved_config_sha256': baseline_formal[
+                'paired_resolved_config_sha256'],
             'paired_formal_authority_sha256': paired_formal_sha,
             'baseline_ap_points': baseline_ap,
             'candidate_ap_points': candidate_ap,

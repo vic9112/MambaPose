@@ -240,6 +240,10 @@ def validate_binary_qk_admission(
     calibration = pwl_authority.get('calibration')
     installation = pwl_authority.get('installation')
     config_closure = pwl_authority.get('config_closure')
+    if pwl_authority.get('authority_path') != (
+            'optimization/coco_train2017_authority.json'):
+        raise ValueError(
+            'PWL numeric authority must use canonical train2017 authority')
     if (
             pwl_authority.get('candidate_id') != pwl.id
             or pwl_authority.get('seed') != pwl.seed
@@ -336,9 +340,7 @@ def validate_binary_qk_admission(
             or baseline_source.get('manifest_sha256') !=
             pwl_authority.get('manifest_sha256')
             or baseline_source.get('authority_path') !=
-            pwl_authority.get('authority_path')
-            or baseline_source.get('authority_sha256') !=
-            pwl_authority.get('authority_sha256')
+            'optimization/coco_val2017_authority.json'
             or not isinstance(baseline_checkpoint, Mapping)
             or set(baseline_checkpoint) != {'path', 'sha256'}
             or baseline_checkpoint.get('path') != baseline.checkpoint.as_posix()
@@ -420,6 +422,10 @@ def validate_binary_qk_admission(
             pwl_result, 'determinism', label=f'{mode} PWL')
         expected_pwl_source = {
             name: pwl_authority[name] for name in _SOURCE_FIELDS}
+        expected_pwl_source.update({
+            'authority_path': baseline_source['authority_path'],
+            'authority_sha256': baseline_source['authority_sha256'],
+        })
         if (
                 _plain_json_value(result_baseline_source) !=
                 _plain_json_value(baseline_source)
@@ -435,7 +441,15 @@ def validate_binary_qk_admission(
                 or pwl_provenance.get('config_sha256') !=
                 result_pwl_source['config_sha256']
                 or pwl_provenance.get('git_commit') !=
-                result_pwl_source['git_commit']):
+                result_pwl_source['git_commit']
+                or baseline_protocol.get('authority_path') !=
+                result_baseline_source['authority_path']
+                or baseline_protocol.get('authority_sha256') !=
+                result_baseline_source['authority_sha256']
+                or pwl_protocol.get('authority_path') !=
+                result_pwl_source['authority_path']
+                or pwl_protocol.get('authority_sha256') !=
+                result_pwl_source['authority_sha256']):
             raise ValueError(
                 f'{mode} baseline/PWL public source authority is invalid')
         if (

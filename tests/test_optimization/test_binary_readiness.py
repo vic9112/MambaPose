@@ -165,14 +165,13 @@ def _stage_b_fixture(tmp_path: Path, *, candidate_ap: float = 72.6):
         'manifest_sha256': pwl_authority['manifest_sha256'],
         'config_path': baseline.config.as_posix(),
         'config_sha256': _sha256(root / baseline.config),
-        'authority_path': pwl_authority['authority_path'],
-        'authority_sha256': pwl_authority['authority_sha256'],
+        'authority_path': 'optimization/coco_val2017_authority.json',
+        'authority_sha256': 'e' * 64,
     }
     pwl_source = {
-        name: pwl_authority[name]
-        for name in (
-            'git_commit', 'manifest_path', 'manifest_sha256', 'config_path',
-            'config_sha256', 'authority_path', 'authority_sha256')
+        **baseline_source,
+        'config_path': pwl_authority['config_path'],
+        'config_sha256': pwl_authority['config_sha256'],
     }
     result_authority = {}
     result_rows = {}
@@ -336,6 +335,47 @@ def test_binary_admission_validates_public_stage_b_pwl_results(
     assert validated['pwl_candidate_id'] == 'pwl-gelu-s-v1'
     assert validated['modes']['flip']['ap_drop_points'] == pytest.approx(0.2)
     assert dict(validated) == gate
+
+
+def test_binary_admission_keeps_val_evaluation_and_train_numeric_authority(
+        tmp_path, monkeypatch):
+    """Evaluation and numeric calibration are different COCO source roles."""
+    from mambapose_opt.binary_readiness import validate_binary_qk_admission
+
+    root, manifest, binary, gate, load_result = _stage_b_fixture(tmp_path)
+    monkeypatch.setattr(
+        'mambapose_opt.binary_readiness.CandidateResult.from_artifacts',
+        load_result)
+
+    validated = validate_binary_qk_admission(
+        binary, repository_root=root, manifest_path=manifest)
+
+    assert validated['baseline_authority']['source']['authority_path'] == (
+        'optimization/coco_val2017_authority.json')
+    assert validated['pwl_authority']['authority_path'] == (
+        'optimization/coco_train2017_authority.json')
+
+
+def test_binary_admission_rejects_numeric_authority_using_val_role(
+        tmp_path, monkeypatch):
+    from mambapose_opt.binary_readiness import validate_binary_qk_admission
+
+    root, manifest, binary, gate, load_result = _stage_b_fixture(tmp_path)
+    gate['pwl_authority']['authority_path'] = (
+        'optimization/coco_val2017_authority.json')
+    for (result_root, _mode), result in load_result.results.items():
+        if 'pwl-gelu-s-v1' in result_root.as_posix():
+            result.pwl_authority = json.loads(json.dumps(gate['pwl_authority']))
+    gate_path = root / binary.features['pwl_stage_b_artifact']
+    _write_json(gate_path, gate)
+    claimed = _rebind_gate(binary, gate_path, root)
+    monkeypatch.setattr(
+        'mambapose_opt.binary_readiness.CandidateResult.from_artifacts',
+        load_result)
+
+    with pytest.raises(ValueError, match='train2017|numeric authority'):
+        validate_binary_qk_admission(
+            claimed, repository_root=root, manifest_path=manifest)
 
 
 def test_campaign_selection_admits_only_validated_stage_b_dependency(
@@ -1106,8 +1146,52 @@ def test_binary_smoke_cli_parser_rejects_dot_alias():
             'work_dirs/optimization/route/candidate/0/./smoke-stage-a')
 
 
+def _public_coco_protocol(*, source, source_config, checkpoint):
+    return {
+        'dataset': 'coco', 'split': 'val2017', 'complete_split': True,
+        'batch_size': 1,
+        'authority_path': source['authority_path'],
+        'authority_sha256': source['authority_sha256'],
+        'authority_image_count': 5000,
+        'authority_annotation_count': 11004,
+        'authority_detection_count': 104125,
+        'inventory_authority_sha256': 'b' * 64,
+        'annotation_authority_sha256': '1' * 64,
+        'detection_authority_sha256': 'c' * 64,
+        'image_corpus_digest_algorithm': 'sha256-filename-size-content-v1',
+        'image_corpus_authority_sha256': '2' * 64,
+        'image_corpus_sha256': '2' * 64,
+        'inventory_annotation_archive_sha256': '3' * 64,
+        'inventory_image_archive_sha256': '4' * 64,
+        'annotation_sha256': '1' * 64,
+        'detection_sha256': 'c' * 64,
+        'inventory_detection_sha256': 'c' * 64,
+        'annotation_image_count': 5000,
+        'annotation_record_count': 11004,
+        'detection_record_count': 104125,
+        'verified_image_count': 5000,
+        'source_config': source_config,
+        'checkpoint': checkpoint,
+        'data_inventory': 'data/inventory.json',
+        'inventory_projection': {
+            'inventory_path': 'data/inventory.json',
+            'inventory_sha256': 'b' * 64,
+            'annotation_asset_id': 'coco-annotations',
+            'annotation_declared_sha256': '3' * 64,
+            'annotation_observed_archive_sha256': '3' * 64,
+            'image_asset_id': 'coco-val2017',
+            'image_declared_sha256': '4' * 64,
+            'image_observed_archive_sha256': '4' * 64,
+            'detection_asset_id': 'coco-val-detections',
+            'detection_declared_sha256': 'c' * 64,
+            'detection_observed_sha256': 'c' * 64,
+        },
+    }
+
+
 def _pareto_fixture(
-        tmp_path, monkeypatch, drops, *, baseline_id='full-s-v1'):
+        tmp_path, monkeypatch, drops, *, baseline_id='full-s-v1',
+        candidate_epoch_override_seed=None, omit_formal_run=None):
     from mmengine.config import Config
     from mambapose_opt.numeric_source import validate_numeric_config_closure
 
@@ -1119,15 +1203,53 @@ def _pareto_fixture(
         'pretrained/vssm_tiny_0230_ckpt_epoch_262.pth')
     paired_base = tmp_path / 'configs/formal/paired_base.py'
     _write_json(authority_path, {'dataset': 'coco', 'split': 'val2017'})
-    _write_json(formal_manifest, {
-        'schema_version': 1,
-        'experiment_id': 'mambapose-formal-stage-c',
-    })
     initialization.parent.mkdir(parents=True)
     initialization.write_bytes(b'vmamba-t-imagenet-initialization')
     paired_base.parent.mkdir(parents=True)
     paired_base.write_text(
-        'train_cfg = dict(max_epochs=300)\n', encoding='utf-8')
+        'train_cfg = dict(max_epochs=300)\n'
+        'train_dataloader = dict(batch_size=128, num_workers=2, '
+        'persistent_workers=False)\n'
+        'randomness = dict(deterministic=True)\n'
+        "val_evaluator = dict(type='mmpose.CocoMetric')\n",
+        encoding='utf-8')
+
+    def formal_config_text(kind, seed):
+        epoch_override = (
+            'train_cfg = dict(max_epochs=1)\n'
+            if kind == 'candidate'
+            and seed == candidate_epoch_override_seed else '')
+        return (
+            "_base_ = ['./paired_base.py']\n"
+            f"formal_role = '{kind}'\nseed = {seed}\n"
+            f'{epoch_override}')
+
+    formal_runs = []
+    for seed in range(len(drops)):
+        for kind, candidate_id in (
+                ('baseline', baseline_id),
+                ('candidate', 'binary-qk-s-v1')):
+            config = tmp_path / f'configs/formal/{kind}_seed{seed}.py'
+            config.write_text(formal_config_text(kind, seed), encoding='utf-8')
+            if omit_formal_run == (kind, seed):
+                continue
+            relative = Path(
+                f'work_dirs/optimization/{kind}/{candidate_id}/{seed}')
+            formal_runs.append({
+                'run_id': f'{kind}-seed{seed}',
+                'role': kind,
+                'seed': seed,
+                'conditional': seed in (3, 4),
+                'config': config.relative_to(tmp_path).as_posix(),
+                'config_sha256': _sha256(config),
+                'initialization_id': 'vmamba-t-imagenet-262',
+                'output_root': relative.as_posix(),
+            })
+    _write_json(formal_manifest, {
+        'schema_version': 2,
+        'experiment_id': 'mambapose-formal-stage-c',
+        'runs': formal_runs,
+    })
 
     for seed, drop in enumerate(drops):
         manifest_path = tmp_path / f'optimization/candidates-seed{seed}.json'
@@ -1142,10 +1264,7 @@ def _pareto_fixture(
             profile = artifact_root / 'profile/profile.json'
             latency = artifact_root / 'latency/latency.json'
             config = tmp_path / f'configs/formal/{kind}_seed{seed}.py'
-            config.write_text(
-                "_base_ = ['./paired_base.py']\n"
-                f"formal_role = '{kind}'\nseed = {seed}\n",
-                encoding='utf-8')
+            config.write_text(formal_config_text(kind, seed), encoding='utf-8')
             checkpoint = artifact_root / 'train/best.pth'
             resume_299 = artifact_root / 'train/epoch_299.pth'
             resume_300 = artifact_root / 'train/epoch_300.pth'
@@ -1191,24 +1310,28 @@ def _pareto_fixture(
             }
             mode_rows = {}
             for mode in ('flip', 'no_flip'):
-                protocol = {
-                    'dataset': 'coco', 'split': 'val2017',
-                    'complete_split': True,
-                    'authority_path': source['authority_path'],
-                    'authority_sha256': source['authority_sha256'],
-                    'data_inventory_sha256': 'b' * 64,
-                    'detections_sha256': 'c' * 64,
-                    'evaluator': 'mmpose.CocoMetric',
-                    'tta': {'mode': mode, 'flip_test': mode == 'flip'},
-                    'source_config': source['config_path'],
-                    'checkpoint': checkpoint_relative,
+                protocol = _public_coco_protocol(
+                    source=source, source_config=source['config_path'],
+                    checkpoint=checkpoint_relative)
+                mode_provenance = {
+                    **provenance,
+                    'config_sha256': ('e' if mode == 'flip' else 'f') * 64,
                 }
                 determinism = {
                     'python_seed': seed, 'numpy_seed': seed,
                     'torch_seed': seed, 'worker_count': 2,
+                    'workers': [
+                        {
+                            'worker_id': worker,
+                            'torch_seed_source': 'torch.initial_seed()',
+                            'python_seed_derivation': 'torch_seed % 2**32',
+                            'numpy_seed_derivation': 'torch_seed % 2**32',
+                        }
+                        for worker in (0, 1)
+                    ],
                     'persistent_workers': False,
                     'order_hashes': {'0': f'{seed + 1:x}' * 64},
-                    'provenance': provenance,
+                    'provenance': mode_provenance,
                 }
                 mode_rows[mode] = (protocol, determinism)
                 results[(artifact_root.resolve(), mode)] = SimpleNamespace(
@@ -1216,7 +1339,7 @@ def _pareto_fixture(
                     candidate_kind=candidate_kind, route=route,
                     seed=seed, flip_test=mode == 'flip',
                     metrics=SimpleNamespace(ap=ap), source=source,
-                    provenance=provenance, protocol=protocol,
+                    provenance=mode_provenance, protocol=protocol,
                     determinism=determinism,
                     binary_operation=(
                         None if kind == 'baseline'
@@ -1509,6 +1632,37 @@ def test_final_pareto_rejects_mismatched_formal_training_order_hash(
     _rebind_formal_fixture(candidate_root)
 
     with pytest.raises(ValueError, match='formal paired'):
+        build_final_pareto_record(
+            candidate_id='binary-qk-s-v1', repository_root=tmp_path,
+            baseline_roots=roots['baseline'],
+            candidate_roots=roots['candidate'])
+
+
+def test_final_pareto_rejects_missing_exact_formal_manifest_run_row(
+        tmp_path, monkeypatch):
+    from mambapose_opt.pareto import build_final_pareto_record
+
+    roots = _pareto_fixture(
+        tmp_path, monkeypatch, [0.05, 0.06, 0.04],
+        omit_formal_run=('candidate', 0))
+
+    with pytest.raises(ValueError, match='formal.*run row'):
+        build_final_pareto_record(
+            candidate_id='binary-qk-s-v1', repository_root=tmp_path,
+            baseline_roots=roots['baseline'],
+            candidate_roots=roots['candidate'])
+
+
+def test_final_pareto_rejects_rehashed_candidate_leaf_epoch_override(
+        tmp_path, monkeypatch):
+    """A signed leaf cannot contradict the paired 300-epoch protocol."""
+    from mambapose_opt.pareto import build_final_pareto_record
+
+    roots = _pareto_fixture(
+        tmp_path, monkeypatch, [0.05, 0.06, 0.04],
+        candidate_epoch_override_seed=0)
+
+    with pytest.raises(ValueError, match='resolved.*protocol|paired.*config'):
         build_final_pareto_record(
             candidate_id='binary-qk-s-v1', repository_root=tmp_path,
             baseline_roots=roots['baseline'],
