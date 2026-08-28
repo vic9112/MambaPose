@@ -1,0 +1,214 @@
+{
+  "data_authority": {
+    "detections": {
+      "asset_relative_path": "coco/person_detection_results/COCO_val2017_detections_AP_H_56_person.json",
+      "authority_root": "data",
+      "sha256": "53ba0ad8d0fd461c5a000cd90797fa8c39cd8c38cd125125c0412626ff592d59",
+      "target_root": "canonical-main/data"
+    },
+    "inventory": {
+      "asset_relative_path": "inventory.json",
+      "authority_root": "data",
+      "sha256": "2a82ab3cfe05a514d141c17921463e72f22741d67eaf978d93317155bbeaf0ed",
+      "target_root": "canonical-main/data"
+    },
+    "train_annotations": {
+      "asset_relative_path": "coco/annotations/person_keypoints_train2017.json",
+      "authority_root": "data",
+      "sha256": "7fc1549d934547c470384d8a207c38707ca33fc016d00e33b795e408603af83e",
+      "target_root": "canonical-main/data"
+    },
+    "validation_annotations": {
+      "asset_relative_path": "coco/annotations/person_keypoints_val2017.json",
+      "authority_root": "data",
+      "sha256": "788e2dae83c86bd547be7fab269d6399df5671063d29a61360cdb2cc370d2b14",
+      "target_root": "canonical-main/data"
+    }
+  },
+  "experiment_id": "mambapose-formal-stage-c",
+  "initialization": {
+    "asset": {
+      "asset_relative_path": "vssm_tiny_0230_ckpt_epoch_262.pth",
+      "authority_root": "pretrained",
+      "sha256": "09739f6d95638e5caf0d33fcbca85b7cff62b8ca16ec2926d781109939c6b201",
+      "target_root": "canonical-main/pretrained"
+    },
+    "id": "vmamba-t-imagenet-262",
+    "kind": "vmamba-backbone"
+  },
+  "prior_artifact": {
+    "artifacts": {
+      "candidate_manifest": {
+        "path": "source/candidates.json",
+        "sha256": "1081b546af0a9f9c95e9ca5e4fffca6f9609f38bf111db6bf47c0c1f5dca3d76"
+      },
+      "coco_authority": {
+        "path": "source/coco_val2017_authority.json",
+        "sha256": "5d5945c35f9bf59d2ff537c088dad3119ae9d7e5ead0b51a641b20667c8c9edb"
+      },
+      "evaluate": {
+        "path": "artifacts/evaluate.json",
+        "sha256": "9bcf326417cb0b9ffbf78deb01d19ac09525d9deb491c93189e8b769df0f3bf5"
+      },
+      "independent_audit": {
+        "path": "audit/task-4-final-artifact-audit.md",
+        "sha256": "b7382dbaca7294477990c2463bf642f3959762a7b9e54d626e46e45d8bb5f361"
+      },
+      "latency": {
+        "path": "artifacts/latency.json",
+        "sha256": "9e7448a6b9ab96eb625c08fe0d6e5e9c3933349da2098cb91ab633faca41b98e"
+      },
+      "parent_config": {
+        "path": "source/coco_s_v1_no_pif.py",
+        "sha256": "706eaa316934d89a446510651d3d7dc3b34278436fa8caa47bdf3c228d1209e1"
+      },
+      "profile": {
+        "path": "artifacts/profile.json",
+        "sha256": "cb0c933291c28bc341cc5bb62b956c14a76255825321bc0291d4e688fa7aa7a3"
+      },
+      "pruned_checkpoint": {
+        "path": "artifacts/pruned-runtime.pth",
+        "sha256": "5797ceaffbf7d369d8eaf8f47b548a79bd43d66dd603933571fa3b88ff28e3db"
+      },
+      "runtime_metadata": {
+        "path": "artifacts/runtime-metadata.json",
+        "sha256": "99e75ff3a4862f08eba3a7c75e586617aa1438efa8f164a73da093ffe5b672ce"
+      },
+      "source_config": {
+        "path": "source/no_pif_pruned.py",
+        "sha256": "e2a84676bb489ea4a9bb3f4a68a965afb7d2168efa013880732db6c818139df2"
+      },
+      "train": {
+        "path": "artifacts/train.json",
+        "sha256": "ea276713f214acce1949798445203e7e05026dd4ed7d6e76e77cffde35041819"
+      }
+    },
+    "audit_sha256": "b7382dbaca7294477990c2463bf642f3959762a7b9e54d626e46e45d8bb5f361",
+    "bundle_manifest_sha256": "522645bdd5612af0a58009b0b30ce1aae22ed4d460c482ba08799c1500b6ed9f",
+    "link_root": "work_dirs/optimization/prior-stage-b",
+    "source_commit": "a6adf6d84f9b51b133b0fca7272c51f728bfb7ac",
+    "target_root": "canonical-main/work_dirs/optimization/formal-stage-c-prior/no-pif-seed0",
+    "unpruned_parent_checkpoint_sha256": "28cd02405e58d619896a0430f91936684084ef7e3423d507c7a10b743759a5fb"
+  },
+  "protocol": {
+    "accumulation_steps": 1,
+    "conditional_seeds": [
+      3,
+      4
+    ],
+    "effective_batch_size": 128,
+    "epochs": 300,
+    "per_device_batch_size": 128,
+    "persistent_workers": false,
+    "primary_seeds": [
+      0,
+      1,
+      2
+    ],
+    "worker_count": 2,
+    "world_size": 1
+  },
+  "runs": [
+    {
+      "conditional": false,
+      "config": "configs/optimization/formal_stage_c/full_seed0.py",
+      "config_sha256": "0dc96bbfc87cf9001136a8ea1b33eb425e5ba1ed3c2399f40ee47c2923de83da",
+      "initialization_id": "vmamba-t-imagenet-262",
+      "output_root": "work_dirs/optimization/formal-stage-c/full-seed0",
+      "role": "baseline",
+      "run_id": "full-seed0",
+      "seed": 0
+    },
+    {
+      "conditional": false,
+      "config": "configs/optimization/formal_stage_c/no_pif_seed0.py",
+      "config_sha256": "2fc72efdd586dd5fceb1c1a1c406dade3521e535bf09790e8369b4dba4035063",
+      "initialization_id": "vmamba-t-imagenet-262",
+      "output_root": "work_dirs/optimization/formal-stage-c/no-pif-seed0",
+      "role": "no_pif",
+      "run_id": "no-pif-seed0",
+      "seed": 0
+    },
+    {
+      "conditional": false,
+      "config": "configs/optimization/formal_stage_c/full_seed1.py",
+      "config_sha256": "a5cbb1d3e560c4ddbdac692e6b0ee19087ded436ca405ea0cb1adc7b218b0503",
+      "initialization_id": "vmamba-t-imagenet-262",
+      "output_root": "work_dirs/optimization/formal-stage-c/full-seed1",
+      "role": "baseline",
+      "run_id": "full-seed1",
+      "seed": 1
+    },
+    {
+      "conditional": false,
+      "config": "configs/optimization/formal_stage_c/no_pif_seed1.py",
+      "config_sha256": "362cf73701db944e797157b2275a2205dd26a85ebda4024e814becc8f80ac338",
+      "initialization_id": "vmamba-t-imagenet-262",
+      "output_root": "work_dirs/optimization/formal-stage-c/no-pif-seed1",
+      "role": "no_pif",
+      "run_id": "no-pif-seed1",
+      "seed": 1
+    },
+    {
+      "conditional": false,
+      "config": "configs/optimization/formal_stage_c/full_seed2.py",
+      "config_sha256": "69629553e71ec28bb00a82f4823cdd4a33ea7e3fb4fa3d6af4eaa8b338994e22",
+      "initialization_id": "vmamba-t-imagenet-262",
+      "output_root": "work_dirs/optimization/formal-stage-c/full-seed2",
+      "role": "baseline",
+      "run_id": "full-seed2",
+      "seed": 2
+    },
+    {
+      "conditional": false,
+      "config": "configs/optimization/formal_stage_c/no_pif_seed2.py",
+      "config_sha256": "f375d63dbed463e2878ea01ef67c9852aa08854c44ab405e1a02d3ce22d3fc85",
+      "initialization_id": "vmamba-t-imagenet-262",
+      "output_root": "work_dirs/optimization/formal-stage-c/no-pif-seed2",
+      "role": "no_pif",
+      "run_id": "no-pif-seed2",
+      "seed": 2
+    },
+    {
+      "conditional": true,
+      "config": "configs/optimization/formal_stage_c/full_seed3.py",
+      "config_sha256": "e5debfdf1adadf601231b290b948d7642d90a3d2bf1ecb90f257d8dffcaf5dfa",
+      "initialization_id": "vmamba-t-imagenet-262",
+      "output_root": "work_dirs/optimization/formal-stage-c/full-seed3",
+      "role": "baseline",
+      "run_id": "full-seed3",
+      "seed": 3
+    },
+    {
+      "conditional": true,
+      "config": "configs/optimization/formal_stage_c/no_pif_seed3.py",
+      "config_sha256": "f2a3aa632570653143994d0676ccf8ac035238a242ec74e0a6f5f2c69ac637bd",
+      "initialization_id": "vmamba-t-imagenet-262",
+      "output_root": "work_dirs/optimization/formal-stage-c/no-pif-seed3",
+      "role": "no_pif",
+      "run_id": "no-pif-seed3",
+      "seed": 3
+    },
+    {
+      "conditional": true,
+      "config": "configs/optimization/formal_stage_c/full_seed4.py",
+      "config_sha256": "ac84ba8eb204229185fe595f560eeb271b035afdd31e696cc9124a1f562d864f",
+      "initialization_id": "vmamba-t-imagenet-262",
+      "output_root": "work_dirs/optimization/formal-stage-c/full-seed4",
+      "role": "baseline",
+      "run_id": "full-seed4",
+      "seed": 4
+    },
+    {
+      "conditional": true,
+      "config": "configs/optimization/formal_stage_c/no_pif_seed4.py",
+      "config_sha256": "a1dee8bd8cabb2da8d8bd659526698b47a624eb180798cc398a0a8d9a671a38a",
+      "initialization_id": "vmamba-t-imagenet-262",
+      "output_root": "work_dirs/optimization/formal-stage-c/no-pif-seed4",
+      "role": "no_pif",
+      "run_id": "no-pif-seed4",
+      "seed": 4
+    }
+  ],
+  "schema_version": 1
+}
