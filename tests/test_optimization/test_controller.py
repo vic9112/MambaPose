@@ -362,6 +362,119 @@ def test_pwl_smoke_controller_owns_one_outer_gpu_lease_and_precreates_dir(
     assert len(calls) == 1
 
 
+def _run_pwl_smoke_lease_contract(
+        tmp_path, monkeypatch, *, artifact_lease, acquired_at, validated_at):
+    from types import SimpleNamespace
+
+    from mambapose_opt import controller as controller_module
+    from mambapose_opt import pwl_smoke
+    from mambapose_opt.controller import OptimizationController
+    from mambapose_opt.gpu_guard import GpuLease
+
+    candidate = _pwl_candidate(tmp_path)
+    acquired = GpuLease(
+        stage_id='fixture:smoke-stage-a', pid=os.getpid(),
+        boot_id='11111111-1111-1111-1111-111111111111',
+        timestamp=acquired_at.isoformat(), device_index=0,
+        allowed_pids=(os.getpid(),), lease_id='7' * 64)
+
+    @contextmanager
+    def owned(*args, **kwargs):
+        yield acquired
+
+    def runner(_candidate, stage, stage_dir, attempt):
+        artifact = stage_dir / 'smoke.json'
+        artifact.write_text(json.dumps({'lease': artifact_lease}))
+        return _outcome(stage, artifact)
+
+    def validate_smoke(path, **kwargs):
+        return {'gpu': {'lease': json.loads(path.read_text())['lease']}}
+
+    monkeypatch.setattr(
+        controller_module, 'authorize_manifest_candidate',
+        lambda *args, **kwargs: SimpleNamespace(candidate=candidate))
+    monkeypatch.setattr(controller_module, 'exclusive_cuda_stage', owned)
+    monkeypatch.setattr(
+        pwl_smoke, 'validate_pwl_stage_a_artifact', validate_smoke)
+    controller = OptimizationController(
+        tmp_path / 'work_dirs/optimization', candidate, runner,
+        repository_root=tmp_path,
+        manifest_path=tmp_path / 'optimization/candidates.json',
+        stages=('smoke-stage-a',), now=lambda: validated_at)
+    return controller, acquired, controller.run_next()
+
+
+def test_pwl_smoke_run_next_accepts_final_lease_heartbeat(
+        tmp_path, monkeypatch):
+    acquired_at = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    artifact_lease = {
+        'stage_id': 'fixture:smoke-stage-a', 'pid': os.getpid(),
+        'boot_id': '11111111-1111-1111-1111-111111111111',
+        'timestamp': (acquired_at + timedelta(seconds=301)).isoformat(),
+        'device_index': 0,
+        'allowed_pids': [os.getpid()], 'lease_id': '7' * 64,
+    }
+    controller, acquired, outcome = _run_pwl_smoke_lease_contract(
+        tmp_path, monkeypatch, artifact_lease=artifact_lease,
+        acquired_at=acquired_at,
+        validated_at=acquired_at + timedelta(seconds=302))
+
+    assert outcome.exit_code == 0
+    assert outcome.gpu_lease == acquired
+    assert outcome.artifact_evidence == ({
+        'path': ('ssm-quant-pwl/fixture/0/smoke-stage-a/smoke.json'),
+        'sha256': outcome.artifact_sha256[str(outcome.artifacts[0])],
+        'schema': 'pwl-stage-a-full-model-smoke-v2',
+    },)
+    assert json.loads(outcome.artifacts[0].read_text())[
+        'lease']['timestamp'] == (
+            acquired_at + timedelta(seconds=301)).isoformat()
+    run = controller.store.read()['runs']['fixture:smoke-stage-a']
+    assert run['status'] == 'complete'
+    assert run['gpu_lease']['timestamp'] == acquired_at.isoformat()
+    assert run['lease_validated_at'] == (
+        acquired_at + timedelta(seconds=302)).isoformat()
+    assert run['artifact_evidence'] == [dict(outcome.artifact_evidence[0])]
+
+
+@pytest.mark.parametrize(('mutation', 'message'), [
+    ('stale-timestamp', 'timestamp'),
+    ('regressed-timestamp', 'timestamp'),
+    ('changed-nonce', 'lease_id'),
+    ('changed-allowed-pids', 'allowed_pids'),
+])
+def test_pwl_smoke_run_next_rejects_replayed_or_replaced_lease(
+        tmp_path, monkeypatch, mutation, message):
+    acquired_at = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    artifact_lease = {
+        'stage_id': 'fixture:smoke-stage-a', 'pid': os.getpid(),
+        'boot_id': '11111111-1111-1111-1111-111111111111',
+        'timestamp': (acquired_at + timedelta(seconds=301)).isoformat(),
+        'device_index': 0,
+        'allowed_pids': [os.getpid()], 'lease_id': '7' * 64,
+    }
+    if mutation == 'stale-timestamp':
+        artifact_lease['timestamp'] = acquired_at.isoformat()
+    elif mutation == 'regressed-timestamp':
+        artifact_lease['timestamp'] = (
+            acquired_at - timedelta(seconds=1)).isoformat()
+    elif mutation == 'changed-nonce':
+        artifact_lease['lease_id'] = '8' * 64
+    else:
+        artifact_lease['allowed_pids'] = [os.getpid(), os.getpid() + 1]
+
+    controller, _acquired, outcome = _run_pwl_smoke_lease_contract(
+        tmp_path, monkeypatch, artifact_lease=artifact_lease,
+        acquired_at=acquired_at,
+        validated_at=acquired_at + timedelta(seconds=302))
+
+    assert outcome.exit_code == 78
+    assert message in outcome.message
+    run = controller.store.read()['runs']['fixture:smoke-stage-a']
+    assert run['status'] == 'blocked'
+    assert run['artifact_evidence'] == []
+
+
 def _write_generic_artifact(
         path, stage, candidate_id='fixture', *, device_index=0):
     path.parent.mkdir(parents=True, exist_ok=True)
