@@ -47,7 +47,8 @@ from mambapose_opt.artifacts import optimization_output_path
 from mambapose_opt.gpu_guard import controller_process_tree
 from mambapose_opt.latency import (
     LEASE_MAX_AGE_SECONDS, LEASE_MAX_FUTURE_SKEW_SECONDS,
-    build_latency_result, measure_latency_samples, validate_gpu_lease)
+    build_latency_result, measure_latency_samples, validate_gpu_lease,
+    validate_refreshed_gpu_lease)
 from mambapose_opt.schema import CandidateSpec, load_candidate_manifest
 from mambapose_opt.numeric_conversion import NumericRuntimeHook
 from mambapose_opt.source import clean_git_commit
@@ -158,6 +159,14 @@ def _active_gpu_lease(
     return value
 
 
+def _refresh_gpu_lease_for_result(
+        initial: dict[str, Any], candidate_id: str,
+        device_index: int) -> dict[str, Any]:
+    """Refresh a long-running latency lease without accepting a new owner."""
+    refreshed = _active_gpu_lease(candidate_id, device_index)
+    return validate_refreshed_gpu_lease(initial, refreshed)
+
+
 def _git_commit() -> str:
     return clean_git_commit(REPO_ROOT)
 
@@ -253,10 +262,15 @@ def measure_candidate(
             warmup=warmup,
             repeats=repeats,
         )
+    if (_sha256(config_path) != runtime['config_sha256']
+            or _sha256(checkpoint) != runtime['checkpoint_sha256']):
+        raise ValueError('latency runtime inputs changed during execution')
+    final_lease = _refresh_gpu_lease_for_result(
+        admission['gpu_lease'], candidate.id, device_index)
     result = build_latency_result(
         flip=samples['flip'], no_flip=samples['no_flip'],
         warmup=warmup, repeats=repeats,
-        gpu_lease=admission['gpu_lease'])
+        gpu_lease=final_lease)
     result.update({
         'route': candidate.route,
         'provenance': {
@@ -274,9 +288,6 @@ def measure_candidate(
         'checkpoint': runtime['checkpoint_name'],
         'data_inventory': 'data/inventory.json',
     })
-    if (_sha256(config_path) != runtime['config_sha256']
-            or _sha256(checkpoint) != runtime['checkpoint_sha256']):
-        raise ValueError('latency runtime inputs changed during execution')
     return stage_envelope(candidate.id, 'latency', result)
 
 

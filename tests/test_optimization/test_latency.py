@@ -268,7 +268,7 @@ def test_latency_admission_rejects_unlocked_lease_before_model_or_cuda(
         tool.measure_candidate(candidate, warmup=50, repeats=200)
 
 
-def test_pwl_latency_producer_serializes_exact_stage_a_binding(
+def test_pwl_latency_producer_serializes_stage_a_and_final_lease_bindings(
         tmp_path, monkeypatch):
     import hashlib
     import sys
@@ -301,12 +301,14 @@ def test_pwl_latency_producer_serializes_exact_stage_a_binding(
         'checkpoint_sha256': candidate.checkpoint_sha256,
         'pwl_stage_a': smoke,
     }
-    lease = {
+    initial_lease = {
         'stage_id': 'pwl-silu-s-v1:latency', 'pid': 123,
         'boot_id': '11111111-1111-1111-1111-111111111111',
         'timestamp': '2026-08-28T00:00:00+00:00', 'device_index': 0,
         'allowed_pids': [123], 'lease_id': '7' * 64,
     }
+    heartbeat_lease = {
+        **initial_lease, 'timestamp': '2026-08-28T00:05:01+00:00'}
     config = tool.Config(dict(
         randomness={}, model=dict(test_cfg=dict(flip_test=False))))
     model = SimpleNamespace(cfg=config, test_cfg={})
@@ -321,7 +323,10 @@ def test_pwl_latency_producer_serializes_exact_stage_a_binding(
         'checkpoint_sha256': candidate.checkpoint_sha256,
         'config_sha256': runtime['config_sha256'],
         'data_inventory_sha256': 'c' * 64,
-        'gpu_lease': lease})
+        'gpu_lease': initial_lease})
+    monkeypatch.setattr(
+        tool, '_active_gpu_lease',
+        lambda _candidate_id, _device_index: heartbeat_lease)
     monkeypatch.setattr(tool, 'build_source_binding',
                         lambda **kwargs: {'bound': True})
     monkeypatch.setattr(tool.Config, 'fromfile', lambda _path: config)
@@ -346,6 +351,54 @@ def test_pwl_latency_producer_serializes_exact_stage_a_binding(
         output=tmp_path / 'work_dirs/optimization/latency.json')
 
     assert envelope['result']['pwl_stage_a'] == smoke
+    assert envelope['result']['gpu_lease'] == heartbeat_lease
+
+
+def test_latency_final_lease_refresh_rejects_replacement_identity(
+        monkeypatch):
+    import tools.optimization.measure_latency as tool
+
+    initial = {
+        'stage_id': 'fixture:latency', 'pid': 123,
+        'boot_id': '11111111-1111-1111-1111-111111111111',
+        'timestamp': '2026-08-28T00:00:00+00:00', 'device_index': 0,
+        'allowed_pids': [123], 'lease_id': '7' * 64,
+    }
+    replacement = {
+        **initial,
+        'timestamp': '2026-08-28T00:05:01+00:00',
+        'lease_id': '8' * 64,
+    }
+    refresh = getattr(tool, '_refresh_gpu_lease_for_result', None)
+    assert refresh is not None, (
+        'latency producer requires a final controller lease refresh')
+    monkeypatch.setattr(
+        tool, '_active_gpu_lease',
+        lambda _candidate_id, _device_index: replacement)
+
+    with pytest.raises(ValueError, match='identity'):
+        refresh(initial, 'fixture', 0)
+
+
+@pytest.mark.parametrize(('change', 'message'), [
+    ({'timestamp': '2026-08-27T23:59:59+00:00'}, 'timestamp'),
+    ({'allowed_pids': [123, 456]}, 'identity'),
+    ({'lease_id': '8' * 64}, 'identity'),
+])
+def test_refreshed_gpu_lease_rejects_regression_or_identity_change(
+        change, message):
+    from mambapose_opt.latency import (
+        LatencyError, validate_refreshed_gpu_lease)
+
+    initial = {
+        'stage_id': 'fixture:latency', 'pid': 123,
+        'boot_id': '11111111-1111-1111-1111-111111111111',
+        'timestamp': '2026-08-28T00:00:00+00:00', 'device_index': 0,
+        'allowed_pids': [123], 'lease_id': '7' * 64,
+    }
+
+    with pytest.raises(LatencyError, match=message):
+        validate_refreshed_gpu_lease(initial, {**initial, **change})
 
 
 def test_active_gpu_lease_checks_boot_device_and_live_descendant(

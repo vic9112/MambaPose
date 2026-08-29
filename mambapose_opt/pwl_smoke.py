@@ -20,7 +20,7 @@ from timm.layers import DropPath
 from .gpu_guard import controller_process_tree
 from .latency import (
     LEASE_MAX_AGE_SECONDS, LEASE_MAX_FUTURE_SKEW_SECONDS,
-    LatencyError, validate_gpu_lease)
+    LatencyError, validate_gpu_lease, validate_refreshed_gpu_lease)
 from .pwl_artifacts import (
     load_pwl_fit_reference, load_pwl_installation_reference)
 from .pwl_selection import load_pwl_selection_reference
@@ -774,6 +774,16 @@ def _active_controller_lease(
     return value
 
 
+def _refresh_controller_lease_for_artifact(
+        initial: Mapping[str, Any], candidate_id: str, device_index: int, *,
+        repository_root: Path,
+        now: Callable[[], datetime] | None = None) -> dict[str, Any]:
+    """Refresh a long-running smoke lease without accepting a new owner."""
+    refreshed = _active_controller_lease(
+        candidate_id, device_index, repository_root=repository_root, now=now)
+    return validate_refreshed_gpu_lease(initial, refreshed)
+
+
 def _prepare_smoke_output_directory(output: Path) -> None:
     """Admit the controller-created directory while preserving its log."""
     output = Path(output)
@@ -970,6 +980,8 @@ def run_pwl_stage_a_smoke(
         sample_id = samples[0].metainfo.get('img_id')
         if isinstance(sample_id, bool) or not isinstance(sample_id, int):
             raise RuntimeError('PWL Stage-A sample image id is invalid')
+        lease_value = _refresh_controller_lease_for_artifact(
+            lease_value, candidate.id, device_index, repository_root=root)
         artifact = {
             'schema_version': 2,
             'artifact_kind': 'pwl-stage-a-full-model-smoke',

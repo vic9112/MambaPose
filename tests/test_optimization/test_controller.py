@@ -1332,6 +1332,31 @@ def test_controller_rejects_latency_nonce_not_from_its_acquisition(
     assert 'lease' in result.message and 'lease_id' in result.message
 
 
+def test_controller_accepts_final_heartbeat_but_rejects_stale_start_time():
+    from mambapose_opt.controller import MetricError, OptimizationController
+    from mambapose_opt.gpu_guard import GpuLease
+
+    acquired_at = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    expected = GpuLease(
+        stage_id='fixture:latency', pid=123,
+        boot_id='11111111-1111-1111-1111-111111111111',
+        timestamp=acquired_at.isoformat(), device_index=0,
+        allowed_pids=(123,), lease_id='7' * 64)
+    initial_artifact = {
+        **asdict(expected), 'allowed_pids': list(expected.allowed_pids)}
+    heartbeat_artifact = {
+        **initial_artifact,
+        'timestamp': (acquired_at + timedelta(seconds=301)).isoformat(),
+    }
+    validated_at = acquired_at + timedelta(seconds=302)
+
+    OptimizationController._match_latency_lease(
+        object(), heartbeat_artifact, expected, validated_at=validated_at)
+    with pytest.raises(MetricError, match='timestamp'):
+        OptimizationController._match_latency_lease(
+            object(), initial_artifact, expected, validated_at=validated_at)
+
+
 def test_completed_latency_revalidates_persisted_controller_lease(
         tmp_path, monkeypatch):
     from mambapose_opt.controller import OptimizationController

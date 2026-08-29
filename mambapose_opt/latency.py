@@ -164,6 +164,24 @@ def validate_gpu_lease(value: object) -> dict[str, Any]:
     return dict(value)
 
 
+def validate_refreshed_gpu_lease(
+        initial: Mapping[str, Any],
+        refreshed: Mapping[str, Any]) -> dict[str, Any]:
+    """Accept a newer heartbeat only from the lease admitted at stage start."""
+    first = validate_gpu_lease(initial)
+    current = validate_gpu_lease(refreshed)
+    identity_fields = (
+        'stage_id', 'pid', 'boot_id', 'device_index', 'lease_id')
+    if (
+            any(first[name] != current[name] for name in identity_fields)
+            or tuple(first['allowed_pids']) != tuple(current['allowed_pids'])):
+        raise LatencyError('GPU lease identity changed during refresh')
+    if datetime.fromisoformat(current['timestamp']) < datetime.fromisoformat(
+            first['timestamp']):
+        raise LatencyError('GPU lease timestamp moved backwards during refresh')
+    return current
+
+
 _lease = validate_gpu_lease
 
 

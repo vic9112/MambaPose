@@ -555,3 +555,88 @@ def test_pwl_smoke_consumes_controller_lease_without_relocking(
             now=lambda: timestamp)
 
     assert observed['lease_id'] == lease.lease_id
+
+
+def test_pwl_smoke_refreshes_artifact_lease_after_long_execution(
+        tmp_path, monkeypatch):
+    """Regression: Stage-A artifacts must use the current lock heartbeat."""
+    from dataclasses import asdict, replace
+    from datetime import datetime, timedelta, timezone
+    import fcntl
+    import os
+
+    from mambapose_opt.gpu_guard import GpuLease
+    from mambapose_opt import pwl_smoke
+
+    refresh = getattr(
+        pwl_smoke, '_refresh_controller_lease_for_artifact', None)
+    assert refresh is not None, (
+        'PWL Stage-A requires a final controller lease refresh')
+    lock = tmp_path / 'gpu.lock'
+    started_at = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    initial = GpuLease(
+        stage_id='pwl-silu-s-v1:smoke-stage-a', pid=os.getpid(),
+        boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+        timestamp=started_at.isoformat(), device_index=2,
+        allowed_pids=(os.getpid(),), lease_id='7' * 64)
+    heartbeat = replace(
+        initial, timestamp=(started_at + timedelta(seconds=301)).isoformat())
+    lock.write_text(json.dumps({
+        **asdict(heartbeat),
+        'allowed_pids': list(heartbeat.allowed_pids),
+    }), encoding='utf-8')
+    monkeypatch.setattr(pwl_smoke, '_canonical_gpu_lock', lambda _root: lock)
+
+    with lock.open('r+', encoding='utf-8') as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        observed = refresh(
+            {**asdict(initial),
+             'allowed_pids': list(initial.allowed_pids)},
+            'pwl-silu-s-v1', 2, repository_root=tmp_path,
+            now=lambda: started_at + timedelta(seconds=302))
+
+    assert observed == {
+        **asdict(heartbeat),
+        'allowed_pids': list(heartbeat.allowed_pids),
+    }
+
+
+def test_pwl_smoke_rejects_replacement_lease_during_final_refresh(
+        tmp_path, monkeypatch):
+    """A fresh timestamp cannot substitute a different controller lease."""
+    from dataclasses import asdict, replace
+    from datetime import datetime, timedelta, timezone
+    import fcntl
+    import os
+
+    from mambapose_opt.gpu_guard import GpuLease
+    from mambapose_opt import pwl_smoke
+
+    refresh = getattr(
+        pwl_smoke, '_refresh_controller_lease_for_artifact', None)
+    assert refresh is not None, (
+        'PWL Stage-A requires a final controller lease refresh')
+    lock = tmp_path / 'gpu.lock'
+    started_at = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    initial = GpuLease(
+        stage_id='pwl-silu-s-v1:smoke-stage-a', pid=os.getpid(),
+        boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+        timestamp=started_at.isoformat(), device_index=2,
+        allowed_pids=(os.getpid(),), lease_id='7' * 64)
+    replacement = replace(
+        initial, timestamp=(started_at + timedelta(seconds=301)).isoformat(),
+        lease_id='8' * 64)
+    lock.write_text(json.dumps({
+        **asdict(replacement),
+        'allowed_pids': list(replacement.allowed_pids),
+    }), encoding='utf-8')
+    monkeypatch.setattr(pwl_smoke, '_canonical_gpu_lock', lambda _root: lock)
+
+    with lock.open('r+', encoding='utf-8') as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match='identity'):
+            refresh(
+                {**asdict(initial),
+                 'allowed_pids': list(initial.allowed_pids)},
+                'pwl-silu-s-v1', 2, repository_root=tmp_path,
+                now=lambda: started_at + timedelta(seconds=302))
