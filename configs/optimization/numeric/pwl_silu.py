@@ -20,7 +20,9 @@ numeric_optimization = dict(
                  'backbone.layers.2.blocks.1.op.act',
                  'backbone.layers.3.blocks.0.op.act'),
              domain=(-6.0, 6.0), segments=16,
-             grid_points=4097, saturation='clamp', qat_form='differentiable',
+             grid_points=4097,
+             saturation='continuous-asymptotic-tail-v1',
+             qat_form='differentiable',
              selection_policy='observed-range-max-then-mean-v1'),
     attention_softmax='exact-floating',
     stage_order=(

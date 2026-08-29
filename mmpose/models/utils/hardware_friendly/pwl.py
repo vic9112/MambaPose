@@ -10,10 +10,12 @@ from torch import Tensor, nn
 
 
 _FUNCTIONS = frozenset({'silu', 'gelu', 'softplus', 'exp'})
+_TAIL_FUNCTIONS = frozenset({'silu', 'gelu', 'softplus'})
+_TAIL_SATURATION = 'continuous-asymptotic-tail-v1'
 
 
 class PiecewiseLinearApproximation(nn.Module):
-    """Continuous PWL function with clamp saturation and QAT gradients."""
+    """Continuous PWL function with explicit out-of-domain handling."""
 
     def __init__(
             self,
@@ -21,13 +23,14 @@ class PiecewiseLinearApproximation(nn.Module):
             slopes: Sequence[float] | Tensor | None,
             intercepts: Sequence[float] | Tensor | None,
             *, function_name: str | None = None,
+            saturation: str = 'clamp',
             max_error: float = 0.0,
             mean_error: float = 0.0,
             enabled: bool = True):
         super().__init__()
         self.enabled = bool(enabled)
         self.function_name = function_name
-        self.saturation = 'identity' if not enabled else 'clamp'
+        self.saturation = 'identity' if not enabled else saturation
         self.max_error = float(max_error)
         self.mean_error = float(mean_error)
         if not enabled:
@@ -35,6 +38,12 @@ class PiecewiseLinearApproximation(nn.Module):
                                                     intercepts)):
                 raise ValueError('disabled PWL must not carry approximation state')
             return
+        if saturation not in {'clamp', _TAIL_SATURATION}:
+            raise ValueError('PWL saturation policy is invalid')
+        if (saturation == _TAIL_SATURATION
+                and function_name not in _TAIL_FUNCTIONS):
+            raise ValueError(
+                'continuous asymptotic tails require silu, gelu, or softplus')
         points = torch.as_tensor(breakpoints, dtype=torch.float64)
         segment_slopes = torch.as_tensor(slopes, dtype=torch.float64)
         segment_intercepts = torch.as_tensor(intercepts, dtype=torch.float64)
@@ -87,7 +96,15 @@ class PiecewiseLinearApproximation(nn.Module):
         intercepts = self.intercepts.to(device=value.device, dtype=value.dtype)
         bounded = value.clamp(points[0], points[-1])
         indices = torch.bucketize(bounded, points[1:-1], right=True)
-        return slopes[indices] * bounded + intercepts[indices]
+        interior = slopes[indices] * bounded + intercepts[indices]
+        if self.saturation == 'clamp':
+            return interior
+        lower_value = slopes[0] * points[0] + intercepts[0]
+        upper_value = slopes[-1] * points[-1] + intercepts[-1]
+        right_tail = value + upper_value - points[-1]
+        return torch.where(
+            value < points[0], lower_value,
+            torch.where(value > points[-1], right_tail, interior))
 
 
 def fit_pwl(
@@ -95,7 +112,8 @@ def fit_pwl(
         domain: tuple[float, float],
         segments: int,
         grid_points: int,
-        *, function_name: str) -> PiecewiseLinearApproximation:
+        *, function_name: str,
+        saturation: str = 'clamp') -> PiecewiseLinearApproximation:
     """Fit deterministic endpoint interpolation and measure it on a grid."""
     if function_name not in _FUNCTIONS:
         raise ValueError(
@@ -120,7 +138,8 @@ def fit_pwl(
     slopes = (values[1:] - values[:-1]) / (points[1:] - points[:-1])
     intercepts = values[:-1] - slopes * points[:-1]
     candidate = PiecewiseLinearApproximation(
-        points, slopes, intercepts, function_name=function_name)
+        points, slopes, intercepts, function_name=function_name,
+        saturation=saturation)
 
     grid = torch.linspace(
         float(domain[0]), float(domain[1]), grid_points,

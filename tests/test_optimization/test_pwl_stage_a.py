@@ -12,7 +12,8 @@ def _policy():
     return {
         'enabled_function': 'silu', 'source': 'module',
         'roles': ('activation',), 'domain': (-2.0, 2.0), 'segments': 4,
-        'grid_points': 129, 'saturation': 'clamp',
+        'grid_points': 129,
+        'saturation': 'continuous-asymptotic-tail-v1',
         'qat_form': 'differentiable',
         'selection_policy': 'observed-range-max-then-mean-v1',
     }
@@ -113,6 +114,34 @@ def test_pwl_stage_a_core_proves_target_grad_adam_identity_and_resume(tmp_path):
     assert tensor_tree(payload)
     assert result['export']['format'] == (
         'torch-weights-only-model-and-adam-tensors-v1')
+
+
+def test_pwl_stage_a_core_rejects_forged_tail_as_clamp(tmp_path):
+    """Break caught: Stage-A must attest the exported tail operation."""
+    from mambapose_opt.numeric_conversion import install_pwl_fit
+    from mambapose_opt.pwl_artifacts import validate_pwl_installation_manifest
+    from mambapose_opt.pwl_smoke import execute_pwl_stage_a_model
+
+    fit, reference, installation = _fit_and_installation()
+    report = validate_pwl_installation_manifest(
+        installation, expected_candidate_id='pwl-silu-s-v1',
+        expected_fit_reference=reference, expected_fit=fit)['report_object']
+    model = TinyPose()
+    install_pwl_fit(model, fit=fit, expected_report=report)
+    forged = dict(installation['operation_manifest'])
+    forged['domain_handling'] = {'kind': 'clamp'}
+
+    with pytest.raises(RuntimeError, match='operation manifest'):
+        execute_pwl_stage_a_model(
+            model=model, inputs=torch.tensor([[1.0, -0.5, 0.25]]),
+            data_samples=torch.tensor([[0.25, -0.75]]),
+            optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+            model_factory=TinyPose,
+            optimizer_factory=lambda restored: torch.optim.Adam(
+                restored.parameters(), lr=1e-3),
+            identity_factory=TinyPose, export_path=tmp_path / 'forged.pth',
+            function_name='silu', roles=('activation',),
+            coefficients=fit['coefficients'], operation_manifest=forged)
 
 
 def _artifact(root: Path):

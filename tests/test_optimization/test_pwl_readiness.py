@@ -33,16 +33,24 @@ def _policy(function_name='silu'):
         'domain': (-2.0, 2.0),
         'segments': 4,
         'grid_points': 129,
-        'saturation': 'clamp',
+        'saturation': ('clamp' if function_name == 'exp'
+                       else 'continuous-asymptotic-tail-v1'),
         'qat_form': 'differentiable',
         'selection_policy': 'observed-range-max-then-mean-v1',
     }
 
 
-def _fit(function_name='silu', values=None):
+def _fit(function_name='silu', values=None, *, domain=None, segments=None,
+         grid_points=None):
     from mambapose_opt.pwl_artifacts import fit_pwl_observations
 
     policy = _policy(function_name)
+    if domain is not None:
+        policy['domain'] = domain
+    if segments is not None:
+        policy['segments'] = segments
+    if grid_points is not None:
+        policy['grid_points'] = grid_points
     return fit_pwl_observations(
         candidate_id=f'pwl-{function_name}-s-v1',
         policy=policy,
@@ -139,13 +147,17 @@ def test_pwl_fit_records_exact_role_ranges_errors_and_saturation():
     assert fit['observed_range_error']['max'] >= (
         fit['observed_range_error']['mean']) >= 0
     assert fit['observed_samples_error']['samples'] == 4
-    assert fit['clamp'] == {
-        'below': 1, 'above': 1, 'total': 4, 'ratio': 0.5}
+    assert fit['schema_version'] == 2
+    assert fit['domain_coverage'] == {
+        'below': 1, 'above': 1, 'total': 4, 'ratio': 0.5,
+        'handling': 'continuous-asymptotic-tail-v1'}
     role = fit['role_observations'][0]
     assert role['operation_role'] == 'block.act'
     assert role['exact_input_role'] == 'block.act.input'
     assert role['observed_range'] == [-3.0, 2.5]
-    assert role['clamp']['ratio'] == 0.5
+    assert role['domain_coverage']['ratio'] == 0.5
+    assert role['domain_coverage']['handling'] == (
+        'continuous-asymptotic-tail-v1')
 
 
 def test_pwl_fit_records_validator_recomputable_exact_role_tail_percentiles():
@@ -238,40 +250,90 @@ def test_pwl_fit_rejects_compound_forged_coefficients_and_all_metrics():
             expected_policy=_policy())
 
 
-def test_out_of_domain_fit_is_publishable_but_not_rankable_or_installable():
-    """Break caught: measured saturation must never enter installation."""
+def test_tail_covered_out_of_domain_fit_is_admitted_with_full_range_error():
+    """Break caught: tail-covered samples must not be classified as clamps."""
     from mambapose_opt.pwl_artifacts import (
-        PWLArtifactError, build_pwl_installation_manifest,
+        build_pwl_installation_manifest,
         rank_pwl_fit_artifacts, validate_pwl_fit_report)
 
-    rejected = _fit(values=[-20.0, 0.0, 20.0])
+    admitted = _fit(
+        values=[-37.16, -6.0, 0.0, 6.0, 38.29],
+        domain=(-6.0, 6.0), segments=16, grid_points=4097)
 
-    assert rejected['admission'] == {
-        'decision': 'rejected',
-        'reasons': ['clamp-count-nonzero', 'observed-range-outside-domain'],
-    }
+    assert admitted['admission'] == {'decision': 'passed', 'reasons': []}
+    assert admitted['domain_coverage'] == {
+        'below': 1, 'above': 1, 'total': 5, 'ratio': 0.4,
+        'handling': 'continuous-asymptotic-tail-v1'}
+    assert admitted['observed_range_error']['max'] < 0.033
+    assert admitted['observed_samples_error']['max'] < 0.016
     assert validate_pwl_fit_report(
-        rejected, expected_policy=_policy()) == rejected
-    with pytest.raises(PWLArtifactError, match='not admitted'):
-        rank_pwl_fit_artifacts([rejected])
-    with pytest.raises(PWLArtifactError, match='not admitted'):
-        build_pwl_installation_manifest(
-            candidate_id='pwl-silu-s-v1', fit=rejected,
-            fit_reference={'path': 'work_dirs/optimization/fit.json',
-                           'sha256': 'a' * 64})
+        admitted, expected_policy={
+            **_policy(), 'domain': (-6.0, 6.0), 'segments': 16,
+            'grid_points': 4097}) == admitted
+    assert rank_pwl_fit_artifacts([admitted]) == (admitted,)
+    installation = build_pwl_installation_manifest(
+        candidate_id='pwl-silu-s-v1', fit=admitted,
+        fit_reference={'path': 'work_dirs/optimization/fit.json',
+                       'sha256': 'a' * 64})
+    assert installation['report']['out_of_domain_ratio'] == 0.4
 
 
-def test_fit_admission_rejects_compound_zero_clamp_with_outside_range():
+def test_tail_coverage_cannot_be_forged_into_clamp_or_rejection():
     from mambapose_opt.pwl_artifacts import (
         PWLArtifactError, validate_pwl_fit_report)
 
     forged = _fit(values=[-20.0, 0.0, 20.0])
-    forged['clamp'] = {'below': 0, 'above': 0, 'total': 3, 'ratio': 0.0}
-    forged['role_observations'][0]['clamp'] = dict(forged['clamp'])
-    forged['admission'] = {'decision': 'passed', 'reasons': []}
+    forged['domain_coverage']['handling'] = 'clamp'
 
+    with pytest.raises(PWLArtifactError, match='coverage|policy'):
+        validate_pwl_fit_report(forged, expected_policy=_policy())
+
+    forged = _fit(values=[-20.0, 0.0, 20.0])
+    forged['admission'] = {
+        'decision': 'rejected',
+        'reasons': ['clamp-count-nonzero', 'observed-range-outside-domain']}
     with pytest.raises(PWLArtifactError, match='admission'):
         validate_pwl_fit_report(forged, expected_policy=_policy())
+
+
+def test_exp_out_of_domain_fit_retains_clamp_rejection():
+    """Break caught: asymptotic tails must never be applied to exp."""
+    from mambapose_opt.pwl_artifacts import (
+        PWLArtifactError, rank_pwl_fit_artifacts, validate_pwl_fit_report)
+
+    rejected = _fit('exp', values=[-20.0, 0.0, 20.0])
+
+    assert rejected['domain_coverage'] == {
+        'below': 1, 'above': 1, 'total': 3, 'ratio': 2 / 3,
+        'handling': 'clamp'}
+    assert rejected['admission'] == {
+        'decision': 'rejected',
+        'reasons': ['clamp-count-nonzero', 'observed-range-outside-domain']}
+    assert validate_pwl_fit_report(
+        rejected, expected_policy=_policy('exp')) == rejected
+    with pytest.raises(PWLArtifactError, match='not admitted'):
+        rank_pwl_fit_artifacts([rejected])
+
+
+def test_fit_schema_v1_is_rejected_instead_of_reinterpreted():
+    from mambapose_opt.pwl_artifacts import (
+        PWLArtifactError, validate_pwl_fit_report)
+
+    legacy = _fit()
+    legacy['schema_version'] = 1
+
+    with pytest.raises(PWLArtifactError, match='schema version'):
+        validate_pwl_fit_report(legacy, expected_policy=_policy())
+
+
+def test_selection_schema_v1_is_explicitly_rejected(tmp_path):
+    from mambapose_opt.pwl_selection import (
+        PWLSelectionError, validate_pwl_selection_artifact)
+
+    with pytest.raises(PWLSelectionError, match='schema version'):
+        validate_pwl_selection_artifact(
+            {'schema_version': 1}, repository_root=tmp_path,
+            manifest_path=tmp_path / 'optimization/candidates.json')
 
 
 def test_exp_fit_retains_exact_export_time_constant_folding_comparator():
@@ -302,7 +364,14 @@ def test_four_candidate_selection_excludes_exportable_exp_and_is_measured():
         'pwl-softplus-s-v1', 'pwl-exp-s-v1']
     exp = next(row for row in selection['candidates']
                if row['candidate_id'] == 'pwl-exp-s-v1')
+    silu = next(row for row in selection['candidates']
+                if row['candidate_id'] == 'pwl-silu-s-v1')
+    assert selection['schema_version'] == 2
+    assert 'clamp' not in silu
+    assert silu['domain_coverage']['handling'] == (
+        'continuous-asymptotic-tail-v1')
     assert exp['selection_status'] == 'excluded-exact-constant-fold'
+    assert exp['domain_coverage']['handling'] == 'clamp'
     assert 'pwl-exp-s-v1' not in selection['ranking']
     assert selection['selected_candidate_id'] == selection['ranking'][0]
     assert selection['selected_candidate_id'] != 'pwl-exp-s-v1'
@@ -390,7 +459,8 @@ def test_exp_pwl_cannot_be_installed_even_with_an_admitted_fit():
         observed_range=(-1.0, 1.0),
         observed_range_max_error=fit['observed_range_error']['max'],
         observed_range_mean_error=fit['observed_range_error']['mean'],
-        clamp_ratio=0.0, fit_artifact_path='work_dirs/optimization/fit.json',
+        out_of_domain_ratio=0.0,
+        fit_artifact_path='work_dirs/optimization/fit.json',
         fit_artifact_sha256='a' * 64,
         exact_comparator=fit['exact_comparator'])
 
@@ -469,7 +539,7 @@ def test_serialized_pwl_installation_binds_fit_and_operation_manifest():
         fit_reference=fit_reference)
     validated = validate_pwl_installation_manifest(
         manifest, expected_candidate_id='pwl-silu-s-v1',
-        expected_fit_reference=fit_reference)
+        expected_fit_reference=fit_reference, expected_fit=fit)
 
     assert validated['report'] == asdict(validated['report_object'])
     assert validated['operation_manifest'] == {
@@ -478,15 +548,90 @@ def test_serialized_pwl_installation_binds_fit_and_operation_manifest():
         'operation_roles': ['block.act'],
         'exact_input_roles': ['block.act.input'],
         'segments_per_role': 4,
-        'saturation': 'clamp',
+        'domain_handling': {
+            'kind': 'continuous-asymptotic-tail-v1',
+            'left': 'constant-endpoint',
+            'right': 'identity-plus-endpoint-offset'},
         'hardware_latency_claimed': False,
     }
+    assert manifest['schema_version'] == 2
     forged = json.loads(json.dumps(manifest))
     forged['report']['observed_range_max_error'] += 1.0
     with pytest.raises(ValueError, match='measured fit'):
         validate_pwl_installation_manifest(
             forged, expected_candidate_id='pwl-silu-s-v1',
             expected_fit_reference=fit_reference, expected_fit=fit)
+
+    downgraded = json.loads(json.dumps(manifest))
+    downgraded['report']['saturation'] = 'clamp'
+    downgraded['operation_manifest']['domain_handling'] = {'kind': 'clamp'}
+    with pytest.raises(ValueError, match='domain handling'):
+        validate_pwl_installation_manifest(
+            downgraded, expected_candidate_id='pwl-silu-s-v1',
+            expected_fit_reference=fit_reference, expected_fit=fit)
+
+    legacy = json.loads(json.dumps(manifest))
+    legacy['schema_version'] = 1
+    with pytest.raises(ValueError, match='identity'):
+        validate_pwl_installation_manifest(
+            legacy, expected_candidate_id='pwl-silu-s-v1',
+            expected_fit_reference=fit_reference, expected_fit=fit)
+
+
+@pytest.mark.parametrize(
+    'missing_field',
+    ['qat_form', 'hardware_latency_claimed', 'exact_comparator'])
+def test_installation_report_rejects_missing_defaulted_fields(missing_field):
+    """Break caught: serialized reports must not consume dataclass defaults."""
+    from mambapose_opt.pwl_artifacts import (
+        build_pwl_installation_manifest, validate_pwl_installation_manifest)
+
+    fit = _fit()
+    fit_reference = {
+        'path': 'work_dirs/optimization/pwl-silu-s-v1/calibrate/calibrate.json',
+        'sha256': 'a' * 64}
+    manifest = build_pwl_installation_manifest(
+        candidate_id='pwl-silu-s-v1', fit=fit,
+        fit_reference=fit_reference)
+    manifest['report'].pop(missing_field)
+
+    with pytest.raises(ValueError, match='installation report is invalid'):
+        validate_pwl_installation_manifest(
+            manifest, expected_candidate_id='pwl-silu-s-v1',
+            expected_fit_reference=fit_reference, expected_fit=fit)
+
+
+def test_installation_validation_requires_measured_fit_authority():
+    """Break caught: a self-described exp report must not replace SiLU fit."""
+    from mambapose_opt.pwl_artifacts import (
+        build_pwl_installation_manifest, validate_pwl_installation_manifest)
+
+    fit = _fit()
+    fit_reference = {
+        'path': 'work_dirs/optimization/pwl-silu-s-v1/calibrate/calibrate.json',
+        'sha256': 'a' * 64}
+    forged = build_pwl_installation_manifest(
+        candidate_id='pwl-silu-s-v1', fit=fit,
+        fit_reference=fit_reference)
+    forged['report'].update({
+        'function_name': 'exp', 'source': 'ss2d-transition',
+        'input_roles': ['block.act.transition_exp_input'],
+        'saturation': 'clamp',
+        'exact_comparator': {
+            'kind': 'exact-export-time-constant-folding',
+            'applicable_source': 'static-parameter',
+            'runtime_nonlinear_operations': 0,
+            'max_error': 0.0, 'mean_error': 0.0,
+            'preferred_over_pwl_when_exportable': True}})
+    forged['operation_manifest'].update({
+        'function': 'exp', 'source': 'ss2d-transition',
+        'exact_input_roles': ['block.act.transition_exp_input'],
+        'domain_handling': {'kind': 'clamp'}})
+
+    with pytest.raises(ValueError, match='measured fit authority'):
+        validate_pwl_installation_manifest(
+            forged, expected_candidate_id='pwl-silu-s-v1',
+            expected_fit_reference=fit_reference, expected_fit=None)
 
 
 def test_calibration_hook_session_observes_declared_module_exact_inputs():
@@ -825,7 +970,8 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
         "    pwl=dict(\n"
         "        candidate_id='pwl-silu-s-v1', enabled_function='silu',\n"
         "        source='module', roles=('layer',), domain=(-2.0, 2.0),\n"
-        "        segments=4, grid_points=129, saturation='clamp',\n"
+        "        segments=4, grid_points=129,\n"
+        "        saturation='continuous-asymptotic-tail-v1',\n"
         "        qat_form='differentiable',\n"
         "        selection_policy='observed-range-max-then-mean-v1'))\n",
         encoding='utf-8')

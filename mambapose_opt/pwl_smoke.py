@@ -202,7 +202,13 @@ def execute_pwl_stage_a_model(
         'operation_roles': list(roles),
         'exact_input_roles': operation_manifest.get('exact_input_roles'),
         'segments_per_role': len(coefficients['slopes']),
-        'saturation': 'clamp', 'hardware_latency_claimed': False}
+        'domain_handling': (
+            {'kind': 'continuous-asymptotic-tail-v1',
+             'left': 'constant-endpoint',
+             'right': 'identity-plus-endpoint-offset'}
+            if function_name in {'silu', 'gelu', 'softplus'}
+            else {'kind': 'clamp'}),
+        'hardware_latency_claimed': False}
     if dict(operation_manifest) != expected_operation:
         raise RuntimeError('PWL operation manifest does not match targets')
 

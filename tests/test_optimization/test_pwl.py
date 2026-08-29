@@ -14,7 +14,9 @@ def _install_measured_pwl(model, *, function_name, source, roles):
     policy = {
         'enabled_function': function_name, 'source': source, 'roles': roles,
         'domain': (-4.0, 4.0), 'segments': 4, 'grid_points': 129,
-        'saturation': 'clamp', 'qat_form': 'differentiable',
+        'saturation': ('clamp' if function_name == 'exp'
+                       else 'continuous-asymptotic-tail-v1'),
+        'qat_form': 'differentiable',
         'selection_policy': 'observed-range-max-then-mean-v1',
     }
     fit = fit_pwl_observations(
@@ -29,7 +31,7 @@ def _install_measured_pwl(model, *, function_name, source, roles):
         fit_reference=reference)
     report = validate_pwl_installation_manifest(
         manifest, expected_candidate_id=f'pwl-{function_name}-test',
-        expected_fit_reference=reference)['report_object']
+        expected_fit_reference=reference, expected_fit=fit)['report_object']
     return install_pwl_fit(model, fit=fit, expected_report=report)
 
 
@@ -56,6 +58,36 @@ def test_pwl_selects_segments_and_saturates_at_declared_domain():
     assert approximation.saturation == 'clamp'
 
 
+@pytest.mark.parametrize(('name', 'reference', 'domain', 'error_bound'), [
+    ('silu', F.silu, (-6.0, 6.0), 0.04),
+    ('gelu', F.gelu, (-5.0, 5.0), 0.04),
+    ('softplus', F.softplus, (-8.0, 8.0), 0.04),
+])
+def test_pwl_asymptotic_tails_are_continuous_and_bound_far_tail_error(
+        name, reference, domain, error_bound):
+    """Break caught: endpoint clamping creates unbounded positive-tail error."""
+    from mmpose.models.utils.hardware_friendly import fit_pwl
+
+    approximation = fit_pwl(
+        reference, domain, segments=16, grid_points=4097,
+        function_name=name,
+        saturation='continuous-asymptotic-tail-v1')
+    lower, upper = domain
+    epsilon = torch.finfo(torch.float64).eps * 8
+    boundaries = torch.tensor(
+        [lower - epsilon, lower, lower + epsilon,
+         upper - epsilon, upper, upper + epsilon], dtype=torch.float64)
+    actual = approximation(boundaries)
+
+    assert approximation.saturation == 'continuous-asymptotic-tail-v1'
+    torch.testing.assert_close(actual[:3], actual[1].expand(3), atol=1e-12,
+                               rtol=1e-12)
+    torch.testing.assert_close(actual[3:], actual[4].expand(3), atol=1e-12,
+                               rtol=1e-12)
+    far = torch.linspace(-38.29, 38.29, 20001, dtype=torch.float64)
+    assert float((approximation(far) - reference(far)).abs().max()) < error_bound
+
+
 @pytest.mark.parametrize('name, reference, domain', [
     ('silu', F.silu, (-6.0, 6.0)),
     ('gelu', F.gelu, (-5.0, 5.0)),
@@ -67,9 +99,13 @@ def test_fit_pwl_is_deterministic_continuous_and_declares_error(
     from mmpose.models.utils.hardware_friendly import fit_pwl
 
     first = fit_pwl(reference, domain, segments=16, grid_points=4097,
-                    function_name=name)
+                    function_name=name,
+                    saturation=('clamp' if name == 'exp'
+                                else 'continuous-asymptotic-tail-v1'))
     second = fit_pwl(reference, domain, segments=16, grid_points=4097,
-                     function_name=name)
+                     function_name=name,
+                     saturation=('clamp' if name == 'exp'
+                                 else 'continuous-asymptotic-tail-v1'))
 
     assert first.function_name == name
     assert first.state_dict().keys() == second.state_dict().keys()

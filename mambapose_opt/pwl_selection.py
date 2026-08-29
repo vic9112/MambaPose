@@ -184,7 +184,7 @@ def build_pwl_selection_record(
             'fit_sha256': _json_sha256(fit),
             'admission': fit['admission'],
             'observed_range_error': fit['observed_range_error'],
-            'clamp': fit['clamp'],
+            'domain_coverage': fit['domain_coverage'],
             'exact_comparator': comparator,
             'selection_status': status,
         })
@@ -194,7 +194,7 @@ def build_pwl_selection_record(
         fit['candidate_id']))]
     selected = ranking[0] if ranking else None
     return {
-        'schema_version': 1,
+        'schema_version': 2,
         'artifact_kind': 'pwl-four-candidate-selection',
         'manifest': manifest,
         'source_authority': source_authority,
@@ -318,6 +318,9 @@ def validate_pwl_selection_artifact(
         value: Mapping[str, Any], *, repository_root: Path,
         manifest_path: Path) -> dict[str, Any]:
     """Reconstruct a production decision from tracked source and four fits."""
+    if (not isinstance(value, Mapping)
+            or value.get('schema_version') != 2):
+        raise PWLSelectionError('PWL selection schema version is invalid')
     root = Path(repository_root).resolve(strict=True)
     supplied = canonical_path(
         str(manifest_path), label='PWL source manifest', allow_absolute=True)

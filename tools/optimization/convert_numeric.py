@@ -209,7 +209,8 @@ def convert(
         }
         report = validate_pwl_installation_manifest(
             installation, expected_candidate_id=candidate.id,
-            expected_fit_reference=calibration_reference)['report_object']
+            expected_fit_reference=calibration_reference,
+            expected_fit=fit)['report_object']
         install_pwl_fit(model, fit=fit, expected_report=report)
         config.numeric_optimization.pwl.fit_artifact = calibration_reference
         config.numeric_optimization.pwl.installation_manifest = (

@@ -25,11 +25,20 @@ class PWLArtifactError(ValueError):
 
 _SHA256 = re.compile(r'^[0-9a-f]{64}$')
 _FUNCTIONS = frozenset({'silu', 'gelu', 'softplus', 'exp'})
+_TAIL_FUNCTIONS = frozenset({'silu', 'gelu', 'softplus'})
+_TAIL_SATURATION = 'continuous-asymptotic-tail-v1'
 _SELECTION_POLICY = 'observed-range-max-then-mean-v1'
 _TAIL_PERCENTILES = (0.9, 0.99, 0.999)
 _TAIL_BINS = 256
 _TAIL_MIN_EXP = -32.0
 _TAIL_MAX_EXP = 32.0
+_INSTALLATION_REPORT_FIELDS = {
+    'function_name', 'source', 'roles', 'input_roles', 'domain', 'segments',
+    'in_domain_max_error', 'in_domain_mean_error', 'observed_range',
+    'observed_range_max_error', 'observed_range_mean_error',
+    'out_of_domain_ratio', 'fit_artifact_path', 'fit_artifact_sha256',
+    'saturation', 'qat_form', 'hardware_latency_claimed', 'exact_comparator',
+}
 
 
 @dataclass(frozen=True)
@@ -47,7 +56,7 @@ class PWLInstallationReport:
     observed_range: tuple[float, float]
     observed_range_max_error: float
     observed_range_mean_error: float
-    clamp_ratio: float
+    out_of_domain_ratio: float
     fit_artifact_path: str
     fit_artifact_sha256: str
     saturation: str = 'clamp'
@@ -102,8 +111,11 @@ def _policy(value: Mapping[str, Any]) -> dict[str, Any]:
             or isinstance(grid_points, bool) or not isinstance(grid_points, int)
             or grid_points < segments + 1):
         raise PWLArtifactError('PWL fit resolution is invalid')
-    if value['saturation'] != 'clamp':
-        raise PWLArtifactError('PWL policy saturation must be clamp')
+    expected_saturation = (
+        _TAIL_SATURATION if function_name in _TAIL_FUNCTIONS else 'clamp')
+    if value['saturation'] != expected_saturation:
+        raise PWLArtifactError(
+            'PWL policy saturation disagrees with function')
     if value['qat_form'] != 'differentiable':
         raise PWLArtifactError('PWL policy QAT form must be differentiable')
     if value['selection_policy'] != _SELECTION_POLICY:
@@ -114,6 +126,18 @@ def _policy(value: Mapping[str, Any]) -> dict[str, Any]:
         'roles': tuple(roles),
         'domain': (float(domain[0]), float(domain[1])),
     }
+
+
+def _domain_handling(saturation: str) -> dict[str, str]:
+    if saturation == _TAIL_SATURATION:
+        return {
+            'kind': _TAIL_SATURATION,
+            'left': 'constant-endpoint',
+            'right': 'identity-plus-endpoint-offset',
+        }
+    if saturation == 'clamp':
+        return {'kind': 'clamp'}
+    raise PWLArtifactError('PWL domain handling is invalid')
 
 
 def exact_input_role(
@@ -265,7 +289,8 @@ class PWLObservationAccumulator:
         self.reference = _reference(function_name)
         self.approximation = fit_pwl(
             self.reference, self.policy['domain'], self.policy['segments'],
-            self.policy['grid_points'], function_name=function_name)
+            self.policy['grid_points'], function_name=function_name,
+            saturation=self.policy['saturation'])
         self._records = {
             role: {
                 'count': 0, 'minimum': math.inf, 'maximum': -math.inf,
@@ -340,11 +365,12 @@ class PWLObservationAccumulator:
                 'observed_samples_error': observed_error,
                 'tail_statistics': _tail_report(
                     record['tail'], total=count),
-                'clamp': {
+                'domain_coverage': {
                     'below': role_below,
                     'above': role_above,
                     'total': count,
                     'ratio': (role_below + role_above) / count,
+                    'handling': policy['saturation'],
                 },
             })
             total += count
@@ -366,12 +392,14 @@ class PWLObservationAccumulator:
                 'preferred_over_pwl_when_exportable': True,
             }
         reasons = []
-        if below + above:
-            reasons.append('clamp-count-nonzero')
-        if observed_min < policy['domain'][0] or observed_max > policy['domain'][1]:
-            reasons.append('observed-range-outside-domain')
+        if policy['saturation'] == 'clamp':
+            if below + above:
+                reasons.append('clamp-count-nonzero')
+            if (observed_min < policy['domain'][0]
+                    or observed_max > policy['domain'][1]):
+                reasons.append('observed-range-outside-domain')
         return {
-            'schema_version': 1,
+            'schema_version': 2,
             'candidate_id': candidate_id,
             'function_name': policy['enabled_function'],
             'source': policy['source'],
@@ -405,9 +433,10 @@ class PWLObservationAccumulator:
                 'mean': error_sum / total,
                 'samples': total,
             },
-            'clamp': {
+            'domain_coverage': {
                 'below': below, 'above': above, 'total': total,
                 'ratio': (below + above) / total,
+                'handling': policy['saturation'],
             },
             'admission': {
                 'decision': 'rejected' if reasons else 'passed',
@@ -474,9 +503,9 @@ def _metric_matches(
             rel_tol=1e-12, abs_tol=1e-15))
 
 
-def _clamp(value: object) -> bool:
+def _domain_coverage(value: object, *, expected_handling: str) -> bool:
     if not isinstance(value, Mapping) or set(value) != {
-            'below', 'above', 'total', 'ratio'}:
+            'below', 'above', 'total', 'ratio', 'handling'}:
         return False
     if (any(not isinstance(value[name], int) or isinstance(value[name], bool)
             or value[name] < 0 for name in ('below', 'above', 'total'))
@@ -484,7 +513,8 @@ def _clamp(value: object) -> bool:
             or value['below'] + value['above'] > value['total']
             or not isinstance(value['ratio'], (int, float))
             or isinstance(value['ratio'], bool)
-            or not math.isfinite(float(value['ratio']))):
+            or not math.isfinite(float(value['ratio']))
+            or value['handling'] != expected_handling):
         return False
     return math.isclose(
         float(value['ratio']),
@@ -500,11 +530,11 @@ def validate_pwl_fit_report(
         'operation_roles', 'input_roles', 'domain', 'segments', 'grid_points',
         'saturation', 'qat_form', 'selection_policy', 'coefficients',
         'observed_range', 'in_domain_error', 'observed_range_error',
-        'observed_samples_error', 'clamp', 'role_observations',
+        'observed_samples_error', 'domain_coverage', 'role_observations',
         'admission', 'exact_comparator'}
     if not isinstance(value, Mapping) or set(value) != fields:
         raise PWLArtifactError('PWL fit artifact fields are invalid')
-    if value.get('schema_version') != 1:
+    if value.get('schema_version') != 2:
         raise PWLArtifactError('PWL fit schema version is invalid')
     candidate_id = value.get('candidate_id')
     if not isinstance(candidate_id, str) or not candidate_id:
@@ -551,7 +581,8 @@ def validate_pwl_fit_report(
         approximation = PiecewiseLinearApproximation(
             coefficients['breakpoints'], coefficients['slopes'],
             coefficients['intercepts'],
-            function_name=policy['enabled_function'])
+            function_name=policy['enabled_function'],
+            saturation=policy['saturation'])
     except (TypeError, ValueError) as error:
         raise PWLArtifactError(f'PWL coefficients are invalid: {error}') from error
     if (approximation.domain != policy['domain']
@@ -560,7 +591,8 @@ def validate_pwl_fit_report(
     canonical = fit_pwl(
         _reference(policy['enabled_function']), policy['domain'],
         policy['segments'], policy['grid_points'],
-        function_name=policy['enabled_function'])
+        function_name=policy['enabled_function'],
+        saturation=policy['saturation'])
     if any(not torch.equal(actual, wanted) for actual, wanted in (
             (approximation.breakpoints, canonical.breakpoints),
             (approximation.slopes, canonical.slopes),
@@ -575,8 +607,10 @@ def validate_pwl_fit_report(
             or not _finite_metric(value['observed_range_error'])
             or value['observed_range_error']['samples'] != policy['grid_points']
             or not _finite_metric(value['observed_samples_error'])
-            or not _clamp(value['clamp'])):
-        raise PWLArtifactError('PWL fit errors or saturation are invalid')
+            or not _domain_coverage(
+                value['domain_coverage'],
+                expected_handling=policy['saturation'])):
+        raise PWLArtifactError('PWL fit errors or domain coverage are invalid')
     rows = value['role_observations']
     if (not isinstance(rows, list) or len(rows) != len(policy['roles'])
             or [row.get('operation_role') if isinstance(row, Mapping) else None
@@ -590,15 +624,17 @@ def validate_pwl_fit_report(
         if (set(row) != {
                 'operation_role', 'exact_input_role', 'observed_range',
                 'observed_range_error', 'observed_samples_error',
-                'tail_statistics', 'clamp'}
+                'tail_statistics', 'domain_coverage'}
                 or row['exact_input_role'] != input_role['exact_input_role']
                 or not _finite_range(row['observed_range'])
                 or not _finite_metric(row['observed_range_error'])
                 or row['observed_range_error']['samples'] != policy['grid_points']
                 or not _finite_metric(row['observed_samples_error'])
-                or not _clamp(row['clamp'])
+                or not _domain_coverage(
+                    row['domain_coverage'],
+                    expected_handling=policy['saturation'])
                 or row['observed_samples_error']['samples'] !=
-                row['clamp']['total']):
+                row['domain_coverage']['total']):
             raise PWLArtifactError('PWL role observation schema is invalid')
         if not _validate_tail_statistics(
                 row['tail_statistics'],
@@ -612,7 +648,7 @@ def validate_pwl_fit_report(
             raise PWLArtifactError(
                 'PWL role observation disagrees with recomputed error')
         role_ranges.append(row['observed_range'])
-        role_clamps.append(row['clamp'])
+        role_clamps.append(row['domain_coverage'])
         role_sample_errors.append(row['observed_samples_error'])
     aggregate_total = sum(item['total'] for item in role_clamps)
     aggregate_below = sum(item['below'] for item in role_clamps)
@@ -624,9 +660,9 @@ def validate_pwl_fit_report(
     if (observed_range != [
                 min(item[0] for item in role_ranges),
                 max(item[1] for item in role_ranges)]
-            or value['clamp']['total'] != aggregate_total
-            or value['clamp']['below'] != aggregate_below
-            or value['clamp']['above'] != aggregate_above
+            or value['domain_coverage']['total'] != aggregate_total
+            or value['domain_coverage']['below'] != aggregate_below
+            or value['domain_coverage']['above'] != aggregate_above
             or value['observed_samples_error']['samples'] != aggregate_total
             or not math.isclose(
                 float(value['observed_samples_error']['max']),
@@ -637,11 +673,12 @@ def validate_pwl_fit_report(
         raise PWLArtifactError(
             'PWL aggregate observations disagree with role observations')
     expected_reasons = []
-    if aggregate_below + aggregate_above:
-        expected_reasons.append('clamp-count-nonzero')
-    if (float(observed_range[0]) < policy['domain'][0]
-            or float(observed_range[1]) > policy['domain'][1]):
-        expected_reasons.append('observed-range-outside-domain')
+    if policy['saturation'] == 'clamp':
+        if aggregate_below + aggregate_above:
+            expected_reasons.append('clamp-count-nonzero')
+        if (float(observed_range[0]) < policy['domain'][0]
+                or float(observed_range[1]) > policy['domain'][1]):
+            expected_reasons.append('observed-range-outside-domain')
     expected_admission = {
         'decision': 'rejected' if expected_reasons else 'passed',
         'reasons': expected_reasons,
@@ -697,12 +734,12 @@ def require_pwl_runtime_candidate(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def rank_pwl_fit_artifacts(
         values: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
-    """Rank only by measured observed-range max, then mean and clamp ratio."""
+    """Rank by observed-range max, then mean and domain coverage ratio."""
     validated = [require_pwl_runtime_candidate(value) for value in values]
     return tuple(sorted(validated, key=lambda item: (
         float(item['observed_range_error']['max']),
         float(item['observed_range_error']['mean']),
-        float(item['clamp']['ratio']),
+        float(item['domain_coverage']['ratio']),
         item['candidate_id'])))
 
 
@@ -772,9 +809,11 @@ def _installation_report_from_fit(
         observed_range=tuple(fitted['observed_range']),
         observed_range_max_error=fitted['observed_range_error']['max'],
         observed_range_mean_error=fitted['observed_range_error']['mean'],
-        clamp_ratio=fitted['clamp']['ratio'],
+        out_of_domain_ratio=fitted['domain_coverage']['ratio'],
         fit_artifact_path=reference['path'],
         fit_artifact_sha256=reference['sha256'],
+        saturation=fitted['saturation'],
+        qat_form=fitted['qat_form'],
         exact_comparator=fitted['exact_comparator'])
 
 
@@ -791,7 +830,7 @@ def build_pwl_installation_manifest(
         raise PWLArtifactError('PWL installation fit reference is invalid')
     report = _installation_report_from_fit(fitted, reference)
     return {
-        'schema_version': 1,
+        'schema_version': 2,
         'candidate_id': candidate_id,
         'fit_artifact': reference,
         'report': asdict(report),
@@ -802,7 +841,7 @@ def build_pwl_installation_manifest(
             'exact_input_roles': [
                 item['exact_input_role'] for item in fitted['input_roles']],
             'segments_per_role': fitted['segments'],
-            'saturation': fitted['saturation'],
+            'domain_handling': _domain_handling(fitted['saturation']),
             'hardware_latency_claimed': False,
         },
     }
@@ -816,12 +855,13 @@ def validate_pwl_installation_manifest(
             or set(value) != {
                 'schema_version', 'candidate_id', 'fit_artifact', 'report',
                 'operation_manifest'}
-            or value.get('schema_version') != 1
+            or value.get('schema_version') != 2
             or value.get('candidate_id') != expected_candidate_id
             or value.get('fit_artifact') != dict(expected_fit_reference)):
         raise PWLArtifactError('PWL installation manifest identity is invalid')
     report_value = value['report']
-    if not isinstance(report_value, Mapping):
+    if (not isinstance(report_value, Mapping)
+            or set(report_value) != _INSTALLATION_REPORT_FIELDS):
         raise PWLArtifactError('PWL installation report is invalid')
     try:
         normalized = dict(report_value)
@@ -830,25 +870,34 @@ def validate_pwl_installation_manifest(
         report = PWLInstallationReport(**normalized)
     except (KeyError, TypeError, ValueError) as error:
         raise PWLArtifactError('PWL installation report is invalid') from error
+    expected_saturation = (
+        _TAIL_SATURATION
+        if report.function_name in _TAIL_FUNCTIONS else 'clamp')
+    if (report.function_name not in _FUNCTIONS
+            or report.saturation != expected_saturation):
+        raise PWLArtifactError(
+            'PWL installation report domain handling is invalid')
     if (report.fit_artifact_path != expected_fit_reference['path']
             or report.fit_artifact_sha256 != expected_fit_reference['sha256']
             or report.hardware_latency_claimed is not False):
         raise PWLArtifactError('PWL installation report fit binding is invalid')
-    if expected_fit is not None:
-        fitted = validate_pwl_fit_report(
-            expected_fit, expected_candidate_id=expected_candidate_id)
-        expected_report = _installation_report_from_fit(
-            fitted, expected_fit_reference)
-        if report != expected_report:
-            raise PWLArtifactError(
-                'PWL installation report disagrees with measured fit')
+    if expected_fit is None:
+        raise PWLArtifactError(
+            'PWL installation measured fit authority is required')
+    fitted = validate_pwl_fit_report(
+        expected_fit, expected_candidate_id=expected_candidate_id)
+    expected_report = _installation_report_from_fit(
+        fitted, expected_fit_reference)
+    if report != expected_report:
+        raise PWLArtifactError(
+            'PWL installation report disagrees with measured fit')
     expected_operation = {
         'function': report.function_name,
         'source': report.source,
         'operation_roles': list(report.roles),
         'exact_input_roles': list(report.input_roles),
         'segments_per_role': report.segments,
-        'saturation': report.saturation,
+        'domain_handling': _domain_handling(report.saturation),
         'hardware_latency_claimed': False,
     }
     if value['operation_manifest'] != expected_operation:

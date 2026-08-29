@@ -9,4 +9,4 @@ numeric_optimization = dict(
             'backbone.layers.2.blocks.0.op',
             'backbone.layers.2.blocks.1.op',
             'backbone.layers.3.blocks.0.op'),
-        domain=(-4.0, 4.0)))
+        domain=(-4.0, 4.0), saturation='clamp'))

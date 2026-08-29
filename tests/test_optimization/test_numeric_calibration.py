@@ -382,7 +382,8 @@ def test_calibration_schema_rejects_strip_downgrade_and_unknown_version():
         policy={
             'enabled_function': 'silu', 'source': 'module',
             'roles': ('block.act',), 'domain': (-2.0, 2.0),
-            'segments': 4, 'grid_points': 129, 'saturation': 'clamp',
+            'segments': 4, 'grid_points': 129,
+            'saturation': 'continuous-asymptotic-tail-v1',
             'qat_form': 'differentiable',
             'selection_policy': 'observed-range-max-then-mean-v1',
         },

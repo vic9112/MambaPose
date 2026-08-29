@@ -304,7 +304,7 @@ def install_pwl_fit(
         'observed_range': tuple(fitted['observed_range']),
         'observed_range_max_error': fitted['observed_range_error']['max'],
         'observed_range_mean_error': fitted['observed_range_error']['mean'],
-        'clamp_ratio': fitted['clamp']['ratio'],
+        'out_of_domain_ratio': fitted['domain_coverage']['ratio'],
         'saturation': fitted['saturation'],
         'qat_form': fitted['qat_form'],
         'hardware_latency_claimed': False,
@@ -326,6 +326,7 @@ def install_pwl_fit(
             coefficients['breakpoints'], coefficients['slopes'],
             coefficients['intercepts'],
             function_name=fitted['function_name'],
+            saturation=fitted['saturation'],
             max_error=fitted['in_domain_error']['max'],
             mean_error=fitted['in_domain_error']['mean'])
 
