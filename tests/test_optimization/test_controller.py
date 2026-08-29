@@ -347,7 +347,7 @@ def test_pwl_smoke_controller_owns_one_outer_gpu_lease_and_precreates_dir(
     monkeypatch.setattr(
         OptimizationController, '_artifact_schema',
         lambda self, stage, path, **kwargs:
-        'pwl-stage-a-full-model-smoke-v1')
+        'pwl-stage-a-full-model-smoke-v2')
     controller = OptimizationController(
         tmp_path / 'work_dirs/optimization', candidate, runner,
         repository_root=tmp_path,

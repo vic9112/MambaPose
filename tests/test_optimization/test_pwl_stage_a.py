@@ -6,6 +6,19 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from timm.layers import DropPath
+
+
+_STRUCTURAL_SMOKE_PROTOCOL = {
+    'kind': 'deterministic-structural-gradient-v1',
+    'model_mode': 'train',
+    'stochastic_depth': 'disabled-timm-drop-path-only',
+    'covered_training_passes': [
+        'target-gradient-and-adam-step', 'optimizer-resume-step'],
+    'gradient_batches': 1,
+    'target_gradient_requirement': (
+        'finite-nonzero-input-and-output-every-target'),
+}
 
 
 def _policy():
@@ -49,6 +62,24 @@ class TinyPose(nn.Module):
 
     def forward(self, inputs, data_samples=None, mode='tensor'):
         output = self.head(self.activation(self.projection(inputs)))
+        if mode == 'loss':
+            return {'loss_kpt': ((output - data_samples) ** 2).mean()}
+        if mode == 'tensor':
+            return output
+        raise ValueError(mode)
+
+
+class TinyDropPathPose(TinyPose):
+    """A PWL target in a whole-sample stochastic-depth residual branch."""
+
+    def __init__(self, *, identity=False):
+        super().__init__(identity=identity)
+        self.drop_path = DropPath(0.075)
+
+    def forward(self, inputs, data_samples=None, mode='tensor'):
+        residual = self.projection(inputs)
+        output = self.head(
+            residual + self.drop_path(self.activation(residual)))
         if mode == 'loss':
             return {'loss_kpt': ((output - data_samples) ** 2).mean()}
         if mode == 'tensor':
@@ -116,6 +147,44 @@ def test_pwl_stage_a_core_proves_target_grad_adam_identity_and_resume(tmp_path):
         'torch-weights-only-model-and-adam-tensors-v1')
 
 
+def test_pwl_stage_a_core_disables_only_drop_path_for_structural_smoke(
+        tmp_path):
+    """Regression: batch-one DropPath must not hide an installed PWL target."""
+    from mambapose_opt.numeric_conversion import install_pwl_fit
+    from mambapose_opt.pwl_artifacts import validate_pwl_installation_manifest
+    from mambapose_opt.pwl_smoke import execute_pwl_stage_a_model
+
+    fit, reference, installation = _fit_and_installation()
+    report = validate_pwl_installation_manifest(
+        installation, expected_candidate_id='pwl-silu-s-v1',
+        expected_fit_reference=reference, expected_fit=fit)['report_object']
+
+    def fitted_factory():
+        model = TinyDropPathPose()
+        install_pwl_fit(model, fit=fit, expected_report=report)
+        return model
+
+    model = fitted_factory()
+    torch.manual_seed(0)  # timm DropPath(0.075) drops this batch-one branch.
+    result = execute_pwl_stage_a_model(
+        model=model, inputs=torch.tensor([[1.0, -0.5, 0.25]]),
+        data_samples=torch.tensor([[0.25, -0.75]]),
+        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+        model_factory=fitted_factory,
+        optimizer_factory=lambda restored: torch.optim.Adam(
+            restored.parameters(), lr=1e-3),
+        identity_factory=TinyDropPathPose,
+        export_path=tmp_path / 'drop-path-round-trip.pth',
+        function_name='silu', roles=('activation',),
+        coefficients=fit['coefficients'],
+        operation_manifest=installation['operation_manifest'])
+
+    assert result['protocol'] == _STRUCTURAL_SMOKE_PROTOCOL
+    assert result['pwl_targets'][0]['input_gradient_norm'] > 0
+    assert result['pwl_targets'][0]['output_gradient_norm'] > 0
+    assert model.drop_path.drop_prob == pytest.approx(0.075)
+
+
 def test_pwl_stage_a_core_rejects_forged_tail_as_clamp(tmp_path):
     """Break caught: Stage-A must attest the exported tail operation."""
     from mambapose_opt.numeric_conversion import install_pwl_fit
@@ -168,7 +237,7 @@ def _artifact(root: Path):
         'path': ('work_dirs/optimization/ssm-quant-pwl/pwl-silu-s-v1/0/'
                  'convert/pwl-installation.json'), 'sha256': 'c' * 64}
     value = {
-        'schema_version': 1,
+        'schema_version': 2,
         'artifact_kind': 'pwl-stage-a-full-model-smoke',
         'candidate_id': 'pwl-silu-s-v1',
         'source': {'git_commit': 'd' * 40},
@@ -188,6 +257,7 @@ def _artifact(root: Path):
             'logical': 'cuda:0', 'physical_index': 0,
             'lease': {'validated-fixture': True}},
         'execution': {
+            'protocol': _STRUCTURAL_SMOKE_PROTOCOL,
             'checks': {
                 'forward': True, 'loss': True, 'backward': True,
                 'optimizer_step': True, 'finite_loss': True,
@@ -257,6 +327,22 @@ def test_public_pwl_stage_a_validator_reconstructs_all_authority(
     forged['policy']['segments'] = 2
     artifact.write_text(json.dumps(forged), encoding='utf-8')
     with pytest.raises(ValueError, match='policy'):
+        pwl_smoke.validate_pwl_stage_a_artifact(
+            artifact, repository_root=tmp_path,
+            manifest_path=Path('optimization/candidates.json'))
+
+    forged = json.loads(json.dumps(value))
+    forged['execution']['protocol']['stochastic_depth'] = 'training-enabled'
+    artifact.write_text(json.dumps(forged), encoding='utf-8')
+    with pytest.raises(ValueError, match='protocol'):
+        pwl_smoke.validate_pwl_stage_a_artifact(
+            artifact, repository_root=tmp_path,
+            manifest_path=Path('optimization/candidates.json'))
+
+    missing = json.loads(json.dumps(value))
+    missing['execution'].pop('protocol')
+    artifact.write_text(json.dumps(missing), encoding='utf-8')
+    with pytest.raises(ValueError, match='fields|protocol'):
         pwl_smoke.validate_pwl_stage_a_artifact(
             artifact, repository_root=tmp_path,
             manifest_path=Path('optimization/candidates.json'))

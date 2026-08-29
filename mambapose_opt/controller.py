@@ -332,7 +332,7 @@ class OptimizationController:
             except (MetricError, OSError, ValueError) as error:
                 raise ArtifactValidationError(
                     f'PWL smoke artifact is invalid: {error}') from error
-            return 'pwl-stage-a-full-model-smoke-v1'
+            return 'pwl-stage-a-full-model-smoke-v2'
         if stage == 'calibrate' and self.candidate.route == 'ssm-quant-pwl':
             try:
                 from .numeric_calibration import validate_calibration_provenance

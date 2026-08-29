@@ -15,6 +15,7 @@ import subprocess
 from typing import Any, Callable, Mapping, Sequence
 
 import torch
+from timm.layers import DropPath
 
 from .gpu_guard import controller_process_tree
 from .latency import (
@@ -29,6 +30,16 @@ from .pwl_paths import canonical_path, canonical_relative_path
 _SHA256 = re.compile(r'^[0-9a-f]{64}$')
 _LEASE_MAX_AGE = timedelta(seconds=LEASE_MAX_AGE_SECONDS)
 _LEASE_MAX_FUTURE_SKEW = timedelta(seconds=LEASE_MAX_FUTURE_SKEW_SECONDS)
+_STRUCTURAL_SMOKE_PROTOCOL = {
+    'kind': 'deterministic-structural-gradient-v1',
+    'model_mode': 'train',
+    'stochastic_depth': 'disabled-timm-drop-path-only',
+    'covered_training_passes': [
+        'target-gradient-and-adam-step', 'optimizer-resume-step'],
+    'gradient_batches': 1,
+    'target_gradient_requirement': (
+        'finite-nonzero-input-and-output-every-target'),
+}
 
 
 def _sha256(path: Path) -> str:
@@ -57,6 +68,14 @@ def _state_exact(first: Mapping[str, torch.Tensor],
                  second: Mapping[str, torch.Tensor]) -> bool:
     return (set(first) == set(second)
             and all(torch.equal(first[name], second[name]) for name in first))
+
+
+def _disable_stochastic_depth_for_structural_smoke(
+        model: torch.nn.Module) -> None:
+    """Keep train semantics while ensuring each residual branch is exercised."""
+    for module in model.modules():
+        if isinstance(module, DropPath):
+            module.eval()
 
 
 def _tensor_tree(value: object) -> bool:
@@ -237,6 +256,7 @@ def execute_pwl_stage_a_model(
             module.register_forward_pre_hook(pre_hook),
             module.register_forward_hook(forward_hook)])
     model.train()
+    _disable_stochastic_depth_for_structural_smoke(model)
     optimizer.zero_grad(set_to_none=True)
     before = {name: value.detach().cpu().clone()
               for name, value in model.named_parameters()}
@@ -312,6 +332,7 @@ def execute_pwl_stage_a_model(
         raise RuntimeError('PWL Stage-A resume optimizer must be Adam')
     _load_adam_tensors(restored, resumed_optimizer, loaded['adam_state'])
     restored.train()
+    _disable_stochastic_depth_for_structural_smoke(restored)
     resumed_optimizer.zero_grad(set_to_none=True)
     _, resumed_loss = _loss(restored, inputs, data_samples)
     resumed_loss.backward()
@@ -341,6 +362,7 @@ def execute_pwl_stage_a_model(
         raise RuntimeError('PWL identity mode is invalid')
 
     return {
+        'protocol': copy.deepcopy(_STRUCTURAL_SMOKE_PROTOCOL),
         'checks': {
             'forward': True, 'loss': True, 'backward': True,
             'optimizer_step': True, 'finite_loss': True,
@@ -517,7 +539,7 @@ def validate_pwl_stage_a_artifact(
         'checkpoint', 'fit_artifact', 'selection_artifact', 'installation',
         'policy', 'data', 'gpu', 'execution', 'claim_limits'}
     if (not isinstance(value, Mapping) or set(value) != fields
-            or value.get('schema_version') != 1
+            or value.get('schema_version') != 2
             or value.get('artifact_kind') != 'pwl-stage-a-full-model-smoke'):
         raise ValueError('PWL Stage-A artifact identity is invalid')
     dependency = _production_dependencies(
@@ -569,9 +591,12 @@ def validate_pwl_stage_a_artifact(
         raise ValueError('PWL Stage-A GPU lease identity is invalid')
     execution = value['execution']
     if not isinstance(execution, Mapping) or set(execution) != {
-            'checks', 'losses', 'pwl_targets', 'optimizer', 'identity',
+            'protocol', 'checks', 'losses', 'pwl_targets', 'optimizer',
+            'identity',
             'output', 'operation', 'export'}:
         raise ValueError('PWL Stage-A execution fields are invalid')
+    if execution['protocol'] != _STRUCTURAL_SMOKE_PROTOCOL:
+        raise ValueError('PWL Stage-A structural smoke protocol is invalid')
     checks = execution['checks']
     boolean = {
         'forward', 'loss', 'backward', 'optimizer_step', 'finite_loss',
@@ -937,7 +962,7 @@ def run_pwl_stage_a_smoke(
         if isinstance(sample_id, bool) or not isinstance(sample_id, int):
             raise RuntimeError('PWL Stage-A sample image id is invalid')
         artifact = {
-            'schema_version': 1,
+            'schema_version': 2,
             'artifact_kind': 'pwl-stage-a-full-model-smoke',
             'candidate_id': candidate.id,
             'source': {'git_commit': authorized.source['git_commit']},
