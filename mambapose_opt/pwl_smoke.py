@@ -840,6 +840,24 @@ def _build_model(config_authority, state, device, *, install: bool):
     return model.to(device)
 
 
+def _stage_a_model_factories(
+        config_authority,
+        state: Mapping[str, torch.Tensor],
+) -> tuple[Callable[[], torch.nn.Module], Callable[[], torch.nn.Module]]:
+    """Build replay closures from the already-validated checkpoint state."""
+    device = torch.device('cpu')
+
+    def fitted_factory() -> torch.nn.Module:
+        return _build_model(
+            config_authority, state, device, install=True)
+
+    def identity_factory() -> torch.nn.Module:
+        return _build_model(
+            config_authority, state, device, install=False)
+
+    return fitted_factory, identity_factory
+
+
 def build_stage_a_optimizer(model, optim_wrapper) -> torch.optim.Adam:
     value = optim_wrapper.get('optimizer') \
         if isinstance(optim_wrapper, Mapping) else None
@@ -933,17 +951,8 @@ def run_pwl_stage_a_smoke(
                 or not isinstance(samples, list) or len(samples) != 1):
             raise RuntimeError('PWL Stage-A packed batch is invalid')
 
-        def fitted_factory():
-            empty = {name: torch.empty_like(value)
-                     for name, value in state.items()}
-            return _build_model(
-                config_authority, empty, torch.device('cpu'), install=True)
-
-        def identity_factory():
-            empty = {name: torch.empty_like(value)
-                     for name, value in state.items()}
-            return _build_model(
-                config_authority, empty, torch.device('cpu'), install=False)
+        fitted_factory, identity_factory = _stage_a_model_factories(
+            config_authority, state)
 
         execution = execute_pwl_stage_a_model(
             model=model, inputs=inputs, data_samples=samples,

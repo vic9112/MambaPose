@@ -87,6 +87,50 @@ class TinyDropPathPose(TinyPose):
         raise ValueError(mode)
 
 
+def test_pwl_stage_a_replay_factories_reuse_exact_authorized_state(
+        monkeypatch):
+    """Regression: replay factories must not create uninitialized tensors."""
+    from mambapose_opt import pwl_smoke
+
+    factory_builder = getattr(pwl_smoke, '_stage_a_model_factories', None)
+    assert factory_builder is not None, (
+        'PWL Stage-A requires an exact-state replay factory')
+    source = {
+        'weight': torch.tensor([1.25, -2.5], dtype=torch.float32),
+        'buffer': torch.tensor([3, 5], dtype=torch.int64),
+    }
+    source_before = {
+        name: value.detach().clone() for name, value in source.items()}
+    authority = object()
+    restored = object()
+    calls = []
+
+    def capture_build(config_authority, state, device, *, install):
+        calls.append((config_authority, state, device, install))
+        return restored
+
+    monkeypatch.setattr(pwl_smoke, '_build_model', capture_build)
+    monkeypatch.setattr(
+        torch, 'empty_like',
+        lambda value: torch.full_like(
+            value, float('nan') if value.is_floating_point() else -1))
+    fitted_factory, identity_factory = factory_builder(authority, source)
+
+    assert fitted_factory() is restored
+    assert identity_factory() is restored
+    assert [call[0] for call in calls] == [authority, authority]
+    assert [call[1] is source for call in calls] == [True, True]
+    assert [call[2] for call in calls] == [
+        torch.device('cpu'), torch.device('cpu')]
+    assert [call[3] for call in calls] == [True, False]
+    assert all(torch.equal(calls[0][1][name], value)
+               for name, value in source_before.items())
+    assert all(torch.equal(calls[1][1][name], value)
+               for name, value in source_before.items())
+    assert all(torch.equal(source[name], value)
+               for name, value in source_before.items())
+
+
 def test_pwl_stage_a_core_proves_target_grad_adam_identity_and_resume(tmp_path):
     from mambapose_opt.numeric_conversion import install_pwl_fit
     from mambapose_opt.pwl_artifacts import validate_pwl_installation_manifest
