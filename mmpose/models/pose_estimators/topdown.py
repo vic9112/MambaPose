@@ -75,6 +75,15 @@ class TopdownPoseEstimator(BasePoseEstimator):
 
         return losses
 
+    def loss_from_output(
+            self, output: Tensor, data_samples: SampleList) -> dict:
+        """Calculate the configured head loss from an existing forward."""
+        if not self.with_head or not callable(
+                getattr(self.head, 'loss_from_output', None)):
+            raise TypeError('pose head does not support loss_from_output')
+        return self.head.loss_from_output(
+            output, data_samples, train_cfg=self.train_cfg)
+
     def predict(self, inputs: Tensor, data_samples: SampleList) -> SampleList:
         """Predict results from a batch of inputs and data samples with post-
         processing.

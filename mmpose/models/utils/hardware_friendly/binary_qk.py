@@ -23,6 +23,21 @@ def binary_qk_logits(query: Tensor, key: Tensor) -> Tensor:
     return torch.einsum('bhid,bhjd->bhij', ste_sign(query), ste_sign(key))
 
 
+def binary_scaled_qk_logits(query: Tensor, key: Tensor) -> Tensor:
+    """Compute BinaryAttention-style scaled signed Q/K logits.
+
+    The activation scales are runtime per-batch, per-head means over both the
+    token and channel dimensions.  The attention module applies its original
+    head-dimension scale separately.
+    """
+    signed_dot = binary_qk_logits(query, key)
+    query_scale = query.abs().mean(dim=-2, keepdim=True).mean(
+        dim=-1, keepdim=True)
+    key_scale = key.abs().mean(dim=-2, keepdim=True).mean(
+        dim=-1, keepdim=True)
+    return signed_dot * query_scale * key_scale
+
+
 @dataclass(frozen=True)
 class BinaryQKOperationReport:
     layers: int

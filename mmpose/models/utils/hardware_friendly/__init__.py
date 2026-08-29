@@ -7,7 +7,7 @@ from .observers import ActivationRangeObserver
 from .pwl import PiecewiseLinearApproximation, fit_pwl
 from .binary_qk import (
     BinaryQKOperationReport, binary_qk_logits, binary_qk_operation_report,
-    ste_sign)
+    binary_scaled_qk_logits, ste_sign)
 
 __all__ = [
     'ActivationRangeObserver',
@@ -20,6 +20,7 @@ __all__ = [
     'PiecewiseLinearApproximation',
     'binary_qk_logits',
     'binary_qk_operation_report',
+    'binary_scaled_qk_logits',
     'convert_for_fake_quant',
     'export_int8_state',
     'fit_pwl',

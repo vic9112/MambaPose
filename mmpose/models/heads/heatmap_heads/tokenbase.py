@@ -20,7 +20,8 @@ from torch import Tensor, nn
 from functools import partial
 
 from .pif import PoseInteraction
-from mmpose.models.utils.hardware_friendly.binary_qk import binary_qk_logits
+from mmpose.models.utils.hardware_friendly.binary_qk import (
+    binary_qk_logits, binary_scaled_qk_logits)
 
 MIN_NUM_PATCHES = 16
 BN_MOMENTUM = 0.1
@@ -185,8 +186,9 @@ class Attention(nn.Module):
     def __init__(self, dim, heads=8, dropout=0., num_keypoints=None,
                  scale_with_head=False, qk_mode='float'):
         super().__init__()
-        if qk_mode not in {'float', 'binary'}:
-            raise ValueError("qk_mode must be 'float' or 'binary'")
+        if qk_mode not in {'float', 'binary', 'binary_scaled'}:
+            raise ValueError(
+                "qk_mode must be 'float', 'binary', or 'binary_scaled'")
         self.heads = heads
         self.qk_mode = qk_mode
         self.scale = (dim // heads) ** -0.5 if scale_with_head else dim ** -0.5
@@ -205,8 +207,10 @@ class Attention(nn.Module):
 
         if self.qk_mode == 'float':
             dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
-        else:
+        elif self.qk_mode == 'binary':
             dots = binary_qk_logits(q, k) * self.scale
+        else:
+            dots = binary_scaled_qk_logits(q, k) * self.scale
         mask_value = -torch.finfo(dots.dtype).max
 
         if mask is not None:
@@ -240,9 +244,10 @@ class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, mlp_dim, dropout, num_keypoints=None, all_attn=False, scale_with_head=False,
                  pruning_loc=[3, 6, 9], qk_mode='float'):
         super().__init__()
-        if qk_mode not in {'float', 'binary'}:
-            raise ValueError("qk_mode must be 'float' or 'binary'")
-        if qk_mode == 'binary' and depth != 6:
+        if qk_mode not in {'float', 'binary', 'binary_scaled'}:
+            raise ValueError(
+                "qk_mode must be 'float', 'binary', or 'binary_scaled'")
+        if qk_mode != 'float' and depth != 6:
             raise ValueError('binary qk_mode is admitted only for six head layers')
         self.layers = nn.ModuleList([])
         self.all_attn = all_attn
