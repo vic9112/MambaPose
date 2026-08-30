@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import math
+import stat
 import threading
 from typing import Any, Mapping
 import zipfile
@@ -169,6 +170,13 @@ def _dataset_stat_stamp(path: Path) -> tuple[Any, ...]:
         value.st_mtime_ns, value.st_ctime_ns)
 
 
+def _dataset_component_stamp(path: Path) -> tuple[Any, ...]:
+    stamp = _dataset_stat_stamp(path)
+    if len(stamp) == 6 and stat.S_ISDIR(stamp[2]):
+        return stamp[:3]
+    return stamp
+
+
 def _dataset_tree_seal(
         path: Path, *, recursive: bool = False) -> tuple[Any, ...]:
     digest = hashlib.sha256()
@@ -199,42 +207,58 @@ def _dataset_tree_seal(
     return (count, digest.hexdigest())
 
 
+def _dataset_relative_path_seal(
+        root: Path, relative: Path) -> tuple[Any, ...]:
+    if (relative.is_absolute() or not relative.parts
+            or any(part in {'', '.', '..'} for part in relative.parts)):
+        return (str(relative), ('unsafe',))
+    current = root
+    components = []
+    for part in relative.parts:
+        current = current / part
+        components.append((part, _dataset_component_stamp(current)))
+    try:
+        resolved = current.resolve(strict=True)
+    except OSError as error:
+        target = ('error', type(error).__name__, getattr(error, 'errno', None))
+    else:
+        target = (str(resolved), _dataset_stat_stamp(resolved))
+    return (relative.as_posix(), tuple(components), target)
+
+
+def _calibration_archive_relatives(root: Path) -> tuple[Any, ...]:
+    try:
+        inventory = json.loads(
+            (root / 'data/inventory.json').read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        return (('invalid', type(error).__name__),)
+    assets = inventory.get('assets') if isinstance(inventory, Mapping) else None
+    result = []
+    for asset_id in ('coco-train2017', 'coco-annotations'):
+        matches = [
+            item for item in assets or ()
+            if isinstance(item, Mapping) and item.get('id') == asset_id]
+        value = matches[0].get('path') if len(matches) == 1 else None
+        if not isinstance(value, str):
+            result.append((asset_id, ('invalid',)))
+        else:
+            result.append((
+                asset_id,
+                _dataset_relative_path_seal(root, Path(value))))
+    return tuple(result)
+
+
 def _dataset_state_seal(
         root: Path, images: Path, annotation: Path) -> tuple[Any, ...]:
     """Cheaply detect input changes; this seal is never data authority."""
-    reproduction_lexical = root / 'work_dirs/reproduction'
-    reproduction = reproduction_lexical
-    reproduction_approved = not reproduction_lexical.is_symlink()
-    try:
-        resolved = reproduction.resolve(strict=True)
-    except OSError:
-        resolved = reproduction
-    if reproduction_lexical.is_symlink():
-        try:
-            from .evaluation import resolve_project_asset_root
-            expected = (
-                resolve_project_asset_root(root) / 'work_dirs/reproduction')
-            if (reproduction_lexical.absolute() != expected.absolute()
-                    and resolved == expected.resolve(strict=True)):
-                reproduction = resolved
-                reproduction_approved = True
-        except (OSError, ValueError):
-            pass
-    elif resolved == reproduction_lexical:
-        reproduction = resolved
-        reproduction_approved = True
-    reproduction_tree = (
-        _dataset_tree_seal(reproduction, recursive=True)
-        if reproduction_approved else (('unsafe-link',),))
     return (
         ('pid', os.getpid()),
-        ('inventory', _dataset_stat_stamp(root / 'data/inventory.json')),
+        ('inventory', _dataset_relative_path_seal(
+            root, Path('data/inventory.json'))),
         ('images-root', _dataset_stat_stamp(images)),
         ('images', _dataset_tree_seal(images)),
         ('annotation', _dataset_stat_stamp(annotation)),
-        ('reproduction-link', _dataset_stat_stamp(reproduction_lexical)),
-        ('reproduction-root', _dataset_stat_stamp(reproduction)),
-        ('reproduction', reproduction_tree),
+        ('archives', _calibration_archive_relatives(root)),
     )
 
 
@@ -330,6 +354,11 @@ def _verified_dataset_authority_uncached(
     }
 
 
+def _clone_dataset_authority(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Isolate every memo consumer from retained dataset authority."""
+    return copy.deepcopy(dict(value))
+
+
 def _verified_dataset_authority(
         root: Path, images: Path, annotation: Path) -> dict[str, Any]:
     key = (os.getpid(), root, images, annotation)
@@ -337,7 +366,7 @@ def _verified_dataset_authority(
         before = _dataset_state_seal(root, images, annotation)
         entry = _DATASET_MEMO.get(key)
         if entry is not None and entry.seal == before:
-            value = copy.deepcopy(dict(entry.authority))
+            value = _clone_dataset_authority(entry.authority)
             after = _dataset_state_seal(root, images, annotation)
             if after == before:
                 _DATASET_MEMO.move_to_end(key)
@@ -350,12 +379,12 @@ def _verified_dataset_authority(
         if after != before:
             raise CalibrationContractError(
                 'dataset inputs changed during authority verification')
-        retained = copy.deepcopy(value)
+        retained = _clone_dataset_authority(value)
         _DATASET_MEMO[key] = _DatasetMemoEntry(retained, after)
         _DATASET_MEMO.move_to_end(key)
         while len(_DATASET_MEMO) > _DATASET_MEMO_MAX:
             _DATASET_MEMO.popitem(last=False)
-        return copy.deepcopy(value)
+        return _clone_dataset_authority(value)
 
 
 def calibration_identity(

@@ -248,6 +248,11 @@ def test_calibration_identity_is_source_checkpoint_policy_and_train_bound(
     def counted_compare(*args, **kwargs):
         nonlocal compare_calls
         compare_calls += 1
+        if compare_calls == 1:
+            health = (
+                repo / 'work_dirs/reproduction/monitor/health.jsonl')
+            health.parent.mkdir(parents=True)
+            health.write_text('{"status":"alive"}\n', encoding='utf-8')
         return original_compare(*args, **kwargs)
 
     monkeypatch.setattr(calibration, '_compare_zip_member', counted_compare)
@@ -372,6 +377,148 @@ def test_calibration_identity_is_source_checkpoint_policy_and_train_bound(
             annotation=Path(
                 'data/coco/annotations/person_keypoints_train2017.json'),
             image_prefix=Path('data/coco/train2017'))
+
+
+def _calibration_archive_fixture(repo: Path):
+    (repo / 'configs/reproduction').mkdir(parents=True)
+    (repo / 'checkpoints').mkdir()
+    (repo / 'data/coco/annotations').mkdir(parents=True)
+    (repo / 'data/coco/train2017').mkdir(parents=True)
+    (repo / 'configs/reproduction/coco_s_v1.py').write_text('full S-V1')
+    (repo / 'checkpoints/full.pth').write_bytes(b'checkpoint')
+    (repo / 'data/coco/annotations/'
+     'person_keypoints_train2017.json').write_bytes(b'{}')
+    (repo / 'data/coco/train2017/000000000001.jpg').write_bytes(b'image')
+    (repo / 'configs/policy.py').write_text('numeric policy')
+    downloads = repo / 'work_dirs/reproduction/downloads'
+    downloads.mkdir(parents=True)
+    train_archive = downloads / 'train2017.zip'
+    annotation_archive = downloads / 'annotations_trainval2017.zip'
+    with zipfile.ZipFile(train_archive, 'w') as archive:
+        archive.writestr('train2017/000000000001.jpg', b'image')
+    with zipfile.ZipFile(annotation_archive, 'w') as archive:
+        archive.writestr(
+            'annotations/person_keypoints_train2017.json', b'{}')
+    (repo / 'data/inventory.json').write_text(json.dumps({
+        'schema_version': 1,
+        'assets': [
+            {'id': 'coco-train2017',
+             'path': 'work_dirs/reproduction/downloads/train2017.zip',
+             'sha256': hashlib.sha256(train_archive.read_bytes()).hexdigest()},
+            {'id': 'coco-annotations',
+             'path': ('work_dirs/reproduction/downloads/'
+                      'annotations_trainval2017.zip'),
+             'sha256': hashlib.sha256(
+                 annotation_archive.read_bytes()).hexdigest()},
+        ],
+    }))
+    arguments = {
+        'repository_root': repo,
+        'candidate_id': 'full-s-v1',
+        'config': Path('configs/reproduction/coco_s_v1.py'),
+        'checkpoint': Path('checkpoints/full.pth'),
+        'expected_checkpoint_sha256': hashlib.sha256(b'checkpoint').hexdigest(),
+        'policy': Path('configs/policy.py'),
+        'split': 'train2017',
+        'annotation': Path(
+            'data/coco/annotations/person_keypoints_train2017.json'),
+        'image_prefix': Path('data/coco/train2017'),
+    }
+    return arguments, {
+        'coco-train2017': train_archive,
+        'coco-annotations': annotation_archive,
+    }
+
+
+@pytest.mark.parametrize(
+    'archive_id', ('coco-train2017', 'coco-annotations'))
+@pytest.mark.parametrize(
+    'mutation', ('content', 'inode', 'ctime', 'symlink-retarget', 'hit-window'))
+def test_calibration_archive_cache_scope_fails_closed_on_exact_mutations(
+        tmp_path, monkeypatch, archive_id, mutation):
+    import mambapose_opt.numeric_calibration as calibration
+    from mambapose_opt.numeric_calibration import (
+        CalibrationContractError, calibration_identity)
+
+    arguments, archives = _calibration_archive_fixture(tmp_path)
+    archive = archives[archive_id]
+    original_uncached = calibration._verified_dataset_authority_uncached
+    uncached_calls = 0
+
+    def counted_uncached(*args, **kwargs):
+        nonlocal uncached_calls
+        uncached_calls += 1
+        return original_uncached(*args, **kwargs)
+
+    monkeypatch.setattr(
+        calibration, '_verified_dataset_authority_uncached', counted_uncached)
+    expected = calibration_identity(**arguments)
+    assert calibration_identity(**arguments) == expected
+    assert uncached_calls == 1
+    original = archive.read_bytes()
+    archive_stat = archive.stat()
+
+    if mutation == 'inode':
+        replacement = archive.with_name(f'{archive.name}.replacement')
+        replacement.write_bytes(original)
+        os.utime(
+            replacement,
+            ns=(archive_stat.st_atime_ns, archive_stat.st_mtime_ns))
+        os.replace(replacement, archive)
+        assert calibration_identity(**arguments) == expected
+        assert uncached_calls == 2
+    elif mutation == 'ctime':
+        os.utime(
+            archive,
+            ns=(archive_stat.st_atime_ns, archive_stat.st_mtime_ns + 1))
+        os.utime(
+            archive,
+            ns=(archive_stat.st_atime_ns, archive_stat.st_mtime_ns))
+        assert archive.stat().st_ctime_ns != archive_stat.st_ctime_ns
+        assert calibration_identity(**arguments) == expected
+        assert uncached_calls == 2
+    elif mutation == 'content':
+        archive.write_bytes(b'x' * len(original))
+        os.utime(
+            archive,
+            ns=(archive_stat.st_atime_ns, archive_stat.st_mtime_ns))
+        with pytest.raises(CalibrationContractError, match='archive|sha256'):
+            calibration_identity(**arguments)
+        assert uncached_calls == 2
+    elif mutation == 'symlink-retarget':
+        first_target = archive.with_name(f'{archive.name}.first')
+        second_target = archive.with_name(f'{archive.name}.second')
+        first_target.write_bytes(original)
+        second_target.write_bytes(original)
+        archive.unlink()
+        archive.symlink_to(first_target)
+        with pytest.raises(CalibrationContractError, match='symlink'):
+            calibration_identity(**arguments)
+        archive.unlink()
+        archive.symlink_to(second_target)
+        with pytest.raises(CalibrationContractError, match='symlink'):
+            calibration_identity(**arguments)
+        assert uncached_calls == 3
+    else:
+        original_clone = calibration._clone_dataset_authority
+        armed = True
+
+        def mutating_clone(value):
+            nonlocal armed
+            result = original_clone(value)
+            if armed:
+                armed = False
+                archive.write_bytes(b'x' * len(original))
+                os.utime(
+                    archive,
+                    ns=(archive_stat.st_atime_ns, archive_stat.st_mtime_ns))
+            return result
+
+        monkeypatch.setattr(
+            calibration, '_clone_dataset_authority', mutating_clone)
+        with pytest.raises(CalibrationContractError, match='archive|sha256'):
+            calibration_identity(**arguments)
+        assert uncached_calls == 2
 
 
 def test_calibration_artifact_requires_deterministic_order_and_exact_hooks():

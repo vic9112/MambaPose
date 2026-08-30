@@ -1,6 +1,7 @@
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -950,7 +951,25 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
     (tmp_path / 'work_dirs/reproduction').mkdir(parents=True)
     (tmp_path / 'work_dirs/optimization').mkdir(parents=True)
     (tmp_path / 'data').mkdir()
-    (tmp_path / 'data/.keep').write_text('', encoding='utf-8')
+    train_archive = (
+        tmp_path / 'work_dirs/reproduction/downloads/train2017.zip')
+    annotation_archive = (
+        tmp_path / 'work_dirs/reproduction/downloads/annotations.zip')
+    train_archive.parent.mkdir(parents=True)
+    train_archive.write_bytes(b'train archive')
+    annotation_archive.write_bytes(b'annotation archive')
+    (tmp_path / 'data/inventory.json').write_text(json.dumps({
+        'schema_version': 1,
+        'assets': [
+            {'id': 'coco-train2017',
+             'path': train_archive.relative_to(tmp_path).as_posix(),
+             'sha256': hashlib.sha256(train_archive.read_bytes()).hexdigest()},
+            {'id': 'coco-annotations',
+             'path': annotation_archive.relative_to(tmp_path).as_posix(),
+             'sha256': hashlib.sha256(
+                 annotation_archive.read_bytes()).hexdigest()},
+        ],
+    }), encoding='utf-8')
     (tmp_path / '.gitignore').write_text('work_dirs/\n', encoding='utf-8')
     checkpoint = tmp_path / 'work_dirs/reproduction/checkpoint.pth'
     checkpoint.write_bytes(b'checkpoint')
@@ -1012,7 +1031,10 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
         observations={'layer': [torch.tensor([-1.0, 0.0, 1.0])]})
     calibration_path.write_text(json.dumps({
         'schema_version': 3, 'candidate_id': candidate.id,
-        'stage': 'calibrate', 'source': {}, 'identity': {},
+        'stage': 'calibrate',
+        'source': {
+            'authority_path': 'optimization/coco_train2017_authority.json'},
+        'identity': {},
         'protocol': {}, 'hooks': {}, 'pwl_fit': fixture_fit,
     }), encoding='utf-8')
     output = root / 'convert/convert.json'
@@ -1033,7 +1055,20 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
         tmp_path / 'work_dirs/optimization/ssm-quant-pwl/'
         'pwl-selection/selection.json')
     selection_path.parent.mkdir(parents=True, exist_ok=True)
-    selection_path.write_text('{}', encoding='utf-8')
+    other_calibration = (
+        tmp_path / 'work_dirs/optimization/ssm-quant-pwl/'
+        'pwl-gelu-s-v1/0/calibrate/calibrate.json')
+    other_calibration.parent.mkdir(parents=True)
+    other_calibration.write_text('{}', encoding='utf-8')
+    selection_path.write_text(json.dumps({
+        'candidates': [{
+            'calibration_artifact': {
+                'path': other_calibration.relative_to(tmp_path).as_posix(),
+                'sha256': hashlib.sha256(
+                    other_calibration.read_bytes()).hexdigest(),
+            },
+        }],
+    }), encoding='utf-8')
     monkeypatch.setattr(
         convert_numeric, 'load_pwl_selection_reference',
         lambda *_args, **_kwargs: {
@@ -1105,6 +1140,37 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
     assert repeated_authority.load_config().numeric_optimization.pwl.candidate_id \
         == candidate.id
     assert runtime_snapshot_calls == 1
+    health = tmp_path / 'work_dirs/reproduction/monitor/status.json'
+    health.parent.mkdir(parents=True)
+    health.write_text('{"status":"alive"}\n', encoding='utf-8')
+    assert authority.load_config().numeric_optimization.pwl.candidate_id == (
+        candidate.id)
+    assert runtime_snapshot_calls == 1
+    entry = checkpoints._CONFIG_MEMO[
+        checkpoints._memo_key(authority)]
+    scoped_files = {path.as_posix() for path in entry.scope.files}
+    assert {
+        output.relative_to(tmp_path).as_posix(),
+        calibration_path.relative_to(tmp_path).as_posix(),
+        selection_path.relative_to(tmp_path).as_posix(),
+        other_calibration.relative_to(tmp_path).as_posix(),
+        'optimization/coco_train2017_authority.json',
+        train_archive.relative_to(tmp_path).as_posix(),
+        annotation_archive.relative_to(tmp_path).as_posix(),
+    } <= scoped_files
+    assert 'work_dirs/reproduction/monitor/status.json' not in scoped_files
+    for dependency in (selection_path, calibration_path, other_calibration,
+                       train_archive, annotation_archive):
+        original_stat = dependency.stat()
+        replacement = dependency.with_name(f'{dependency.name}.replacement')
+        replacement.write_bytes(dependency.read_bytes())
+        os.utime(
+            replacement,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        os.replace(replacement, dependency)
+        assert authority.load_config().numeric_optimization.pwl.candidate_id == (
+            candidate.id)
+    assert runtime_snapshot_calls == 6
 
     materialized_path = output.parent.parent / 'evaluate/resolved-flip.py'
     authority_path = output.parent.parent / (

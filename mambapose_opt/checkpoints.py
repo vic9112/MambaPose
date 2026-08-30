@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import stat
 import tempfile
 import threading
 from typing import Any, Mapping
@@ -57,6 +58,12 @@ class _ConfigSnapshot:
 class _ConfigMemoEntry:
     snapshot: _ConfigSnapshot
     seal: tuple[Any, ...]
+    scope: '_ConfigDependencyScope'
+
+
+@dataclass(frozen=True)
+class _ConfigDependencyScope:
+    files: tuple[Path, ...]
 
 
 _CONFIG_MEMO_MAX = 32
@@ -168,13 +175,20 @@ def _stat_stamp(path: Path) -> tuple[Any, ...]:
         value.st_mtime_ns, value.st_ctime_ns)
 
 
+def _component_stamp(path: Path) -> tuple[Any, ...]:
+    stamp = _stat_stamp(path)
+    if len(stamp) == 6 and stat.S_ISDIR(stamp[2]):
+        return stamp[:3]
+    return stamp
+
+
 def _relative_path_seal(root: Path, relative: Path) -> tuple[Any, ...]:
     """Describe one lexical path and its target without trusting either."""
     current = root
     components: list[tuple[Any, ...]] = []
     for part in relative.parts:
         current = current / part
-        components.append((part, _stat_stamp(current)))
+        components.append((part, _component_stamp(current)))
     try:
         resolved = current.resolve(strict=True)
     except OSError as error:
@@ -272,17 +286,90 @@ def _git_state_seal(root: Path) -> tuple[Any, ...]:
     return tuple(records)
 
 
-def _authority_state_seal(
+def _dependency_relative(value: object) -> Path | None:
+    if not isinstance(value, str):
+        return None
+    relative = Path(value)
+    if (relative.is_absolute() or not relative.parts
+            or any(part in {'', '.', '..'} for part in relative.parts)):
+        return None
+    return relative
+
+
+def _artifact_references(value: object) -> set[Path]:
+    """Collect paths consumed by the validated artifact schemas."""
+    files: set[Path] = set()
+    direct_file_fields = {
+        'annotation', 'annotation_archive', 'checkpoint', 'config',
+        'data_inventory', 'image_prefix', 'inventory', 'policy',
+        'train_archive',
+    }
+
+    def visit(item: object) -> None:
+        if isinstance(item, Mapping):
+            reference = _dependency_relative(item.get('path'))
+            if reference is not None and isinstance(item.get('sha256'), str):
+                files.add(reference)
+            for name, child in item.items():
+                relative = _dependency_relative(child)
+                if relative is not None and (
+                        name in direct_file_fields or name.endswith('_path')):
+                    files.add(relative)
+                visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return files
+
+
+def _dependency_json(root: Path, relative: Path) -> object | None:
+    if (relative.suffix.lower() != '.json'
+            or relative.parts[:2] != ('work_dirs', 'optimization')):
+        return None
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return None
+    try:
+        if not current.is_file():
+            return None
+        return json.loads(current.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _inventory_archive_dependencies(root: Path) -> set[Path]:
+    try:
+        value = json.loads(
+            (root / 'data/inventory.json').read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    assets = value.get('assets') if isinstance(value, Mapping) else None
+    result = set()
+    for asset_id in ('coco-train2017', 'coco-annotations'):
+        matches = [
+            item for item in assets or ()
+            if isinstance(item, Mapping) and item.get('id') == asset_id]
+        if len(matches) == 1:
+            relative = _dependency_relative(matches[0].get('path'))
+            if relative is not None:
+                result.add(relative)
+    return result
+
+
+def _config_dependency_scope(
         root: Path, manifest_path: Path,
-        snapshot: _ConfigSnapshot) -> tuple[Any, ...]:
-    """Build a mutation detector; this seal never establishes authority."""
-    paths = {
+        snapshot: _ConfigSnapshot) -> _ConfigDependencyScope:
+    files = {
         Path(manifest_path).relative_to(root), snapshot.candidate.config,
         snapshot.candidate.checkpoint,
     }
     closure = snapshot.reference.get('closure')
     if isinstance(closure, list):
-        paths.update(
+        files.update(
             Path(item['path']) for item in closure
             if isinstance(item, Mapping) and isinstance(item.get('path'), str))
     for field in (
@@ -290,25 +377,41 @@ def _authority_state_seal(
             'base_conversion_path', 'materialized_path'):
         value = snapshot.reference.get(field)
         if isinstance(value, str):
-            paths.add(Path(value))
-    records: list[tuple[Any, ...]] = [
-        ('pid', os.getpid()), ('git', _git_state_seal(root)),
-        ('paths', tuple(
-            _relative_path_seal(root, path)
-            for path in sorted(paths, key=lambda item: item.as_posix()))),
-    ]
+            files.add(Path(value))
     if snapshot.reference.get('kind') in {
             'pwl-convert-runtime-v1', 'materialized-evaluation-v1'}:
-        records.extend((
-            ('artifacts', _tree_seal(
-                root, Path('work_dirs/optimization'),
-                suffixes=frozenset({
-                    '.json', '.py', '.pth', '.yaml', '.yml', '.npz'}))),
-            ('dataset', _tree_seal(root, Path('data'))),
-            ('reproduction', _tree_seal(
-                root, Path('work_dirs/reproduction'))),
-        ))
-    return tuple(records)
+        pending = list(files)
+        inspected: set[Path] = set()
+        while pending:
+            relative = pending.pop()
+            if relative in inspected:
+                continue
+            inspected.add(relative)
+            artifact = _dependency_json(root, relative)
+            if artifact is None:
+                continue
+            for dependency in _artifact_references(artifact):
+                if dependency not in files:
+                    files.add(dependency)
+                    pending.append(dependency)
+        files.update({
+            Path('data/inventory.json'),
+            Path('data/coco/annotations/person_keypoints_train2017.json'),
+        })
+        files.update(_inventory_archive_dependencies(root))
+        files.add(Path('data/coco/train2017'))
+    return _ConfigDependencyScope(
+        files=tuple(sorted(files, key=lambda item: item.as_posix())))
+
+
+def _authority_state_seal(
+        root: Path, scope: _ConfigDependencyScope) -> tuple[Any, ...]:
+    """Build a mutation detector; this seal never establishes authority."""
+    return (
+        ('pid', os.getpid()), ('git', _git_state_seal(root)),
+        ('paths', tuple(
+            _relative_path_seal(root, path) for path in scope.files)),
+    )
 
 
 def _memo_key(authority: ConfigAuthority) -> tuple[Any, ...]:
@@ -318,13 +421,17 @@ def _memo_key(authority: ConfigAuthority) -> tuple[Any, ...]:
 def _remember_config_snapshot(
         authority: ConfigAuthority, snapshot: _ConfigSnapshot) -> None:
     root = Path(authority._repository_root)
-    before = _authority_state_seal(root, authority._manifest_path, snapshot)
+    scope = _config_dependency_scope(
+        root, authority._manifest_path, snapshot)
+    before = _authority_state_seal(root, scope)
     retained = _clone_config_snapshot(snapshot)
-    after = _authority_state_seal(root, authority._manifest_path, snapshot)
-    if before != after:
+    after_scope = _config_dependency_scope(
+        root, authority._manifest_path, snapshot)
+    after = _authority_state_seal(root, after_scope)
+    if scope != after_scope or before != after:
         raise ValueError('ConfigAuthority source changed during memoization')
     key = _memo_key(authority)
-    _CONFIG_MEMO[key] = _ConfigMemoEntry(retained, after)
+    _CONFIG_MEMO[key] = _ConfigMemoEntry(retained, after, scope)
     _CONFIG_MEMO.move_to_end(key)
     while len(_CONFIG_MEMO) > _CONFIG_MEMO_MAX:
         _CONFIG_MEMO.popitem(last=False)
@@ -336,12 +443,10 @@ def _cached_config_snapshot(authority: ConfigAuthority) -> _ConfigSnapshot:
     with _CONFIG_MEMO_LOCK:
         entry = _CONFIG_MEMO.get(key)
         if entry is not None:
-            before = _authority_state_seal(
-                root, authority._manifest_path, entry.snapshot)
+            before = _authority_state_seal(root, entry.scope)
             if before == entry.seal:
                 result = _clone_config_snapshot(entry.snapshot)
-                after = _authority_state_seal(
-                    root, authority._manifest_path, entry.snapshot)
+                after = _authority_state_seal(root, entry.scope)
                 if after == before:
                     _CONFIG_MEMO.move_to_end(key)
                     return result
@@ -370,12 +475,12 @@ def _memoized_config_authority(
                     or any(snapshot.reference.get(name) != value
                            for name, value in selector_items)):
                 continue
-            before = _authority_state_seal(root, manifest_path, snapshot)
+            before = _authority_state_seal(root, entry.scope)
             if before != entry.seal:
                 _CONFIG_MEMO.pop(key, None)
                 return None
             isolated = _clone_config_snapshot(snapshot)
-            after = _authority_state_seal(root, manifest_path, snapshot)
+            after = _authority_state_seal(root, entry.scope)
             if after != before:
                 _CONFIG_MEMO.pop(key, None)
                 return None
