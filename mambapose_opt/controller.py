@@ -687,6 +687,21 @@ class OptimizationController:
             except (MetricError, OSError, ValueError) as error:
                 raise ArtifactValidationError(
                     f'evaluate artifact is invalid: {error}') from error
+        if (stage == 'compare'
+                and self.candidate.features.get('numeric_kind') ==
+                'pwl-combined'):
+            try:
+                from .combined_comparison import (
+                    validate_combined_comparison_artifact)
+                validate_combined_comparison_artifact(
+                    value, candidate=self.candidate, artifact_path=path,
+                    repository_root=self.repository_root,
+                    manifest_path=self.manifest_path)
+            except (OSError, ValueError) as error:
+                raise ArtifactValidationError(
+                    f'combined comparison artifact is invalid: {error}') \
+                    from error
+            return 'combined-full-comparison-v1'
         if stage == 'latency':
             try:
                 source, source_candidate, authority = resolve_artifact_source(
@@ -736,6 +751,17 @@ class OptimizationController:
                 else:
                     expected_pwl_stage_a = None
                     config_authority = None
+                if self.candidate.features.get(
+                        'numeric_kind') == 'pwl-combined':
+                    from .combined_comparison import (
+                        load_combined_comparison_binding)
+                    expected_comparison = load_combined_comparison_binding(
+                        self.candidate,
+                        repository_root=self.repository_root,
+                        manifest_path=self.manifest_path,
+                        downstream_output=path)
+                else:
+                    expected_comparison = None
                 validated_latency = validate_latency_envelope(
                     value,
                     expected_candidate_id=self.candidate.id,
@@ -751,6 +777,7 @@ class OptimizationController:
                     expected_authority=authority,
                     require_source_binding=True,
                     expected_pwl_stage_a=expected_pwl_stage_a,
+                    expected_comparison=expected_comparison,
                 )
                 if expected_gpu_lease is None:
                     raise MetricError(

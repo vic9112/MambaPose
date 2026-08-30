@@ -169,6 +169,15 @@ def test_pwl_downstream_validators_require_exact_stage_a_binding(tmp_path):
     latency['result']['pwl_stage_a'] = smoke
     assert validate_latency_envelope(
         latency, expected_pwl_stage_a=smoke)['pwl_stage_a'] == smoke
+    comparison = {
+        'path': ('work_dirs/optimization/ssm-quant-pwl/'
+                 'no-pif-pwl-softplus-s-v1/0/compare/compare.json'),
+        'sha256': '7' * 64,
+    }
+    latency['result']['comparison'] = comparison
+    assert validate_latency_envelope(
+        latency, expected_pwl_stage_a=smoke,
+        expected_comparison=comparison)['comparison'] == comparison
 
     forged = dict(smoke, sha256='8' * 64)
     with pytest.raises(MetricError, match='Stage-A|smoke'):
@@ -176,6 +185,12 @@ def test_pwl_downstream_validators_require_exact_stage_a_binding(tmp_path):
             evaluation, expected_pwl_stage_a=forged)
     with pytest.raises(MetricError, match='Stage-A|smoke'):
         validate_latency_envelope(latency, expected_pwl_stage_a=forged)
+    with pytest.raises(MetricError, match='comparison'):
+        validate_latency_envelope(
+            latency, expected_pwl_stage_a=smoke,
+            expected_comparison={**comparison, 'sha256': '6' * 64})
+    with pytest.raises(MetricError, match='comparison'):
+        validate_latency_envelope(latency, expected_pwl_stage_a=smoke)
 
 
 def _latency(candidate_id='full-s-v1'):

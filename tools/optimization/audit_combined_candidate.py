@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import hashlib
 import json
 from pathlib import Path
@@ -81,7 +82,8 @@ def main() -> int:
         default=REPOSITORY_ROOT / 'optimization/candidates.json')
     args = parser.parse_args()
     try:
-        value = audit(args.candidate, args.manifest)
+        with redirect_stdout(sys.stderr):
+            value = audit(args.candidate, args.manifest)
     except (OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))
     print(json.dumps(value, indent=2, sort_keys=True, allow_nan=False))

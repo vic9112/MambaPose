@@ -1,0 +1,1818 @@
+{
+  "candidate": "pwl-softplus-s-v1",
+  "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+  "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+  "config": "work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/convert/resolved-runtime.py",
+  "device": {
+    "kind": "cuda",
+    "logical": "cuda:0",
+    "physical_index": 0
+  },
+  "git_commit": "f71fcff33bebe32241d0825eb2b736605a926183",
+  "input_shapes": [
+    1,
+    3,
+    256,
+    192
+  ],
+  "modules": [
+    {
+      "hazard": null,
+      "kind": "TopdownPoseEstimator",
+      "name": "",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PoseDataPreprocessor",
+      "name": "data_preprocessor",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Backbone_VSSM",
+      "name": "backbone",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.patch_embed",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Conv2d",
+      "name": "backbone.patch_embed.0",
+      "parameters": 1344
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.patch_embed.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.patch_embed.2",
+      "parameters": 96
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.patch_embed.3",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "backbone.patch_embed.4",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Conv2d",
+      "name": "backbone.patch_embed.5",
+      "parameters": 41568
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.patch_embed.6",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.patch_embed.7",
+      "parameters": 192
+    },
+    {
+      "hazard": null,
+      "kind": "ModuleList",
+      "name": "backbone.layers",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.0.blocks",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "VSSBlock",
+      "name": "backbone.layers.0.blocks.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.0.blocks.0.norm",
+      "parameters": 192
+    },
+    {
+      "hazard": null,
+      "kind": "SS2D",
+      "name": "backbone.layers.0.blocks.0.op",
+      "parameters": 13056
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.0.blocks.0.op.out_norm",
+      "parameters": 384
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.0.blocks.0.op.in_proj",
+      "parameters": 18432
+    },
+    {
+      "hazard": null,
+      "kind": "SiLU",
+      "name": "backbone.layers.0.blocks.0.op.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Conv2d",
+      "name": "backbone.layers.0.blocks.0.op.conv2d",
+      "parameters": 1728
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.0.blocks.0.op.out_act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.0.blocks.0.op.out_proj",
+      "parameters": 18432
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.0.blocks.0.op.dropout",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PiecewiseLinearApproximation",
+      "name": "backbone.layers.0.blocks.0.op._numeric_pwl_softplus",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "DropPath",
+      "name": "backbone.layers.0.blocks.0.drop_path",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.0.blocks.0.norm2",
+      "parameters": 192
+    },
+    {
+      "hazard": null,
+      "kind": "Mlp",
+      "name": "backbone.layers.0.blocks.0.mlp",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.0.blocks.0.mlp.fc1",
+      "parameters": 37248
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "backbone.layers.0.blocks.0.mlp.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.0.blocks.0.mlp.fc2",
+      "parameters": 36960
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "backbone.layers.0.blocks.0.mlp.drop",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.0.downsample",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.0.downsample.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Conv2d",
+      "name": "backbone.layers.0.downsample.1",
+      "parameters": 166080
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.0.downsample.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.0.downsample.3",
+      "parameters": 384
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.1.blocks",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "VSSBlock",
+      "name": "backbone.layers.1.blocks.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.1.blocks.0.norm",
+      "parameters": 384
+    },
+    {
+      "hazard": null,
+      "kind": "SS2D",
+      "name": "backbone.layers.1.blocks.0.op",
+      "parameters": 44544
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.1.blocks.0.op.out_norm",
+      "parameters": 768
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.1.blocks.0.op.in_proj",
+      "parameters": 73728
+    },
+    {
+      "hazard": null,
+      "kind": "SiLU",
+      "name": "backbone.layers.1.blocks.0.op.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Conv2d",
+      "name": "backbone.layers.1.blocks.0.op.conv2d",
+      "parameters": 3456
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.1.blocks.0.op.out_act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.1.blocks.0.op.out_proj",
+      "parameters": 73728
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.1.blocks.0.op.dropout",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PiecewiseLinearApproximation",
+      "name": "backbone.layers.1.blocks.0.op._numeric_pwl_softplus",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "DropPath",
+      "name": "backbone.layers.1.blocks.0.drop_path",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.1.blocks.0.norm2",
+      "parameters": 384
+    },
+    {
+      "hazard": null,
+      "kind": "Mlp",
+      "name": "backbone.layers.1.blocks.0.mlp",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.1.blocks.0.mlp.fc1",
+      "parameters": 148224
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "backbone.layers.1.blocks.0.mlp.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.1.blocks.0.mlp.fc2",
+      "parameters": 147648
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "backbone.layers.1.blocks.0.mlp.drop",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.1.downsample",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.1.downsample.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Conv2d",
+      "name": "backbone.layers.1.downsample.1",
+      "parameters": 663936
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.1.downsample.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.1.downsample.3",
+      "parameters": 768
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.2.blocks",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "VSSBlock",
+      "name": "backbone.layers.2.blocks.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.2.blocks.0.norm",
+      "parameters": 768
+    },
+    {
+      "hazard": null,
+      "kind": "SS2D",
+      "name": "backbone.layers.2.blocks.0.op",
+      "parameters": 162816
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.2.blocks.0.op.out_norm",
+      "parameters": 1536
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.2.blocks.0.op.in_proj",
+      "parameters": 294912
+    },
+    {
+      "hazard": null,
+      "kind": "SiLU",
+      "name": "backbone.layers.2.blocks.0.op.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Conv2d",
+      "name": "backbone.layers.2.blocks.0.op.conv2d",
+      "parameters": 6912
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.2.blocks.0.op.out_act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.2.blocks.0.op.out_proj",
+      "parameters": 294912
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.2.blocks.0.op.dropout",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PiecewiseLinearApproximation",
+      "name": "backbone.layers.2.blocks.0.op._numeric_pwl_softplus",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "DropPath",
+      "name": "backbone.layers.2.blocks.0.drop_path",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.2.blocks.0.norm2",
+      "parameters": 768
+    },
+    {
+      "hazard": null,
+      "kind": "Mlp",
+      "name": "backbone.layers.2.blocks.0.mlp",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.2.blocks.0.mlp.fc1",
+      "parameters": 591360
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "backbone.layers.2.blocks.0.mlp.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.2.blocks.0.mlp.fc2",
+      "parameters": 590208
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "backbone.layers.2.blocks.0.mlp.drop",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "VSSBlock",
+      "name": "backbone.layers.2.blocks.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.2.blocks.1.norm",
+      "parameters": 768
+    },
+    {
+      "hazard": null,
+      "kind": "SS2D",
+      "name": "backbone.layers.2.blocks.1.op",
+      "parameters": 162816
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.2.blocks.1.op.out_norm",
+      "parameters": 1536
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.2.blocks.1.op.in_proj",
+      "parameters": 294912
+    },
+    {
+      "hazard": null,
+      "kind": "SiLU",
+      "name": "backbone.layers.2.blocks.1.op.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Conv2d",
+      "name": "backbone.layers.2.blocks.1.op.conv2d",
+      "parameters": 6912
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.2.blocks.1.op.out_act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.2.blocks.1.op.out_proj",
+      "parameters": 294912
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.2.blocks.1.op.dropout",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PiecewiseLinearApproximation",
+      "name": "backbone.layers.2.blocks.1.op._numeric_pwl_softplus",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "DropPath",
+      "name": "backbone.layers.2.blocks.1.drop_path",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.2.blocks.1.norm2",
+      "parameters": 768
+    },
+    {
+      "hazard": null,
+      "kind": "Mlp",
+      "name": "backbone.layers.2.blocks.1.mlp",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.2.blocks.1.mlp.fc1",
+      "parameters": 591360
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "backbone.layers.2.blocks.1.mlp.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.2.blocks.1.mlp.fc2",
+      "parameters": 590208
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "backbone.layers.2.blocks.1.mlp.drop",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.2.downsample",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.2.downsample.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Conv2d",
+      "name": "backbone.layers.2.downsample.1",
+      "parameters": 2654976
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.2.downsample.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.2.downsample.3",
+      "parameters": 1536
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.3",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "backbone.layers.3.blocks",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "VSSBlock",
+      "name": "backbone.layers.3.blocks.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.3.blocks.0.norm",
+      "parameters": 1536
+    },
+    {
+      "hazard": null,
+      "kind": "SS2D",
+      "name": "backbone.layers.3.blocks.0.op",
+      "parameters": 620544
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.3.blocks.0.op.out_norm",
+      "parameters": 3072
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.3.blocks.0.op.in_proj",
+      "parameters": 1179648
+    },
+    {
+      "hazard": null,
+      "kind": "SiLU",
+      "name": "backbone.layers.3.blocks.0.op.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Conv2d",
+      "name": "backbone.layers.3.blocks.0.op.conv2d",
+      "parameters": 13824
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.3.blocks.0.op.out_act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.3.blocks.0.op.out_proj",
+      "parameters": 1179648
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.3.blocks.0.op.dropout",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PiecewiseLinearApproximation",
+      "name": "backbone.layers.3.blocks.0.op._numeric_pwl_softplus",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "DropPath",
+      "name": "backbone.layers.3.blocks.0.drop_path",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.layers.3.blocks.0.norm2",
+      "parameters": 1536
+    },
+    {
+      "hazard": null,
+      "kind": "Mlp",
+      "name": "backbone.layers.3.blocks.0.mlp",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.3.blocks.0.mlp.fc1",
+      "parameters": 2362368
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "backbone.layers.3.blocks.0.mlp.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear2d",
+      "name": "backbone.layers.3.blocks.0.mlp.fc2",
+      "parameters": 2360064
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "backbone.layers.3.blocks.0.mlp.drop",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "backbone.layers.3.downsample",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.outnorm0",
+      "parameters": 192
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.outnorm1",
+      "parameters": 384
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.outnorm2",
+      "parameters": 768
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm2d",
+      "name": "backbone.outnorm3",
+      "parameters": 1536
+    },
+    {
+      "hazard": null,
+      "kind": "MambaTokenHead",
+      "name": "head",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "KeypointMSELoss",
+      "name": "head.loss_module",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "TokenPose_TB_base",
+      "name": "head.tokenpose",
+      "parameters": 16640
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.patch_to_embedding",
+      "parameters": 196864
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.dropout",
+      "parameters": 0
+    },
+    {
+      "hazard": "dynamic top-k",
+      "kind": "PoseInteraction",
+      "name": "head.tokenpose.pose_interaction",
+      "parameters": 1
+    },
+    {
+      "hazard": null,
+      "kind": "Block",
+      "name": "head.tokenpose.pose_interaction.MambaBlock",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Mamba",
+      "name": "head.tokenpose.pose_interaction.MambaBlock.mixer",
+      "parameters": 8704
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.MambaBlock.mixer.in_proj",
+      "parameters": 262144
+    },
+    {
+      "hazard": null,
+      "kind": "Conv1d",
+      "name": "head.tokenpose.pose_interaction.MambaBlock.mixer.conv1d",
+      "parameters": 2560
+    },
+    {
+      "hazard": null,
+      "kind": "SiLU",
+      "name": "head.tokenpose.pose_interaction.MambaBlock.mixer.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.MambaBlock.mixer.x_proj",
+      "parameters": 24576
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.MambaBlock.mixer.dt_proj",
+      "parameters": 8704
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.MambaBlock.mixer.out_proj",
+      "parameters": 131072
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.pose_interaction.MambaBlock.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "head.tokenpose.pose_interaction.MambaBlock.drop_path",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Block",
+      "name": "head.tokenpose.pose_interaction.MambaBlock2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Mamba",
+      "name": "head.tokenpose.pose_interaction.MambaBlock2.mixer",
+      "parameters": 8704
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.MambaBlock2.mixer.in_proj",
+      "parameters": 262144
+    },
+    {
+      "hazard": null,
+      "kind": "Conv1d",
+      "name": "head.tokenpose.pose_interaction.MambaBlock2.mixer.conv1d",
+      "parameters": 2560
+    },
+    {
+      "hazard": null,
+      "kind": "SiLU",
+      "name": "head.tokenpose.pose_interaction.MambaBlock2.mixer.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.MambaBlock2.mixer.x_proj",
+      "parameters": 24576
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.MambaBlock2.mixer.dt_proj",
+      "parameters": 8704
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.MambaBlock2.mixer.out_proj",
+      "parameters": 131072
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.pose_interaction.MambaBlock2.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "head.tokenpose.pose_interaction.MambaBlock2.drop_path",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.pose_interaction.within_dropout",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.pose_interaction.within_norm",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.pose_interaction.within_dropout_2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.pose_interaction.within_norm_2",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "Block",
+      "name": "head.tokenpose.pose_interaction.Mamba_selfScanBlock",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Mamba",
+      "name": "head.tokenpose.pose_interaction.Mamba_selfScanBlock.mixer",
+      "parameters": 8704
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.Mamba_selfScanBlock.mixer.in_proj",
+      "parameters": 262144
+    },
+    {
+      "hazard": null,
+      "kind": "Conv1d",
+      "name": "head.tokenpose.pose_interaction.Mamba_selfScanBlock.mixer.conv1d",
+      "parameters": 2560
+    },
+    {
+      "hazard": null,
+      "kind": "SiLU",
+      "name": "head.tokenpose.pose_interaction.Mamba_selfScanBlock.mixer.act",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.Mamba_selfScanBlock.mixer.x_proj",
+      "parameters": 24576
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.Mamba_selfScanBlock.mixer.dt_proj",
+      "parameters": 8704
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.pose_interaction.Mamba_selfScanBlock.mixer.out_proj",
+      "parameters": 131072
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.pose_interaction.Mamba_selfScanBlock.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "head.tokenpose.pose_interaction.Mamba_selfScanBlock.drop_path",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Transformer",
+      "name": "head.tokenpose.transformer",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "ModuleList",
+      "name": "head.tokenpose.transformer.layers",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "ModuleList",
+      "name": "head.tokenpose.transformer.layers.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.0.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.0.0.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.0.0.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": "attention score and softmax",
+      "kind": "Attention",
+      "name": "head.tokenpose.transformer.layers.0.0.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.0.0.fn.fn.to_qkv",
+      "parameters": 196608
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.0.0.fn.fn.to_out",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.0.0.fn.fn.to_out.0",
+      "parameters": 65792
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.0.0.fn.fn.to_out.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.0.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.0.1.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.0.1.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "FeedForward",
+      "name": "head.tokenpose.transformer.layers.0.1.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.0.1.fn.fn.net",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.0.1.fn.fn.net.0",
+      "parameters": 197376
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "head.tokenpose.transformer.layers.0.1.fn.fn.net.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.0.1.fn.fn.net.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.0.1.fn.fn.net.3",
+      "parameters": 196864
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.0.1.fn.fn.net.4",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "ModuleList",
+      "name": "head.tokenpose.transformer.layers.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.1.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.1.0.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.1.0.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": "attention score and softmax",
+      "kind": "Attention",
+      "name": "head.tokenpose.transformer.layers.1.0.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.1.0.fn.fn.to_qkv",
+      "parameters": 196608
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.1.0.fn.fn.to_out",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.1.0.fn.fn.to_out.0",
+      "parameters": 65792
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.1.0.fn.fn.to_out.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.1.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.1.1.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.1.1.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "FeedForward",
+      "name": "head.tokenpose.transformer.layers.1.1.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.1.1.fn.fn.net",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.1.1.fn.fn.net.0",
+      "parameters": 197376
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "head.tokenpose.transformer.layers.1.1.fn.fn.net.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.1.1.fn.fn.net.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.1.1.fn.fn.net.3",
+      "parameters": 196864
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.1.1.fn.fn.net.4",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "ModuleList",
+      "name": "head.tokenpose.transformer.layers.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.2.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.2.0.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.2.0.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": "attention score and softmax",
+      "kind": "Attention",
+      "name": "head.tokenpose.transformer.layers.2.0.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.2.0.fn.fn.to_qkv",
+      "parameters": 196608
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.2.0.fn.fn.to_out",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.2.0.fn.fn.to_out.0",
+      "parameters": 65792
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.2.0.fn.fn.to_out.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.2.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.2.1.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.2.1.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "FeedForward",
+      "name": "head.tokenpose.transformer.layers.2.1.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.2.1.fn.fn.net",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.2.1.fn.fn.net.0",
+      "parameters": 197376
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "head.tokenpose.transformer.layers.2.1.fn.fn.net.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.2.1.fn.fn.net.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.2.1.fn.fn.net.3",
+      "parameters": 196864
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.2.1.fn.fn.net.4",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "ModuleList",
+      "name": "head.tokenpose.transformer.layers.3",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.3.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.3.0.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.3.0.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": "attention score and softmax",
+      "kind": "Attention",
+      "name": "head.tokenpose.transformer.layers.3.0.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.3.0.fn.fn.to_qkv",
+      "parameters": 196608
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.3.0.fn.fn.to_out",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.3.0.fn.fn.to_out.0",
+      "parameters": 65792
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.3.0.fn.fn.to_out.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.3.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.3.1.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.3.1.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "FeedForward",
+      "name": "head.tokenpose.transformer.layers.3.1.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.3.1.fn.fn.net",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.3.1.fn.fn.net.0",
+      "parameters": 197376
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "head.tokenpose.transformer.layers.3.1.fn.fn.net.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.3.1.fn.fn.net.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.3.1.fn.fn.net.3",
+      "parameters": 196864
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.3.1.fn.fn.net.4",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "ModuleList",
+      "name": "head.tokenpose.transformer.layers.4",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.4.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.4.0.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.4.0.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": "attention score and softmax",
+      "kind": "Attention",
+      "name": "head.tokenpose.transformer.layers.4.0.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.4.0.fn.fn.to_qkv",
+      "parameters": 196608
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.4.0.fn.fn.to_out",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.4.0.fn.fn.to_out.0",
+      "parameters": 65792
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.4.0.fn.fn.to_out.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.4.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.4.1.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.4.1.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "FeedForward",
+      "name": "head.tokenpose.transformer.layers.4.1.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.4.1.fn.fn.net",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.4.1.fn.fn.net.0",
+      "parameters": 197376
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "head.tokenpose.transformer.layers.4.1.fn.fn.net.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.4.1.fn.fn.net.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.4.1.fn.fn.net.3",
+      "parameters": 196864
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.4.1.fn.fn.net.4",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "ModuleList",
+      "name": "head.tokenpose.transformer.layers.5",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.5.0",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.5.0.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.5.0.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": "attention score and softmax",
+      "kind": "Attention",
+      "name": "head.tokenpose.transformer.layers.5.0.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.5.0.fn.fn.to_qkv",
+      "parameters": 196608
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.5.0.fn.fn.to_out",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.5.0.fn.fn.to_out.0",
+      "parameters": 65792
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.5.0.fn.fn.to_out.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Residual",
+      "name": "head.tokenpose.transformer.layers.5.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "PreNorm",
+      "name": "head.tokenpose.transformer.layers.5.1.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.transformer.layers.5.1.fn.norm",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "FeedForward",
+      "name": "head.tokenpose.transformer.layers.5.1.fn.fn",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.transformer.layers.5.1.fn.fn.net",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.5.1.fn.fn.net.0",
+      "parameters": 197376
+    },
+    {
+      "hazard": null,
+      "kind": "GELU",
+      "name": "head.tokenpose.transformer.layers.5.1.fn.fn.net.1",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.5.1.fn.fn.net.2",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.transformer.layers.5.1.fn.fn.net.3",
+      "parameters": 196864
+    },
+    {
+      "hazard": null,
+      "kind": "Dropout",
+      "name": "head.tokenpose.transformer.layers.5.1.fn.fn.net.4",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Identity",
+      "name": "head.tokenpose.to_keypoint_token",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "Sequential",
+      "name": "head.tokenpose.mlp_head",
+      "parameters": 0
+    },
+    {
+      "hazard": null,
+      "kind": "LayerNorm",
+      "name": "head.tokenpose.mlp_head.0",
+      "parameters": 512
+    },
+    {
+      "hazard": null,
+      "kind": "Linear",
+      "name": "head.tokenpose.mlp_head.1",
+      "parameters": 789504
+    }
+  ],
+  "output_shapes": [
+    1,
+    17,
+    64,
+    48
+  ],
+  "parameters": {
+    "by_prefix": {
+      "backbone": 15763872,
+      "head": 6265345
+    },
+    "bytes_by_dtype": {
+      "torch.float32": 88116868
+    },
+    "total": 22029217,
+    "trainable": 22016929
+  },
+  "parent": {
+    "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+    "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+    "config": "configs/optimization/numeric/pwl_softplus.py"
+  },
+  "pwl_stage_a": {
+    "path": "work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/smoke-stage-a/smoke.json",
+    "sha256": "6dcb4b8b52defd7fe4d087fd79b067d1651d1bf456fb9392b86be6df1ed6a666"
+  },
+  "runtime": {
+    "checkpoint": {
+      "path": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2"
+    },
+    "config": {
+      "path": "work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/convert/resolved-runtime.py",
+      "sha256": "04ad735e5a4217ff0192c1824e4b54f278b56592b0f78a00bdbffea513d96f83"
+    }
+  },
+  "schema_version": 2,
+  "source": {
+    "authority_path": "optimization/coco_train2017_authority.json",
+    "authority_sha256": "553fead03ae77990049e6ae87fb45d6afa999aec8f4d9a2b7f40c7f6d5255d3a",
+    "candidate_id": "pwl-softplus-s-v1",
+    "candidate_row_sha256": "0d1a587b8b91dd48f559dcb8fe7f0f2cf101341ba3e36a98520be67468e759fe",
+    "checkpoint_path": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+    "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+    "config_path": "configs/optimization/numeric/pwl_softplus.py",
+    "config_sha256": "60ec03d3f74520e20694901ff257ee6a3ea8902460f7c34cffe2c189dc1595d3",
+    "git_commit": "f71fcff33bebe32241d0825eb2b736605a926183",
+    "manifest_path": "optimization/candidates.json",
+    "manifest_sha256": "f5d5e02bd085637e952b7c7f96c28b91957434099211360af25fbf4c19faf30e",
+    "policy_path": "configs/optimization/numeric/pwl_softplus.py",
+    "policy_sha256": "60ec03d3f74520e20694901ff257ee6a3ea8902460f7c34cffe2c189dc1595d3"
+  }
+}

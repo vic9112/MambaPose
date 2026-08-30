@@ -65,6 +65,31 @@ def _validate_pwl_stage_a_binding(
     return normalized
 
 
+def _validate_comparison_binding(
+        value: object, *, expected: Mapping[str, str] | None,
+        ) -> dict[str, str] | None:
+    if value is None and expected is None:
+        return None
+    if (not isinstance(value, Mapping)
+            or set(value) != {'path', 'sha256'}
+            or not isinstance(value.get('sha256'), str)
+            or not _SHA256.fullmatch(value['sha256'])):
+        raise MetricError('combined comparison binding is invalid')
+    try:
+        relative = canonical_relative_path(
+            value.get('path'), label='combined comparison')
+    except ValueError as error:
+        raise MetricError(str(error)) from error
+    if (relative.parts[:2] != ('work_dirs', 'optimization')
+            or relative.name != 'compare.json'
+            or relative.parent.name != 'compare'):
+        raise MetricError('combined comparison path is not canonical')
+    normalized = {'path': relative.as_posix(), 'sha256': value['sha256']}
+    if expected is None or normalized != dict(expected):
+        raise MetricError('combined comparison binding mismatch')
+    return normalized
+
+
 _COCO_ANNOTATION = 'data/coco/annotations/person_keypoints_val2017.json'
 _COCO_DETECTIONS = (
     'data/coco/person_detection_results/'
@@ -1266,6 +1291,7 @@ class CandidateResult:
     latency: Mapping[str, Any] | None
     gpu_lease: Mapping[str, Any] | None
     pwl_stage_a: Mapping[str, str] | None
+    comparison: Mapping[str, str] | None
     artifact_paths: Mapping[str, Path]
     evaluation_artifact: Path
 
@@ -1366,6 +1392,20 @@ class CandidateResult:
         gpu_lease: Mapping[str, Any] | None = None
         artifact_paths: dict[str, Path] = {'evaluation': path.resolve()}
         latency_path = root / 'latency/latency.json'
+        if candidate.features.get('numeric_kind') == 'pwl-combined':
+            try:
+                from .combined_comparison import (
+                    load_combined_comparison_binding)
+                expected_comparison = load_combined_comparison_binding(
+                    candidate, repository_root=repository_root,
+                    manifest_path=repository_root / source['manifest_path'],
+                    downstream_output=latency_path)
+            except (OSError, ValueError) as error:
+                raise MetricError(
+                    f'combined comparison authority is invalid: {error}') \
+                    from error
+        else:
+            expected_comparison = None
         profile = _load_profile(
             profile_path, candidate_id=candidate_id,
             provenance=provenance,
@@ -1379,7 +1419,8 @@ class CandidateResult:
             latency_path, candidate_id=candidate_id, route=route,
             provenance=provenance, source=source,
             expected_runtime=expected_runtime, authority=authority,
-            expected_pwl_stage_a=expected_pwl_stage_a)
+            expected_pwl_stage_a=expected_pwl_stage_a,
+            expected_comparison=expected_comparison)
         if (
                 profile['schema_version'] == 2
                 and profile['device']['physical_index'] !=
@@ -1421,6 +1462,14 @@ class CandidateResult:
                 raise MetricError(
                     'PWL Stage-A smoke binding differs across artifacts')
             artifact_paths['pwl_stage_a'] = smoke_path.resolve()
+        if expected_comparison is not None:
+            comparison_path = repository_root / expected_comparison['path']
+            if (latency.get('comparison') != expected_comparison
+                    or _file_sha256(comparison_path) !=
+                    expected_comparison['sha256']):
+                raise MetricError(
+                    'combined comparison differs across terminal artifacts')
+            artifact_paths['comparison'] = comparison_path.resolve()
         try:
             for artifact in artifact_paths.values():
                 artifact.relative_to(root.resolve())
@@ -1441,6 +1490,9 @@ class CandidateResult:
             pwl_stage_a=(
                 _freeze(expected_pwl_stage_a)
                 if expected_pwl_stage_a is not None else None),
+            comparison=(
+                _freeze(expected_comparison)
+                if expected_comparison is not None else None),
             artifact_paths=MappingProxyType(artifact_paths),
             evaluation_artifact=path.resolve(),
         )
@@ -1572,6 +1624,7 @@ def _load_latency(
         provenance: Mapping[str, str], source: Mapping[str, str],
         expected_runtime: Mapping[str, Any], authority: Mapping[str, Any],
         expected_pwl_stage_a: Mapping[str, str] | None = None,
+        expected_comparison: Mapping[str, str] | None = None,
         ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     try:
         envelope = json.loads(path.read_text(encoding='utf-8'))
@@ -1590,7 +1643,8 @@ def _load_latency(
         expected_source_binding=source,
         expected_authority=authority,
         require_source_binding=True,
-        expected_pwl_stage_a=expected_pwl_stage_a)
+        expected_pwl_stage_a=expected_pwl_stage_a,
+        expected_comparison=expected_comparison)
     return validated, validated['gpu_lease']
 
 
@@ -1609,6 +1663,7 @@ def validate_latency_envelope(
         expected_authority: Mapping[str, Any] | None = None,
         require_source_binding: bool = False,
         expected_pwl_stage_a: Mapping[str, str] | None = None,
+        expected_comparison: Mapping[str, str] | None = None,
         ) -> Mapping[str, Any]:
     """Validate the one formal dual-mode latency stage envelope."""
     if (
@@ -1624,16 +1679,14 @@ def validate_latency_envelope(
     if expected_candidate_id is not None and candidate_id != expected_candidate_id:
         raise MetricError('latency candidate identity mismatch')
     result = envelope['result']
+    base_result_fields = {
+        'route', 'provenance', 'protocol', 'modes', 'gpu_lease'}
+    optional_result_fields = {'source', 'pwl_stage_a', 'comparison'}
     if (
             not isinstance(result, Mapping)
-            or set(result) not in ({
-                'route', 'provenance', 'protocol', 'modes', 'gpu_lease',
-                'source'}, {
-                'route', 'provenance', 'protocol', 'modes', 'gpu_lease'}, {
-                'route', 'provenance', 'protocol', 'modes', 'gpu_lease',
-                'source', 'pwl_stage_a'}, {
-                'route', 'provenance', 'protocol', 'modes', 'gpu_lease',
-                'pwl_stage_a'})
+            or not base_result_fields.issubset(result)
+            or not set(result).issubset(
+                base_result_fields | optional_result_fields)
             or not isinstance(result['route'], str)
             or not result['route']):
         raise MetricError('latency artifact provenance or route mismatch')
@@ -1648,6 +1701,8 @@ def validate_latency_envelope(
             raise MetricError('latency source manifest binding mismatch')
     pwl_stage_a = _validate_pwl_stage_a_binding(
         result.get('pwl_stage_a'), expected=expected_pwl_stage_a)
+    _validate_comparison_binding(
+        result.get('comparison'), expected=expected_comparison)
     if expected_route is not None and result['route'] != expected_route:
         raise MetricError('latency artifact provenance or route mismatch')
     latency_provenance = validate_provenance(result['provenance'])

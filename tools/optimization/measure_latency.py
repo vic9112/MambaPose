@@ -209,6 +209,14 @@ def measure_candidate(
     runtime = resolve_numeric_runtime(
         candidate, repository_root=REPO_ROOT, manifest_path=manifest,
         downstream_output=downstream_output)
+    if candidate.features.get('numeric_kind') == 'pwl-combined':
+        from mambapose_opt.combined_comparison import (
+            load_combined_comparison_binding)
+        comparison = load_combined_comparison_binding(
+            candidate, repository_root=REPO_ROOT, manifest_path=manifest,
+            downstream_output=downstream_output)
+    else:
+        comparison = None
     checkpoint = runtime['checkpoint_path']
     config_path = runtime['config_path']
     admission = _latency_admission(
@@ -282,6 +290,8 @@ def measure_candidate(
     })
     if candidate.features.get('numeric_kind') in {'pwl', 'pwl-combined'}:
         result['pwl_stage_a'] = dict(runtime['pwl_stage_a'])
+    if comparison is not None:
+        result['comparison'] = comparison
     result['protocol']['data'] = data_protocol
     result['protocol'].update({
         'source_config': config_path.relative_to(REPO_ROOT).as_posix(),

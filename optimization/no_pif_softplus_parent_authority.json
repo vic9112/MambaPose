@@ -25,7 +25,14 @@
     "candidate_id": "full-s-v1",
     "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
     "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
-    "config": "configs/reproduction/coco_s_v1.py"
+    "config": "configs/reproduction/coco_s_v1.py",
+    "config_sha256": "7aa78c2b8394b57b16517380a479adb5c3b3161cadb802c26c2d2f66583a6b34",
+    "evaluation_artifact": {
+      "path": "optimization/evidence_snapshots/no_pif_softplus/full-s-v1-evaluate.json",
+      "sha256": "aab31a0bf41b7aa62c379e99c3818626705b95d01c07acf04c0adb26fefd4e5d"
+    },
+    "evaluation_candidate_id": "full-s-v1-frozen-r1",
+    "source_commit": "a6adf6d84f9b51b133b0fca7272c51f728bfb7ac"
   },
   "parents": {
     "no_pif": {
@@ -44,11 +51,30 @@
       "config": "configs/optimization/numeric/pwl_softplus.py",
       "config_sha256": "60ec03d3f74520e20694901ff257ee6a3ea8902460f7c34cffe2c189dc1595d3",
       "isolated_evidence": {
-        "evaluate_artifact_sha256": "1726918fdd96402698b6b4d7b1ac347a45491d6df19a41631ff1ccdba908887e",
-        "flip_ap": 72.84823479948885,
-        "no_flip_ap": 72.2877400382553,
-        "selection_artifact_sha256": "be8e07f4b65dcc95137c7357e7621192aff5252ef5a0ebd0888dbed3d7bb23e8",
-        "smoke_artifact_sha256": "6dcb4b8b52defd7fe4d087fd79b067d1651d1bf456fb9392b86be6df1ed6a666"
+        "selection": {
+          "path": "optimization/evidence_snapshots/no_pif_softplus/v6-selection.json",
+          "sha256": "be8e07f4b65dcc95137c7357e7621192aff5252ef5a0ebd0888dbed3d7bb23e8"
+        },
+        "installation": {
+          "path": "optimization/evidence_snapshots/no_pif_softplus/v6-installation.json",
+          "sha256": "0e8ecc484397922cc8b21326ca6581ffc042511a37d71db656d7a757ae7363ad"
+        },
+        "smoke": {
+          "path": "optimization/evidence_snapshots/no_pif_softplus/v6-smoke.json",
+          "sha256": "6dcb4b8b52defd7fe4d087fd79b067d1651d1bf456fb9392b86be6df1ed6a666"
+        },
+        "evaluate": {
+          "path": "optimization/evidence_snapshots/no_pif_softplus/v6-evaluate.json",
+          "sha256": "1726918fdd96402698b6b4d7b1ac347a45491d6df19a41631ff1ccdba908887e"
+        },
+        "profile": {
+          "path": "optimization/evidence_snapshots/no_pif_softplus/v6-profile.json",
+          "sha256": "90c57b724e33bb685d39bc18a10f2a80be468081a48311eb9ec6515ee959c600"
+        },
+        "latency": {
+          "path": "optimization/evidence_snapshots/no_pif_softplus/v6-latency.json",
+          "sha256": "e07516e26aa4c4eb2469836c8b6653f9cefcf042677084632c19affbf084fc94"
+        }
       },
       "role": "function-policy-and-isolated-evidence-parent",
       "source_commit": "f71fcff33bebe32241d0825eb2b736605a926183"

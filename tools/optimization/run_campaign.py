@@ -187,6 +187,15 @@ class SubprocessStageRunner:
                 candidate.id, '--manifest', str(self.manifest_path),
                 '--output', self._relative(artifact),
             ]
+        if (stage == 'compare'
+                and candidate.features.get('numeric_kind') == 'pwl-combined'):
+            return [
+                python,
+                str(REPO_ROOT /
+                    'tools/optimization/compare_combined_candidate.py'),
+                candidate.id, '--manifest', str(self.manifest_path),
+                '--output', self._relative(artifact),
+            ]
         tool = {
             'calibrate': 'calibrate_candidate.py',
             'train': 'train_candidate.py',

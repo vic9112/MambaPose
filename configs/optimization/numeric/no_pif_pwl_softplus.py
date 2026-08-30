@@ -41,4 +41,4 @@ numeric_optimization = dict(
     attention_softmax='exact-floating',
     stage_order=(
         'calibrate', 'convert', 'smoke-stage-a', 'profile', 'evaluate',
-        'latency'))
+        'compare', 'latency'))

@@ -1,0 +1,103 @@
+{
+  "candidate_id": "pwl-softplus-s-v1",
+  "result": {
+    "gpu_lease": {
+      "allowed_pids": [
+        1610691
+      ],
+      "boot_id": "927c7e8b-1730-426b-9e2d-87ea4ec21559",
+      "device_index": 0,
+      "lease_id": "11e22b98012e9e89b3ac90e37a6573beaea97bdb0aa6a2140296e92a6817a8c2",
+      "pid": 1610691,
+      "stage_id": "pwl-softplus-s-v1:latency",
+      "timestamp": "2026-08-30T15:11:43.282270+00:00"
+    },
+    "modes": {
+      "flip": {
+        "median_ms": 28.165263175964355,
+        "p90_ms": 32.852470779418944,
+        "p95_ms": 34.584913063049314,
+        "sample_count": 200
+      },
+      "no_flip": {
+        "median_ms": 26.55030345916748,
+        "p90_ms": 31.047415161132815,
+        "p95_ms": 32.07975120544434,
+        "sample_count": 200
+      }
+    },
+    "protocol": {
+      "batch_size": 1,
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "data": {
+        "annotation_authority_sha256": "788e2dae83c86bd547be7fab269d6399df5671063d29a61360cdb2cc370d2b14",
+        "annotation_image_count": 5000,
+        "annotation_record_count": 11004,
+        "annotation_sha256": "788e2dae83c86bd547be7fab269d6399df5671063d29a61360cdb2cc370d2b14",
+        "authority_annotation_count": 11004,
+        "authority_detection_count": 104125,
+        "authority_image_count": 5000,
+        "authority_path": "optimization/coco_val2017_authority.json",
+        "authority_sha256": "5d5945c35f9bf59d2ff537c088dad3119ae9d7e5ead0b51a641b20667c8c9edb",
+        "complete_split": true,
+        "dataset": "coco",
+        "detection_authority_sha256": "53ba0ad8d0fd461c5a000cd90797fa8c39cd8c38cd125125c0412626ff592d59",
+        "detection_record_count": 104125,
+        "detection_sha256": "53ba0ad8d0fd461c5a000cd90797fa8c39cd8c38cd125125c0412626ff592d59",
+        "image_corpus_authority_sha256": "af63eef4b4bf35f39406462ec147f9411b203f99f7de47ebb0bccaecf8b86b68",
+        "image_corpus_digest_algorithm": "sha256-filename-size-content-v1",
+        "image_corpus_sha256": "af63eef4b4bf35f39406462ec147f9411b203f99f7de47ebb0bccaecf8b86b68",
+        "inventory_annotation_archive_sha256": "113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268",
+        "inventory_authority_sha256": "2a82ab3cfe05a514d141c17921463e72f22741d67eaf978d93317155bbeaf0ed",
+        "inventory_detection_sha256": "53ba0ad8d0fd461c5a000cd90797fa8c39cd8c38cd125125c0412626ff592d59",
+        "inventory_image_archive_sha256": "4f7e2ccb2866ec5041993c9cf2a952bbed69647b115d0f74da7ce8f4bef82f05",
+        "inventory_projection": {
+          "annotation_asset_id": "coco-annotations",
+          "annotation_declared_sha256": "113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268",
+          "annotation_observed_archive_sha256": "113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268",
+          "detection_asset_id": "coco-val-detections",
+          "detection_declared_sha256": "53ba0ad8d0fd461c5a000cd90797fa8c39cd8c38cd125125c0412626ff592d59",
+          "detection_observed_sha256": "53ba0ad8d0fd461c5a000cd90797fa8c39cd8c38cd125125c0412626ff592d59",
+          "image_asset_id": "coco-val2017",
+          "image_declared_sha256": "4f7e2ccb2866ec5041993c9cf2a952bbed69647b115d0f74da7ce8f4bef82f05",
+          "image_observed_archive_sha256": "4f7e2ccb2866ec5041993c9cf2a952bbed69647b115d0f74da7ce8f4bef82f05",
+          "inventory_path": "data/inventory.json",
+          "inventory_sha256": "2a82ab3cfe05a514d141c17921463e72f22741d67eaf978d93317155bbeaf0ed"
+        },
+        "split": "val2017",
+        "verified_image_count": 5000
+      },
+      "data_inventory": "data/inventory.json",
+      "iterations": 200,
+      "lease_max_age_seconds": 300,
+      "lease_max_future_skew_seconds": 30,
+      "scope": "full_topdown_model",
+      "source_config": "work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/convert/resolved-runtime.py",
+      "synchronize": true,
+      "timer": "torch.cuda.Event",
+      "warmup": 50
+    },
+    "provenance": {
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "config_sha256": "04ad735e5a4217ff0192c1824e4b54f278b56592b0f78a00bdbffea513d96f83",
+      "data_inventory_sha256": "2a82ab3cfe05a514d141c17921463e72f22741d67eaf978d93317155bbeaf0ed",
+      "git_commit": "f71fcff33bebe32241d0825eb2b736605a926183"
+    },
+    "pwl_stage_a": {
+      "path": "work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/smoke-stage-a/smoke.json",
+      "sha256": "6dcb4b8b52defd7fe4d087fd79b067d1651d1bf456fb9392b86be6df1ed6a666"
+    },
+    "route": "ssm-quant-pwl",
+    "source": {
+      "authority_path": "optimization/coco_val2017_authority.json",
+      "authority_sha256": "5d5945c35f9bf59d2ff537c088dad3119ae9d7e5ead0b51a641b20667c8c9edb",
+      "config_path": "configs/optimization/numeric/pwl_softplus.py",
+      "config_sha256": "60ec03d3f74520e20694901ff257ee6a3ea8902460f7c34cffe2c189dc1595d3",
+      "git_commit": "f71fcff33bebe32241d0825eb2b736605a926183",
+      "manifest_path": "optimization/candidates.json",
+      "manifest_sha256": "f5d5e02bd085637e952b7c7f96c28b91957434099211360af25fbf4c19faf30e"
+    }
+  },
+  "schema_version": 1,
+  "stage": "latency"
+}
