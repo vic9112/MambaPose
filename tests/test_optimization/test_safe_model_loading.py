@@ -469,6 +469,7 @@ def test_test_cli_injects_safe_model_and_disables_runner_checkpoint(
     manifest = tmp_path / 'candidates.json'
     manifest.write_text('{}\n', encoding='utf-8')
     model = _ToyModel()
+    model.data_preprocessor = torch.nn.Identity()
     captured = {}
     authority_path = tmp_path / 'config-authority.json'
     authority_path.write_text('{}\n', encoding='utf-8')
@@ -500,19 +501,18 @@ def test_test_cli_injects_safe_model_and_disables_runner_checkpoint(
         materialized_config_path, device:
         model)
 
-    class FakeRunner:
-        def register_hook(self, *_args, **_kwargs):
-            raise AssertionError('no output hook expected')
+    def runner_init(self, model, *, cfg, load_from, **_kwargs):
+        captured['load_from'] = load_from
+        captured['pretty_text'] = cfg.pretty_text
+        captured['config_model'] = cfg.model.to_dict()
+        self.model = self.build_model(model)
 
-        def test(self):
-            captured['tested'] = True
+    def runner_test(self):
+        captured['tested'] = True
+        captured['runner_model'] = self.model
 
-    def from_cfg(config):
-        captured['load_from'] = config.load_from
-        captured['model'] = config.model
-        return FakeRunner()
-
-    monkeypatch.setattr(tool.Runner, 'from_cfg', from_cfg)
+    monkeypatch.setattr(tool.Runner, '__init__', runner_init)
+    monkeypatch.setattr(tool.Runner, 'test', runner_test)
     monkeypatch.setattr(sys, 'argv', [
         'tools/test.py', str(config_path), str(checkpoint),
         '--safe-manifest', str(manifest),
@@ -521,8 +521,12 @@ def test_test_cli_injects_safe_model_and_disables_runner_checkpoint(
 
     tool.main()
 
-    assert captured == {
-        'load_from': None, 'model': model, 'tested': True, 'verified': 1}
+    assert captured['load_from'] is None
+    assert captured['config_model'] == {'type': 'Fixture'}
+    assert "model = dict(type='Fixture')" in captured['pretty_text']
+    assert captured['runner_model'] is model
+    assert captured['tested'] is True
+    assert captured['verified'] == 1
 
 
 def test_test_cli_postverifies_materialized_config_after_runner(
