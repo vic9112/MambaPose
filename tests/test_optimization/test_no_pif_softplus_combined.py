@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
-import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -380,6 +383,277 @@ def test_audit_cli_routes_model_noise_to_stderr(monkeypatch, capsys):
     assert json.loads(captured.out) == {
         'candidate_id': COMBINED_ID, 'schema_version': 1}
     assert 'model construction noise' in captured.err
+
+
+def _portable_combined_result_fixture(tmp_path, monkeypatch):
+    from mambapose_opt.evaluation import build_source_binding
+    from mambapose_opt.schema import load_candidate_manifest
+    from tools.optimization import compare_combined_candidate as compare_tool
+
+    repository = tmp_path / 'portable-checkout'
+    subprocess.run([
+        'git', 'clone', '-q', '--shared', str(REPOSITORY_ROOT),
+        str(repository),
+    ], check=True)
+    assert not (repository / '.worktrees').exists()
+    manifest = repository / 'optimization/candidates.json'
+    candidate = next(
+        item for item in load_candidate_manifest(manifest)
+        if item.id == COMBINED_ID)
+    commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=repository,
+        text=True).strip()
+    source = build_source_binding(
+        repository_root=repository, candidate=candidate,
+        manifest_path=manifest, git_commit=commit)
+    root = (
+        repository / 'work_dirs/optimization' / candidate.route /
+        candidate.id / str(candidate.seed))
+    runtime_config = root / 'convert/resolved-runtime.py'
+    runtime_config.parent.mkdir(parents=True)
+    runtime_config.write_text('# authorized combined runtime fixture\n')
+    smoke_path = root / 'smoke-stage-a/smoke.json'
+    smoke_path.parent.mkdir(parents=True)
+    shutil.copy2(
+        repository /
+        'optimization/evidence_snapshots/no_pif_softplus/v6-smoke.json',
+        smoke_path)
+    def file_hash(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    smoke = {
+        'path': smoke_path.relative_to(repository).as_posix(),
+        'sha256': file_hash(smoke_path),
+    }
+    runtime = {
+        'config_path': runtime_config,
+        'config_sha256': file_hash(runtime_config),
+        'checkpoint_path': repository / candidate.checkpoint,
+        'checkpoint_name': candidate.checkpoint.as_posix(),
+        'checkpoint_sha256': candidate.checkpoint_sha256,
+        'pwl_stage_a': smoke,
+    }
+    monkeypatch.setattr(
+        'mambapose_opt.numeric_runtime.resolve_numeric_runtime',
+        lambda *_args, **_kwargs: copy.deepcopy(runtime))
+    monkeypatch.setattr(
+        'mambapose_opt.numeric_source.validate_numeric_source_binding',
+        lambda value, **_kwargs: copy.deepcopy(value))
+    monkeypatch.setattr(compare_tool, 'REPOSITORY_ROOT', repository)
+
+    full = json.loads((
+        repository /
+        'optimization/evidence_snapshots/no_pif_softplus/'
+        'full-s-v1-evaluate.json').read_text())
+    modes = {}
+    for mode in ('flip', 'no_flip'):
+        row = copy.deepcopy(full['result']['modes'][mode])
+        row['metrics'] = {
+            name: (value + 0.02 if name != 'unit' else value)
+            for name, value in row['metrics'].items()
+        }
+        row['provenance'].update({
+            'checkpoint_sha256': candidate.checkpoint_sha256,
+            'config_sha256': runtime['config_sha256'],
+            'git_commit': commit,
+        })
+        row['determinism']['provenance'] = dict(row['provenance'])
+        row['protocol'].update({
+            'source_config': runtime_config.relative_to(
+                repository).as_posix(),
+            'checkpoint': candidate.checkpoint.as_posix(),
+        })
+        modes[mode] = row
+    evaluation = {
+        'schema_version': 1,
+        'candidate_id': candidate.id,
+        'stage': 'evaluate',
+        'result': {
+            'route': candidate.route,
+            'calibration_split': None,
+            'modes': modes,
+            'source': source,
+            'pwl_stage_a': smoke,
+        },
+    }
+    evaluation_path = root / 'evaluate/evaluate.json'
+    evaluation_path.parent.mkdir()
+    evaluation_path.write_text(json.dumps(evaluation))
+    compare_path = root / 'compare/compare.json'
+    comparison = compare_tool.compare(
+        candidate.id, manifest_path=manifest, output=compare_path)
+
+    numeric_source = {'fixture': 'authorized-numeric-source'}
+    profile_path = root / 'profile/profile.json'
+    profile_path.parent.mkdir()
+    profile_path.write_text(json.dumps({
+        'schema_version': 2,
+        'git_commit': commit,
+        'candidate': candidate.id,
+        'config': runtime_config.relative_to(repository).as_posix(),
+        'checkpoint': candidate.checkpoint.as_posix(),
+        'checkpoint_sha256': candidate.checkpoint_sha256,
+        'device': {'logical': 'cuda:0', 'physical_index': 0, 'kind': 'cuda'},
+        'parent': {
+            'config': candidate.config.as_posix(),
+            'checkpoint': candidate.checkpoint.as_posix(),
+            'checkpoint_sha256': candidate.checkpoint_sha256,
+        },
+        'runtime': {
+            'config': {
+                'path': runtime_config.relative_to(repository).as_posix(),
+                'sha256': runtime['config_sha256']},
+            'checkpoint': {
+                'path': candidate.checkpoint.as_posix(),
+                'sha256': candidate.checkpoint_sha256},
+        },
+        'source': numeric_source,
+        'pwl_stage_a': smoke,
+        'input_shapes': [1, 3, 256, 192],
+        'output_shapes': [1, 17, 64, 48],
+        'parameters': {
+            'total': 10, 'trainable': 9,
+            'bytes_by_dtype': {'torch.float32': 40},
+            'by_prefix': {'backbone': 7, 'head': 3}},
+        'modules': [{
+            'name': '', 'kind': 'CombinedFixture', 'parameters': 10,
+            'hazard': None}],
+    }))
+    comparison_binding = {
+        'path': compare_path.relative_to(repository).as_posix(),
+        'sha256': file_hash(compare_path),
+    }
+    evaluation_protocol = modes['flip']['protocol']
+    latency_data = copy.deepcopy(evaluation_protocol)
+    for field in ('batch_size', 'source_config', 'checkpoint',
+                  'data_inventory'):
+        latency_data.pop(field)
+    summary = {
+        'median_ms': 1.0, 'p90_ms': 1.2, 'p95_ms': 1.3,
+        'sample_count': 200,
+    }
+    latency_path = root / 'latency/latency.json'
+    latency_path.parent.mkdir()
+    latency_path.write_text(json.dumps({
+        'schema_version': 1,
+        'candidate_id': candidate.id,
+        'stage': 'latency',
+        'result': {
+            'route': candidate.route,
+            'source': source,
+            'provenance': {
+                'checkpoint_sha256': candidate.checkpoint_sha256,
+                'config_sha256': runtime['config_sha256'],
+                'data_inventory_sha256': modes['flip']['provenance'][
+                    'data_inventory_sha256'],
+                'git_commit': commit,
+            },
+            'protocol': {
+                'batch_size': 1, 'warmup': 50, 'iterations': 200,
+                'timer': 'torch.cuda.Event', 'synchronize': True,
+                'scope': 'full_topdown_model',
+                'lease_max_age_seconds': 300,
+                'lease_max_future_skew_seconds': 30,
+                'source_config': runtime_config.relative_to(
+                    repository).as_posix(),
+                'checkpoint': candidate.checkpoint.as_posix(),
+                'data_inventory': evaluation_protocol['data_inventory'],
+                'data': latency_data,
+            },
+            'modes': {'flip': summary, 'no_flip': summary},
+            'gpu_lease': {
+                'stage_id': f'{candidate.id}:latency',
+                'pid': os.getpid(),
+                'boot_id': '11111111-1111-1111-1111-111111111111',
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'device_index': 0,
+                'allowed_pids': [os.getpid()],
+                'lease_id': '7' * 64,
+            },
+            'pwl_stage_a': smoke,
+            'comparison': comparison_binding,
+        },
+    }))
+    monkeypatch.setattr(
+        'mambapose_opt.evaluation._TRUSTED_REPOSITORY_ROOT', repository)
+    return {
+        'repository': repository, 'manifest': manifest,
+        'candidate': candidate, 'root': root,
+        'compare_path': compare_path, 'comparison': comparison,
+        'comparison_binding': comparison_binding,
+        'latency_path': latency_path,
+    }
+
+
+def test_real_combined_controller_compare_chain_and_mutations_fail_closed(
+        tmp_path, monkeypatch):
+    from mambapose_opt.combined_comparison import (
+        CombinedComparisonError, load_combined_comparison_binding)
+    from mambapose_opt.controller import (
+        OptimizationController, StageOutcome)
+    from mambapose_opt.evaluation import CandidateResult, MetricError
+
+    fixture = _portable_combined_result_fixture(tmp_path, monkeypatch)
+
+    def runner(candidate, stage, stage_dir, attempt):
+        assert candidate == fixture['candidate']
+        assert stage == 'compare'
+        assert stage_dir == fixture['compare_path'].parent
+        digest = hashlib.sha256(fixture['compare_path'].read_bytes()).hexdigest()
+        return StageOutcome(
+            stage_id=f'{candidate.id}:compare', stage='compare',
+            candidate_id=candidate.id, exit_code=0,
+            fingerprint='portable-combined-compare', artifacts_valid=True,
+            artifacts=(fixture['compare_path'],),
+            artifact_sha256={str(fixture['compare_path']): digest},
+            attempt=attempt)
+
+    monkeypatch.setattr(
+        'mambapose_opt.controller.authorize_manifest_candidate',
+        lambda *_args, **_kwargs: SimpleNamespace(
+            candidate=fixture['candidate']))
+    controller = OptimizationController(
+        fixture['repository'] / 'work_dirs/optimization',
+        fixture['candidate'], runner,
+        repository_root=fixture['repository'],
+        manifest_path=fixture['manifest'], stages=('compare',))
+    outcome = controller.run_next()
+    assert outcome.exit_code == 0
+    assert outcome.artifact_evidence == ({
+        'path': fixture['compare_path'].relative_to(
+            controller.root).as_posix(),
+        'sha256': fixture['comparison_binding']['sha256'],
+        'schema': 'combined-full-comparison-v1',
+    },)
+    assert load_combined_comparison_binding(
+        fixture['candidate'], repository_root=fixture['repository'],
+        manifest_path=fixture['manifest'],
+        downstream_output=fixture['latency_path']) == (
+            fixture['comparison_binding'])
+    result = CandidateResult.from_artifacts(fixture['root'])
+    assert result.comparison == fixture['comparison_binding']
+    assert result.artifact_paths['comparison'] == (
+        fixture['compare_path'].resolve())
+
+    original_compare = fixture['compare_path'].read_bytes()
+    tampered_compare = copy.deepcopy(fixture['comparison'])
+    tampered_compare['result']['modes']['flip'][
+        'drop_full_minus_candidate']['AP'] += 1.0
+    fixture['compare_path'].write_text(json.dumps(tampered_compare))
+    invalid = controller.run_next()
+    assert invalid.exit_code == 78
+    assert 'comparison' in invalid.message
+    with pytest.raises(CombinedComparisonError, match='differs'):
+        load_combined_comparison_binding(
+            fixture['candidate'], repository_root=fixture['repository'],
+            manifest_path=fixture['manifest'],
+            downstream_output=fixture['latency_path'])
+    fixture['compare_path'].write_bytes(original_compare)
+
+    latency = json.loads(fixture['latency_path'].read_text())
+    latency['result']['comparison']['sha256'] = '0' * 64
+    fixture['latency_path'].write_text(json.dumps(latency))
+    with pytest.raises(MetricError, match='comparison'):
+        CandidateResult.from_artifacts(fixture['root'])
 
 
 class _FakeSS2D(nn.Module):
