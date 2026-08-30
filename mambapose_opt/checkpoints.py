@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
 import json
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 from typing import Any, Mapping
 
 import numpy as np
@@ -51,8 +53,19 @@ class _ConfigSnapshot:
                 allow_nan=False))
 
 
+@dataclass(frozen=True)
+class _ConfigMemoEntry:
+    snapshot: _ConfigSnapshot
+    seal: tuple[Any, ...]
+
+
+_CONFIG_MEMO_MAX = 32
+_CONFIG_MEMO: OrderedDict[tuple[Any, ...], _ConfigMemoEntry] = OrderedDict()
+_CONFIG_MEMO_LOCK = threading.RLock()
+
+
 class ConfigAuthority:
-    """A public locator whose Config is reconstructed on every consumption."""
+    """A locator for a sealed, fully validated, process-local Config snapshot."""
 
     __slots__ = (
         '_candidate_id', '_manifest_path', '_reference', '_repository_root')
@@ -76,9 +89,7 @@ class ConfigAuthority:
         return value
 
     def _snapshot(self) -> _ConfigSnapshot:
-        return _reconstruct_config_snapshot(
-            self._repository_root, self._manifest_path,
-            self._candidate_id, self._reference)
+        return _cached_config_snapshot(self)
 
     def _require_exact(self, expected: 'ConfigAuthority') -> None:
         if not isinstance(expected, ConfigAuthority):
@@ -120,24 +131,265 @@ class ConfigAuthority:
         return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
     def verify(self) -> None:
-        first = self._snapshot()
-        second = self._snapshot()
-        if (
-                first.identity() != second.identity()
-                or self._config_fingerprint(first.config) !=
-                self._config_fingerprint(second.config)):
-            raise ValueError('ConfigAuthority source changed during verification')
+        snapshot = self._snapshot()
+        self._config_fingerprint(snapshot.config)
 
     def load_config(self) -> Any:
-        first = self._snapshot()
-        value = copy.deepcopy(first.config)
-        second = self._snapshot()
-        if (
-                first.identity() != second.identity()
-                or self._config_fingerprint(first.config) !=
-                self._config_fingerprint(second.config)):
-            raise ValueError('ConfigAuthority source changed during parsing')
-        return value
+        return copy.deepcopy(self._snapshot().config)
+
+
+def _clone_config_snapshot(snapshot: _ConfigSnapshot) -> _ConfigSnapshot:
+    """Isolate every memo consumer from the retained validated Config."""
+    candidate = CandidateSpec.from_dict({
+        'id': snapshot.candidate.id,
+        'route': snapshot.candidate.route,
+        'kind': snapshot.candidate.kind,
+        'config': snapshot.candidate.config.as_posix(),
+        'checkpoint': snapshot.candidate.checkpoint.as_posix(),
+        'checkpoint_sha256': snapshot.candidate.checkpoint_sha256,
+        'seed': snapshot.candidate.seed,
+        'features': dict(snapshot.candidate.features),
+    })
+    return _ConfigSnapshot(
+        candidate=candidate,
+        path=Path(snapshot.path),
+        sha256=str(snapshot.sha256),
+        config=copy.deepcopy(snapshot.config),
+        reference=copy.deepcopy(dict(snapshot.reference)))
+
+
+def _stat_stamp(path: Path) -> tuple[Any, ...]:
+    try:
+        value = path.lstat()
+    except OSError as error:
+        return ('error', type(error).__name__, getattr(error, 'errno', None))
+    return (
+        value.st_dev, value.st_ino, value.st_mode, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _relative_path_seal(root: Path, relative: Path) -> tuple[Any, ...]:
+    """Describe one lexical path and its target without trusting either."""
+    current = root
+    components: list[tuple[Any, ...]] = []
+    for part in relative.parts:
+        current = current / part
+        components.append((part, _stat_stamp(current)))
+    try:
+        resolved = current.resolve(strict=True)
+    except OSError as error:
+        target = ('error', type(error).__name__, getattr(error, 'errno', None))
+    else:
+        target = (str(resolved), _stat_stamp(resolved))
+    return (relative.as_posix(), tuple(components), target)
+
+
+def _tree_seal(root: Path, relative: Path, *,
+               suffixes: frozenset[str] | None = None) -> tuple[Any, ...]:
+    """Capture membership and metadata, following only the scope-root link."""
+    lexical = root / relative
+    lexical_stamp = _relative_path_seal(root, relative)
+    try:
+        tree_root = lexical.resolve(strict=True)
+    except OSError:
+        return (relative.as_posix(), lexical_stamp, ('missing',))
+    if lexical.is_symlink():
+        if relative.parts[:1] not in {('data',), ('work_dirs',)}:
+            return (relative.as_posix(), lexical_stamp, ('unsafe-link',))
+        try:
+            expected = resolve_project_asset_root(root) / relative
+            if (lexical.absolute() == expected.absolute()
+                    or tree_root != expected.resolve(strict=True)):
+                return (
+                    relative.as_posix(), lexical_stamp, ('unsafe-link',))
+        except (OSError, ValueError):
+            return (relative.as_posix(), lexical_stamp, ('unsafe-link',))
+    else:
+        try:
+            tree_root.relative_to(root)
+        except ValueError:
+            return (relative.as_posix(), lexical_stamp, ('unsafe-root',))
+    if not tree_root.is_dir():
+        return (relative.as_posix(), lexical_stamp, ('not-directory',))
+    digest = hashlib.sha256()
+    count = 0
+
+    def record(value: tuple[Any, ...]) -> None:
+        nonlocal count
+        encoded = repr(value).encode('utf-8')
+        digest.update(len(encoded).to_bytes(8, 'big'))
+        digest.update(encoded)
+        count += 1
+
+    pending = [(tree_root, Path())]
+    while pending:
+        directory, prefix = pending.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+        except OSError as error:
+            record((
+                prefix.as_posix(), 'error', type(error).__name__,
+                getattr(error, 'errno', None)))
+            continue
+        for entry in entries:
+            child_relative = prefix / entry.name
+            child = Path(entry.path)
+            stamp = _stat_stamp(child)
+            try:
+                is_link = entry.is_symlink()
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                is_link = True
+                is_directory = False
+            if is_link:
+                record((child_relative.as_posix(), 'link', stamp))
+            elif is_directory:
+                record((child_relative.as_posix(), 'directory', stamp))
+                pending.append((child, child_relative))
+            elif suffixes is None or child.suffix.lower() in suffixes:
+                record((child_relative.as_posix(), 'file', stamp))
+    return (
+        relative.as_posix(), lexical_stamp, count, digest.hexdigest())
+
+
+def _git_state_seal(root: Path) -> tuple[Any, ...]:
+    commands = (
+        ('rev-parse', 'HEAD'),
+        ('status', '--porcelain=v1', '--untracked-files=all'),
+    )
+    records = []
+    for arguments in commands:
+        try:
+            result = subprocess.run(
+                ['git', *arguments], cwd=root, check=False,
+                capture_output=True)
+            records.append((
+                arguments, result.returncode, result.stdout, result.stderr))
+        except OSError as error:
+            records.append((
+                arguments, 'error', type(error).__name__,
+                getattr(error, 'errno', None)))
+    return tuple(records)
+
+
+def _authority_state_seal(
+        root: Path, manifest_path: Path,
+        snapshot: _ConfigSnapshot) -> tuple[Any, ...]:
+    """Build a mutation detector; this seal never establishes authority."""
+    paths = {
+        Path(manifest_path).relative_to(root), snapshot.candidate.config,
+        snapshot.candidate.checkpoint,
+    }
+    closure = snapshot.reference.get('closure')
+    if isinstance(closure, list):
+        paths.update(
+            Path(item['path']) for item in closure
+            if isinstance(item, Mapping) and isinstance(item.get('path'), str))
+    for field in (
+            'conversion_path', 'runtime_path', 'authority_path',
+            'base_conversion_path', 'materialized_path'):
+        value = snapshot.reference.get(field)
+        if isinstance(value, str):
+            paths.add(Path(value))
+    records: list[tuple[Any, ...]] = [
+        ('pid', os.getpid()), ('git', _git_state_seal(root)),
+        ('paths', tuple(
+            _relative_path_seal(root, path)
+            for path in sorted(paths, key=lambda item: item.as_posix()))),
+    ]
+    if snapshot.reference.get('kind') in {
+            'pwl-convert-runtime-v1', 'materialized-evaluation-v1'}:
+        records.extend((
+            ('artifacts', _tree_seal(
+                root, Path('work_dirs/optimization'),
+                suffixes=frozenset({
+                    '.json', '.py', '.pth', '.yaml', '.yml', '.npz'}))),
+            ('dataset', _tree_seal(root, Path('data'))),
+            ('reproduction', _tree_seal(
+                root, Path('work_dirs/reproduction'))),
+        ))
+    return tuple(records)
+
+
+def _memo_key(authority: ConfigAuthority) -> tuple[Any, ...]:
+    return (os.getpid(), *authority._locator_identity())
+
+
+def _remember_config_snapshot(
+        authority: ConfigAuthority, snapshot: _ConfigSnapshot) -> None:
+    root = Path(authority._repository_root)
+    before = _authority_state_seal(root, authority._manifest_path, snapshot)
+    retained = _clone_config_snapshot(snapshot)
+    after = _authority_state_seal(root, authority._manifest_path, snapshot)
+    if before != after:
+        raise ValueError('ConfigAuthority source changed during memoization')
+    key = _memo_key(authority)
+    _CONFIG_MEMO[key] = _ConfigMemoEntry(retained, after)
+    _CONFIG_MEMO.move_to_end(key)
+    while len(_CONFIG_MEMO) > _CONFIG_MEMO_MAX:
+        _CONFIG_MEMO.popitem(last=False)
+
+
+def _cached_config_snapshot(authority: ConfigAuthority) -> _ConfigSnapshot:
+    key = _memo_key(authority)
+    root = Path(authority._repository_root)
+    with _CONFIG_MEMO_LOCK:
+        entry = _CONFIG_MEMO.get(key)
+        if entry is not None:
+            before = _authority_state_seal(
+                root, authority._manifest_path, entry.snapshot)
+            if before == entry.seal:
+                result = _clone_config_snapshot(entry.snapshot)
+                after = _authority_state_seal(
+                    root, authority._manifest_path, entry.snapshot)
+                if after == before:
+                    _CONFIG_MEMO.move_to_end(key)
+                    return result
+            _CONFIG_MEMO.pop(key, None)
+        snapshot = _reconstruct_config_snapshot(
+            root, authority._manifest_path,
+            authority._candidate_id, authority._reference)
+        _remember_config_snapshot(authority, snapshot)
+        return _clone_config_snapshot(snapshot)
+
+
+def _memoized_config_authority(
+        *, root: Path, manifest_path: Path,
+        candidate: str | CandidateSpec, kind: str,
+        selectors: Mapping[str, str] | None = None,
+        ) -> ConfigAuthority | None:
+    """Reuse a matching locator only while its complete mutation seal holds."""
+    candidate_id = candidate if isinstance(candidate, str) else candidate.id
+    selector_items = tuple(sorted((selectors or {}).items()))
+    prefix = (os.getpid(), root, manifest_path, candidate_id)
+    with _CONFIG_MEMO_LOCK:
+        for key, entry in reversed(tuple(_CONFIG_MEMO.items())):
+            snapshot = entry.snapshot
+            if (key[:4] != prefix
+                    or snapshot.reference.get('kind') != kind
+                    or any(snapshot.reference.get(name) != value
+                           for name, value in selector_items)):
+                continue
+            before = _authority_state_seal(root, manifest_path, snapshot)
+            if before != entry.seal:
+                _CONFIG_MEMO.pop(key, None)
+                return None
+            isolated = _clone_config_snapshot(snapshot)
+            after = _authority_state_seal(root, manifest_path, snapshot)
+            if after != before:
+                _CONFIG_MEMO.pop(key, None)
+                return None
+            if (isinstance(candidate, CandidateSpec)
+                    and isolated.candidate != candidate):
+                return None
+            ConfigAuthority._config_fingerprint(isolated.config)
+            _CONFIG_MEMO.move_to_end(key)
+            return ConfigAuthority._create(
+                repository_root=root,
+                manifest_path=manifest_path,
+                candidate_id=isolated.candidate.id,
+                reference=isolated.reference)
+    return None
 
 
 def _sha256(path: Path) -> str:
@@ -262,9 +514,12 @@ def authorized_tracked_file(
 
 def _manifest_absolute(root: Path, manifest_path: Path) -> Path:
     manifest = Path(manifest_path)
-    if not manifest.is_absolute():
-        manifest = root / manifest
-    return manifest.resolve(strict=True)
+    if manifest.is_absolute():
+        try:
+            manifest = manifest.absolute().relative_to(root.absolute())
+        except ValueError as error:
+            raise ValueError('candidate manifest escapes repository') from error
+    return _lexical_file(root, manifest, label='candidate manifest')
 
 
 def _tracked_blob(root: Path, commit: str, relative: str) -> bytes:
@@ -437,11 +692,19 @@ def authorize_tracked_config(
         candidate: str | CandidateSpec) -> ConfigAuthority:
     """Return a locator for a tracked Config, never the parsed Config itself."""
     root = lexical_repository_root(repository_root)
+    manifest = _manifest_absolute(root, manifest_path)
+    cached = _memoized_config_authority(
+        root=root, manifest_path=manifest, candidate=candidate,
+        kind='tracked-candidate-config-v1')
+    if cached is not None:
+        return cached
     snapshot = _tracked_config_snapshot(root, manifest_path, candidate)
     authority = ConfigAuthority._create(
         repository_root=root,
-        manifest_path=_manifest_absolute(root, manifest_path),
+        manifest_path=manifest,
         candidate_id=snapshot.candidate.id, reference=snapshot.reference)
+    with _CONFIG_MEMO_LOCK:
+        _remember_config_snapshot(authority, snapshot)
     authority.verify()
     return authority
 
@@ -555,12 +818,23 @@ def authorize_pwl_runtime_config(
         conversion_path: Path) -> ConfigAuthority:
     """Return a locator for the exact public-valid PWL runtime Config."""
     root = lexical_repository_root(repository_root)
+    manifest = _manifest_absolute(root, manifest_path)
+    conversion_relative = _repository_relative(
+        root, conversion_path, label='PWL conversion artifact')
+    cached = _memoized_config_authority(
+        root=root, manifest_path=manifest, candidate=candidate,
+        kind='pwl-convert-runtime-v1',
+        selectors={'conversion_path': conversion_relative.as_posix()})
+    if cached is not None:
+        return cached
     snapshot = _pwl_runtime_config_snapshot(
         root, manifest_path, candidate, conversion_path=conversion_path)
     authority = ConfigAuthority._create(
         repository_root=root,
-        manifest_path=_manifest_absolute(root, manifest_path),
+        manifest_path=manifest,
         candidate_id=snapshot.candidate.id, reference=snapshot.reference)
+    with _CONFIG_MEMO_LOCK:
+        _remember_config_snapshot(authority, snapshot)
     authority.verify()
     return authority
 
@@ -738,10 +1012,13 @@ def _materialized_config_snapshot(
 def _authority_from_snapshot(
         root: Path, manifest_path: Path,
         snapshot: _ConfigSnapshot) -> ConfigAuthority:
-    return ConfigAuthority._create(
+    authority = ConfigAuthority._create(
         repository_root=root,
         manifest_path=_manifest_absolute(root, manifest_path),
         candidate_id=snapshot.candidate.id, reference=snapshot.reference)
+    with _CONFIG_MEMO_LOCK:
+        _remember_config_snapshot(authority, snapshot)
+    return authority
 
 
 def load_materialized_config_authority(
@@ -750,6 +1027,15 @@ def load_materialized_config_authority(
         authority_path: Path) -> ConfigAuthority:
     """Return a reconstructable locator for one materialized evaluation Config."""
     root = lexical_repository_root(repository_root)
+    manifest = _manifest_absolute(root, manifest_path)
+    authority_relative = _repository_relative(
+        root, authority_path, label='materialized config authority')
+    cached = _memoized_config_authority(
+        root=root, manifest_path=manifest, candidate=candidate,
+        kind='materialized-evaluation-v1',
+        selectors={'authority_path': authority_relative.as_posix()})
+    if cached is not None:
+        return cached
     snapshot = _materialized_config_snapshot(
         root, manifest_path, candidate, authority_path)
     authority = _authority_from_snapshot(root, manifest_path, snapshot)

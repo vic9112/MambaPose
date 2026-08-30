@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -199,7 +200,8 @@ def test_calibration_inventory_fails_closed_on_missing_or_duplicate_roles():
 
 
 def test_calibration_identity_is_source_checkpoint_policy_and_train_bound(
-        tmp_path):
+        tmp_path, monkeypatch):
+    import mambapose_opt.numeric_calibration as calibration
     from mambapose_opt.numeric_calibration import (
         CalibrationContractError, calibration_identity)
 
@@ -240,6 +242,15 @@ def test_calibration_identity_is_source_checkpoint_policy_and_train_bound(
              'sha256': hashlib.sha256(annotation_zip.read_bytes()).hexdigest()},
         ],
     }))
+    original_compare = calibration._compare_zip_member
+    compare_calls = 0
+
+    def counted_compare(*args, **kwargs):
+        nonlocal compare_calls
+        compare_calls += 1
+        return original_compare(*args, **kwargs)
+
+    monkeypatch.setattr(calibration, '_compare_zip_member', counted_compare)
 
     identity = calibration_identity(
         repository_root=repo,
@@ -264,8 +275,48 @@ def test_calibration_identity_is_source_checkpoint_policy_and_train_bound(
         train_zip.read_bytes()).hexdigest()
     assert identity['dataset']['annotation_member_sha256'] == hashlib.sha256(
         b'{}').hexdigest()
+    expected_identity = copy.deepcopy(identity)
+    identity['dataset']['image_count'] = 999
 
-    (repo / 'data/coco/train2017/000000000001.jpg').write_bytes(b'mutated')
+    repeated = calibration_identity(
+        repository_root=repo,
+        candidate_id='full-s-v1',
+        config=Path('configs/reproduction/coco_s_v1.py'),
+        checkpoint=Path('checkpoints/full.pth'),
+        expected_checkpoint_sha256=hashlib.sha256(b'checkpoint').hexdigest(),
+        policy=Path('configs/policy.py'),
+        split='train2017',
+        annotation=Path(
+            'data/coco/annotations/person_keypoints_train2017.json'),
+        image_prefix=Path('data/coco/train2017'))
+    assert repeated == expected_identity
+    assert compare_calls == 2
+
+    inventory_stat = inventory.stat()
+    replacement_inventory = inventory.with_name('replacement.json')
+    replacement_inventory.write_bytes(inventory.read_bytes())
+    os.utime(
+        replacement_inventory,
+        ns=(inventory_stat.st_atime_ns, inventory_stat.st_mtime_ns))
+    os.replace(replacement_inventory, inventory)
+    replayed = calibration_identity(
+        repository_root=repo,
+        candidate_id='full-s-v1',
+        config=Path('configs/reproduction/coco_s_v1.py'),
+        checkpoint=Path('checkpoints/full.pth'),
+        expected_checkpoint_sha256=hashlib.sha256(b'checkpoint').hexdigest(),
+        policy=Path('configs/policy.py'),
+        split='train2017',
+        annotation=Path(
+            'data/coco/annotations/person_keypoints_train2017.json'),
+        image_prefix=Path('data/coco/train2017'))
+    assert replayed == expected_identity
+    assert compare_calls == 4
+
+    image = repo / 'data/coco/train2017/000000000001.jpg'
+    image_stat = image.stat()
+    image.write_bytes(b'MUTAT')
+    os.utime(image, ns=(image_stat.st_atime_ns, image_stat.st_mtime_ns))
     with pytest.raises(CalibrationContractError, match='content'):
         calibration_identity(
             repository_root=repo, candidate_id='full-s-v1',
@@ -277,7 +328,23 @@ def test_calibration_identity_is_source_checkpoint_policy_and_train_bound(
                 'data/coco/annotations/person_keypoints_train2017.json'),
             image_prefix=Path('data/coco/train2017'))
 
-    (repo / 'data/coco/train2017/000000000001.jpg').write_bytes(b'image')
+    image.write_bytes(b'image')
+    image_target = repo / 'alternate-image.jpg'
+    image_target.write_bytes(b'image')
+    image.unlink()
+    image.symlink_to(image_target)
+    with pytest.raises(CalibrationContractError, match='symlink'):
+        calibration_identity(
+            repository_root=repo, candidate_id='full-s-v1',
+            config=Path('configs/reproduction/coco_s_v1.py'),
+            checkpoint=Path('checkpoints/full.pth'),
+            expected_checkpoint_sha256=hashlib.sha256(b'checkpoint').hexdigest(),
+            policy=Path('configs/policy.py'), split='train2017',
+            annotation=Path(
+                'data/coco/annotations/person_keypoints_train2017.json'),
+            image_prefix=Path('data/coco/train2017'))
+    image.unlink()
+    image.write_bytes(b'image')
     config_bytes = config.read_bytes()
     config.unlink()
     (config.parent / 'actual.py').write_bytes(config_bytes)

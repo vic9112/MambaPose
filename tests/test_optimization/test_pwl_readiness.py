@@ -1081,12 +1081,30 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
         authorize_pwl_runtime_config,
         load_materialized_config_authority,
         materialize_evaluation_config_authority)
+    import mambapose_opt.checkpoints as checkpoints
+    original_runtime_snapshot = checkpoints._pwl_runtime_config_snapshot
+    runtime_snapshot_calls = 0
+
+    def counted_runtime_snapshot(*args, **kwargs):
+        nonlocal runtime_snapshot_calls
+        runtime_snapshot_calls += 1
+        return original_runtime_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(
+        checkpoints, '_pwl_runtime_config_snapshot',
+        counted_runtime_snapshot)
     authority = authorize_pwl_runtime_config(
         tmp_path, manifest, candidate, conversion_path=output)
     assert authority.path == output.parent / 'resolved-runtime.py'
     assert authority.sha256 == produced['result']['runtime_config']['sha256']
     assert authority.load_config().numeric_optimization.pwl.candidate_id == (
         candidate.id)
+    authority.verify()
+    repeated_authority = authorize_pwl_runtime_config(
+        tmp_path, manifest, candidate, conversion_path=output)
+    assert repeated_authority.load_config().numeric_optimization.pwl.candidate_id \
+        == candidate.id
+    assert runtime_snapshot_calls == 1
 
     materialized_path = output.parent.parent / 'evaluate/resolved-flip.py'
     authority_path = output.parent.parent / (

@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import os
@@ -194,9 +195,274 @@ def test_config_authority_returns_reconstructed_config_not_mutable_state(tmp_pat
         tmp_path, manifest, 'pwl-silu-s-v1')
     config = authority.load_config()
     config.model.type = 'Alternate'
+    candidate = authority.candidate
+    object.__setattr__(candidate, 'id', 'tampered')
 
     assert authority.load_config().model.type == 'Fixture'
+    assert authority.candidate.id == 'pwl-silu-s-v1'
     authority.verify()
+
+
+def test_config_authority_reuses_one_full_snapshot_for_unchanged_process(
+        tmp_path, monkeypatch):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}},
+        'model = dict(type="Fixture", authority_tag="tracked")\n')
+    original = checkpoints._tracked_config_snapshot
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoints, '_tracked_config_snapshot', counted)
+    authority = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+
+    assert authority.path == tmp_path / 'configs/model.py'
+    assert authority.sha256 == hashlib.sha256(
+        (tmp_path / 'configs/model.py').read_bytes()).hexdigest()
+    assert authority.candidate.id == 'pwl-silu-s-v1'
+    assert authority.load_config().model.authority_tag == 'tracked'
+    assert authority.load_config().model.authority_tag == 'tracked'
+    authority.verify()
+    repeated = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    assert repeated.load_config().model.authority_tag == 'tracked'
+    assert calls == 1
+
+
+def test_config_authority_cache_revalidates_mtime_restored_content_mutation(
+        tmp_path, monkeypatch):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}},
+        'model = dict(type="Fixture", authority_tag="tracked")\n')
+    original_snapshot = checkpoints._tracked_config_snapshot
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoints, '_tracked_config_snapshot', counted)
+    authority = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    source = tmp_path / 'configs/model.py'
+    original_stat = source.stat()
+    source.write_text(
+        'model = dict(type="Fixture", authority_tag="altered")\n',
+        encoding='utf-8')
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    with pytest.raises(
+            (RuntimeError, ValueError),
+            match='clean|blob|changed|authority'):
+        authority.load_config()
+    assert calls == 2
+
+
+@pytest.mark.parametrize('mutation', ['metadata', 'exact-replay'])
+def test_config_authority_cache_revalidates_metadata_and_inode_changes(
+        tmp_path, monkeypatch, mutation):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}},
+        'model = dict(type="Fixture", authority_tag="tracked")\n')
+    original_snapshot = checkpoints._tracked_config_snapshot
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoints, '_tracked_config_snapshot', counted)
+    authority = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    source = tmp_path / 'configs/model.py'
+    original_stat = source.stat()
+    if mutation == 'metadata':
+        original_mode = original_stat.st_mode & 0o777
+        source.chmod(0o600 if original_mode != 0o600 else 0o640)
+        source.chmod(original_mode)
+    else:
+        replacement = source.with_name('replacement.py')
+        replacement.write_bytes(source.read_bytes())
+        os.utime(
+            replacement,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        os.replace(replacement, source)
+
+    assert authority.load_config().model.authority_tag == 'tracked'
+    assert calls == 2
+
+
+def test_config_authority_cache_rejects_symlink_replacement(
+        tmp_path, monkeypatch):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}},
+        'model = dict(type="Fixture", authority_tag="tracked")\n')
+    original_snapshot = checkpoints._tracked_config_snapshot
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoints, '_tracked_config_snapshot', counted)
+    authority = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=tmp_path, text=True).strip()
+    monkeypatch.setattr(
+        checkpoints, 'clean_git_commit', lambda _root: commit)
+    source = tmp_path / 'configs/model.py'
+    target = tmp_path / 'alternate.py'
+    target.write_bytes(source.read_bytes())
+    source.unlink()
+    source.symlink_to(target)
+
+    with pytest.raises(ValueError, match='symlink|not tracked'):
+        authority.verify()
+    assert calls == 2
+
+
+def test_config_authority_cache_revalidates_a_hit_window_mutation(
+        tmp_path, monkeypatch):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}},
+        'model = dict(type="Fixture", authority_tag="tracked")\n')
+    original_snapshot = checkpoints._tracked_config_snapshot
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoints, '_tracked_config_snapshot', counted)
+    authority = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    source = tmp_path / 'configs/model.py'
+    original_stat = source.stat()
+    original_clone = checkpoints._clone_config_snapshot
+    armed = True
+
+    def mutating_clone(snapshot):
+        nonlocal armed
+        result = original_clone(snapshot)
+        if armed:
+            armed = False
+            source.write_text(
+                'model = dict(type="Fixture", authority_tag="altered")\n',
+                encoding='utf-8')
+            os.utime(
+                source,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        return result
+
+    monkeypatch.setattr(checkpoints, '_clone_config_snapshot', mutating_clone)
+    with pytest.raises(
+            (RuntimeError, ValueError),
+            match='clean|blob|changed|authority'):
+        authority.load_config()
+    assert calls == 2
+
+
+def test_config_authority_cache_is_process_local(tmp_path, monkeypatch):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}},
+        'model = dict(type="Fixture", authority_tag="tracked")\n')
+    original_snapshot = checkpoints._tracked_config_snapshot
+    calls = 0
+    pid = 41001
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoints, '_tracked_config_snapshot', counted)
+    monkeypatch.setattr(checkpoints.os, 'getpid', lambda: pid)
+    authority = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    assert authority.load_config().model.authority_tag == 'tracked'
+    assert calls == 1
+
+    pid = 41002
+    assert authority.load_config().model.authority_tag == 'tracked'
+    assert calls == 2
+
+
+def test_config_authority_cache_misses_on_commit_change(tmp_path, monkeypatch):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}},
+        'model = dict(type="Fixture", authority_tag="tracked")\n')
+    original_snapshot = checkpoints._tracked_config_snapshot
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoints, '_tracked_config_snapshot', counted)
+    first = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    (tmp_path / 'commit-marker.txt').write_text('next\n', encoding='utf-8')
+    _git('add', 'commit-marker.txt', cwd=tmp_path)
+    _git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+         'commit', '-qm', 'next commit', cwd=tmp_path)
+
+    second = checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+
+    assert first._locator_identity() != second._locator_identity()
+    assert second.load_config().model.authority_tag == 'tracked'
+    assert calls == 2
+
+
+def test_config_authority_cache_does_not_bypass_manifest_symlink(
+        tmp_path, monkeypatch):
+    import mambapose_opt.checkpoints as checkpoints
+
+    manifest, _checkpoint = _authorized_repo(
+        tmp_path, {'state_dict': {'unused': torch.ones(1)}},
+        'model = dict(type="Fixture", authority_tag="tracked")\n')
+    original_snapshot = checkpoints._tracked_config_snapshot
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoints, '_tracked_config_snapshot', counted)
+    checkpoints.authorize_tracked_config(
+        tmp_path, manifest, 'pwl-silu-s-v1')
+    manifest_link = tmp_path / 'manifest-link.json'
+    manifest_link.symlink_to(manifest)
+
+    with pytest.raises(ValueError, match='symlink'):
+        checkpoints.authorize_tracked_config(
+            tmp_path, manifest_link, 'pwl-silu-s-v1')
+    assert calls == 1
 
 
 def _install_tracked_parse_window_swap(monkeypatch, source_path):
@@ -527,6 +793,54 @@ def test_test_cli_injects_safe_model_and_disables_runner_checkpoint(
     assert captured['runner_model'] is model
     assert captured['tested'] is True
     assert captured['verified'] == 1
+
+
+def test_safe_model_constructs_real_runner_without_polluting_dumped_config(
+        tmp_path):
+    from mmpose.models.data_preprocessors import PoseDataPreprocessor
+    from tools import test as tool
+
+    model = _ToyModel()
+    model.data_preprocessor = PoseDataPreprocessor()
+    config = Config(dict(
+        model=dict(
+            type='TopdownPoseEstimator',
+            data_preprocessor=dict(
+                type='PoseDataPreprocessor', mean=[1.0, 2.0, 3.0]),
+            backbone=dict(type='MM_VSSM'),
+            head=dict(type='TopdownHeatmapSimpleHead')),
+        work_dir=str(tmp_path),
+        load_from=None,
+        default_scope='mmpose',
+        launcher='none',
+        env_cfg=dict(
+            cudnn_benchmark=False,
+            mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0),
+            dist_cfg=dict(backend='nccl')),
+        log_level='WARNING',
+        default_hooks=dict(),
+        visualizer=dict(type='Visualizer', vis_backends=[])))
+    visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    polluted = copy.deepcopy(config)
+    polluted.work_dir = str(tmp_path / 'polluted-parent-behavior')
+    polluted.model = model
+
+    with pytest.raises(SyntaxError, match='Failed to format'):
+        tool.Runner.from_cfg(polluted)
+
+    runner = tool._runner_from_cfg_with_model(config, model)
+
+    assert runner.model is model
+    assert runner.model.data_preprocessor is model.data_preprocessor
+    assert runner._load_from is None
+    assert runner.cfg.model.to_dict() == config.model.to_dict()
+    assert isinstance(runner.cfg.model.data_preprocessor, dict)
+    assert os.environ.get('CUDA_VISIBLE_DEVICES') == visible_devices
+    dumps = tuple(tmp_path.glob('*.py'))
+    assert len(dumps) == 1
+    dumped = Config.fromfile(dumps[0])
+    assert dumped.model.to_dict() == config.model.to_dict()
+    assert isinstance(dumped.model.data_preprocessor, dict)
 
 
 def test_test_cli_postverifies_materialized_config_after_runner(

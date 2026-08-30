@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+import copy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -9,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import math
+import threading
 from typing import Any, Mapping
 import zipfile
 
@@ -30,6 +33,17 @@ class CalibrationTargets:
     transition_parameters: tuple[str, ...]
     functional_observers: tuple[str, ...]
     unsupported_internals: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _DatasetMemoEntry:
+    authority: Mapping[str, Any]
+    seal: tuple[Any, ...]
+
+
+_DATASET_MEMO_MAX = 8
+_DATASET_MEMO: OrderedDict[tuple[Any, ...], _DatasetMemoEntry] = OrderedDict()
+_DATASET_MEMO_LOCK = threading.RLock()
 
 
 def _sha256(path: Path) -> str:
@@ -145,7 +159,86 @@ def _compare_zip_member(
     return digest.hexdigest()
 
 
-def _verified_dataset_authority(
+def _dataset_stat_stamp(path: Path) -> tuple[Any, ...]:
+    try:
+        value = path.lstat()
+    except OSError as error:
+        return ('error', type(error).__name__, getattr(error, 'errno', None))
+    return (
+        value.st_dev, value.st_ino, value.st_mode, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _dataset_tree_seal(
+        path: Path, *, recursive: bool = False) -> tuple[Any, ...]:
+    digest = hashlib.sha256()
+    count = 0
+
+    def record(value: tuple[Any, ...]) -> None:
+        nonlocal count
+        encoded = repr(value).encode('utf-8')
+        digest.update(len(encoded).to_bytes(8, 'big'))
+        digest.update(encoded)
+        count += 1
+
+    pending = [(path, Path())]
+    while pending:
+        directory, prefix = pending.pop()
+        try:
+            entries = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError as error:
+            record((
+                prefix.as_posix(), 'error', type(error).__name__,
+                getattr(error, 'errno', None)))
+            continue
+        for entry in entries:
+            relative = prefix / entry.name
+            record((relative.as_posix(), _dataset_stat_stamp(entry)))
+            if recursive and entry.is_dir() and not entry.is_symlink():
+                pending.append((entry, relative))
+    return (count, digest.hexdigest())
+
+
+def _dataset_state_seal(
+        root: Path, images: Path, annotation: Path) -> tuple[Any, ...]:
+    """Cheaply detect input changes; this seal is never data authority."""
+    reproduction_lexical = root / 'work_dirs/reproduction'
+    reproduction = reproduction_lexical
+    reproduction_approved = not reproduction_lexical.is_symlink()
+    try:
+        resolved = reproduction.resolve(strict=True)
+    except OSError:
+        resolved = reproduction
+    if reproduction_lexical.is_symlink():
+        try:
+            from .evaluation import resolve_project_asset_root
+            expected = (
+                resolve_project_asset_root(root) / 'work_dirs/reproduction')
+            if (reproduction_lexical.absolute() != expected.absolute()
+                    and resolved == expected.resolve(strict=True)):
+                reproduction = resolved
+                reproduction_approved = True
+        except (OSError, ValueError):
+            pass
+    elif resolved == reproduction_lexical:
+        reproduction = resolved
+        reproduction_approved = True
+    reproduction_tree = (
+        _dataset_tree_seal(reproduction, recursive=True)
+        if reproduction_approved else (('unsafe-link',),))
+    return (
+        ('pid', os.getpid()),
+        ('inventory', _dataset_stat_stamp(root / 'data/inventory.json')),
+        ('images-root', _dataset_stat_stamp(images)),
+        ('images', _dataset_tree_seal(images)),
+        ('annotation', _dataset_stat_stamp(annotation)),
+        ('reproduction-link', _dataset_stat_stamp(reproduction_lexical)),
+        ('reproduction-root', _dataset_stat_stamp(reproduction)),
+        ('reproduction', reproduction_tree),
+    )
+
+
+def _verified_dataset_authority_uncached(
         root: Path, images: Path, annotation: Path) -> dict[str, Any]:
     inventory_path = _inside(root, Path('data/inventory.json'),
                              'dataset inventory')
@@ -160,10 +253,13 @@ def _verified_dataset_authority(
     annotation_archive, annotation_archive_sha256, annotation_archive_relative = _verified_archive(
         root, inventory, 'coco-annotations')
 
+    image_entries = tuple(images.iterdir())
+    if any(path.is_symlink() for path in image_entries):
+        raise CalibrationContractError(
+            'extracted train2017 images must not use symlinks')
     extracted = {
-        path.name: path for path in images.iterdir()
-        if path.is_file() and path.suffix.lower() == '.jpg'
-    }
+        path.name: path for path in image_entries
+        if path.is_file() and path.suffix.lower() == '.jpg'}
     content_aggregate = hashlib.sha256()
     order_aggregate = hashlib.sha256()
     try:
@@ -232,6 +328,34 @@ def _verified_dataset_authority(
         'annotation_member': annotation_member_name,
         'annotation_member_sha256': annotation_member_sha256,
     }
+
+
+def _verified_dataset_authority(
+        root: Path, images: Path, annotation: Path) -> dict[str, Any]:
+    key = (os.getpid(), root, images, annotation)
+    with _DATASET_MEMO_LOCK:
+        before = _dataset_state_seal(root, images, annotation)
+        entry = _DATASET_MEMO.get(key)
+        if entry is not None and entry.seal == before:
+            value = copy.deepcopy(dict(entry.authority))
+            after = _dataset_state_seal(root, images, annotation)
+            if after == before:
+                _DATASET_MEMO.move_to_end(key)
+                return value
+            _DATASET_MEMO.pop(key, None)
+            before = after
+        value = _verified_dataset_authority_uncached(
+            root, images, annotation)
+        after = _dataset_state_seal(root, images, annotation)
+        if after != before:
+            raise CalibrationContractError(
+                'dataset inputs changed during authority verification')
+        retained = copy.deepcopy(value)
+        _DATASET_MEMO[key] = _DatasetMemoEntry(retained, after)
+        _DATASET_MEMO.move_to_end(key)
+        while len(_DATASET_MEMO) > _DATASET_MEMO_MAX:
+            _DATASET_MEMO.popitem(last=False)
+        return copy.deepcopy(value)
 
 
 def calibration_identity(
