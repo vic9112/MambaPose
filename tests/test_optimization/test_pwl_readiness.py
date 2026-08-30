@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import zipfile
 
 import pytest
 import torch
@@ -950,14 +951,23 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
     (tmp_path / 'optimization').mkdir()
     (tmp_path / 'work_dirs/reproduction').mkdir(parents=True)
     (tmp_path / 'work_dirs/optimization').mkdir(parents=True)
-    (tmp_path / 'data').mkdir()
+    (tmp_path / 'data/coco/train2017').mkdir(parents=True)
+    (tmp_path / 'data/coco/annotations').mkdir(parents=True)
+    image = tmp_path / 'data/coco/train2017/000000000001.jpg'
+    annotation = (
+        tmp_path / 'data/coco/annotations/person_keypoints_train2017.json')
+    image.write_bytes(b'image')
+    annotation.write_bytes(b'{}')
     train_archive = (
         tmp_path / 'work_dirs/reproduction/downloads/train2017.zip')
     annotation_archive = (
         tmp_path / 'work_dirs/reproduction/downloads/annotations.zip')
     train_archive.parent.mkdir(parents=True)
-    train_archive.write_bytes(b'train archive')
-    annotation_archive.write_bytes(b'annotation archive')
+    with zipfile.ZipFile(train_archive, 'w') as archive:
+        archive.writestr('train2017/000000000001.jpg', b'image')
+    with zipfile.ZipFile(annotation_archive, 'w') as archive:
+        archive.writestr(
+            'annotations/person_keypoints_train2017.json', b'{}')
     (tmp_path / 'data/inventory.json').write_text(json.dumps({
         'schema_version': 1,
         'assets': [
@@ -970,7 +980,8 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
                  annotation_archive.read_bytes()).hexdigest()},
         ],
     }), encoding='utf-8')
-    (tmp_path / '.gitignore').write_text('work_dirs/\n', encoding='utf-8')
+    (tmp_path / '.gitignore').write_text(
+        'data/\nwork_dirs/\n', encoding='utf-8')
     checkpoint = tmp_path / 'work_dirs/reproduction/checkpoint.pth'
     checkpoint.write_bytes(b'checkpoint')
     checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
@@ -1045,12 +1056,19 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
     monkeypatch.setattr(
         convert_numeric, 'build_manifest_authorized_model',
         lambda *_args, **_kwargs: model)
+    import mambapose_opt.numeric_calibration as numeric_calibration
+
+    def validate_fixture_calibration(value, **_kwargs):
+        numeric_calibration._verified_dataset_authority(
+            tmp_path, image.parent, annotation)
+        return value
+
     monkeypatch.setattr(
         convert_numeric, 'validate_calibration_provenance',
-        lambda value, **_kwargs: value)
+        validate_fixture_calibration)
     monkeypatch.setattr(
-        'mambapose_opt.numeric_calibration.validate_calibration_provenance',
-        lambda value, **_kwargs: value)
+        numeric_calibration, 'validate_calibration_provenance',
+        validate_fixture_calibration)
     selection_path = (
         tmp_path / 'work_dirs/optimization/ssm-quant-pwl/'
         'pwl-selection/selection.json')
@@ -1155,12 +1173,16 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
         selection_path.relative_to(tmp_path).as_posix(),
         other_calibration.relative_to(tmp_path).as_posix(),
         'optimization/coco_train2017_authority.json',
+        'data/inventory.json',
+        annotation.relative_to(tmp_path).as_posix(),
         train_archive.relative_to(tmp_path).as_posix(),
         annotation_archive.relative_to(tmp_path).as_posix(),
     } <= scoped_files
+    assert {path.as_posix() for path in entry.scope.trees} == {
+        image.parent.relative_to(tmp_path).as_posix()}
     assert 'work_dirs/reproduction/monitor/status.json' not in scoped_files
     for dependency in (selection_path, calibration_path, other_calibration,
-                       train_archive, annotation_archive):
+                       annotation, train_archive, annotation_archive):
         original_stat = dependency.stat()
         replacement = dependency.with_name(f'{dependency.name}.replacement')
         replacement.write_bytes(dependency.read_bytes())
@@ -1170,7 +1192,75 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
         os.replace(replacement, dependency)
         assert authority.load_config().numeric_optimization.pwl.candidate_id == (
             candidate.id)
-    assert runtime_snapshot_calls == 6
+    assert runtime_snapshot_calls == 7
+
+    image_stat = image.stat()
+    image.write_bytes(b'MUTAT')
+    os.utime(image, ns=(image_stat.st_atime_ns, image_stat.st_mtime_ns))
+    assert image.stat().st_ctime_ns != image_stat.st_ctime_ns
+    with pytest.raises(ValueError, match='content'):
+        authority.load_config()
+    assert runtime_snapshot_calls == 8
+    image.write_bytes(b'image')
+    assert authority.load_config().numeric_optimization.pwl.candidate_id == (
+        candidate.id)
+    assert runtime_snapshot_calls == 9
+
+    image_stat = image.stat()
+    replacement_image = image.with_name('replacement.jpg')
+    replacement_image.write_bytes(image.read_bytes())
+    os.utime(
+        replacement_image,
+        ns=(image_stat.st_atime_ns, image_stat.st_mtime_ns))
+    os.replace(replacement_image, image)
+    assert image.stat().st_ino != image_stat.st_ino
+    assert authority.load_config().numeric_optimization.pwl.candidate_id == (
+        candidate.id)
+    assert runtime_snapshot_calls == 10
+
+    extra_image = image.with_name('000000000002.jpg')
+    extra_image.write_bytes(b'extra')
+    with pytest.raises(ValueError, match='membership'):
+        authority.load_config()
+    assert runtime_snapshot_calls == 11
+    extra_image.unlink()
+    assert authority.load_config().numeric_optimization.pwl.candidate_id == (
+        candidate.id)
+    assert runtime_snapshot_calls == 12
+
+    image_bytes = image.read_bytes()
+    image.unlink()
+    with pytest.raises(ValueError, match='membership'):
+        authority.load_config()
+    assert runtime_snapshot_calls == 13
+    image.write_bytes(image_bytes)
+    assert authority.load_config().numeric_optimization.pwl.candidate_id == (
+        candidate.id)
+    assert runtime_snapshot_calls == 14
+
+    image_target = tmp_path / 'data/alternate-image.jpg'
+    image_target.write_bytes(b'image')
+    original_clone = checkpoints._clone_config_snapshot
+    armed = True
+
+    def symlink_during_hit(snapshot):
+        nonlocal armed
+        result = original_clone(snapshot)
+        if armed:
+            armed = False
+            image.unlink()
+            image.symlink_to(image_target)
+        return result
+
+    monkeypatch.setattr(
+        checkpoints, '_clone_config_snapshot', symlink_during_hit)
+    with pytest.raises(ValueError, match='symlink'):
+        authority.load_config()
+    assert runtime_snapshot_calls == 15
+    image.unlink()
+    image.write_bytes(b'image')
+    monkeypatch.setattr(
+        checkpoints, '_clone_config_snapshot', original_clone)
 
     materialized_path = output.parent.parent / 'evaluate/resolved-flip.py'
     authority_path = output.parent.parent / (

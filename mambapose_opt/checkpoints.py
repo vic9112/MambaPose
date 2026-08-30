@@ -64,6 +64,7 @@ class _ConfigMemoEntry:
 @dataclass(frozen=True)
 class _ConfigDependencyScope:
     files: tuple[Path, ...]
+    trees: tuple[Path, ...]
 
 
 _CONFIG_MEMO_MAX = 32
@@ -200,28 +201,34 @@ def _relative_path_seal(root: Path, relative: Path) -> tuple[Any, ...]:
 
 def _tree_seal(root: Path, relative: Path, *,
                suffixes: frozenset[str] | None = None) -> tuple[Any, ...]:
-    """Capture membership and metadata, following only the scope-root link."""
+    """Capture exact tree membership/metadata without reading file bytes."""
     lexical = root / relative
     lexical_stamp = _relative_path_seal(root, relative)
+    current = root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        if not current.is_symlink():
+            continue
+        if relative.parts[:index + 1] != ('data',):
+            return (relative.as_posix(), lexical_stamp, ('unsafe-link',))
+        try:
+            resolve_project_asset_root(root)
+        except (OSError, ValueError):
+            return (relative.as_posix(), lexical_stamp, ('unsafe-link',))
     try:
         tree_root = lexical.resolve(strict=True)
     except OSError:
         return (relative.as_posix(), lexical_stamp, ('missing',))
-    if lexical.is_symlink():
-        if relative.parts[:1] not in {('data',), ('work_dirs',)}:
-            return (relative.as_posix(), lexical_stamp, ('unsafe-link',))
+    try:
+        tree_root.relative_to(root)
+    except ValueError:
+        if relative.parts[:1] != ('data',):
+            return (relative.as_posix(), lexical_stamp, ('unsafe-root',))
         try:
             expected = resolve_project_asset_root(root) / relative
-            if (lexical.absolute() == expected.absolute()
-                    or tree_root != expected.resolve(strict=True)):
-                return (
-                    relative.as_posix(), lexical_stamp, ('unsafe-link',))
+            if tree_root != expected.resolve(strict=True):
+                return (relative.as_posix(), lexical_stamp, ('unsafe-root',))
         except (OSError, ValueError):
-            return (relative.as_posix(), lexical_stamp, ('unsafe-link',))
-    else:
-        try:
-            tree_root.relative_to(root)
-        except ValueError:
             return (relative.as_posix(), lexical_stamp, ('unsafe-root',))
     if not tree_root.is_dir():
         return (relative.as_posix(), lexical_stamp, ('not-directory',))
@@ -296,13 +303,13 @@ def _dependency_relative(value: object) -> Path | None:
     return relative
 
 
-def _artifact_references(value: object) -> set[Path]:
-    """Collect paths consumed by the validated artifact schemas."""
+def _artifact_references(value: object) -> tuple[set[Path], set[Path]]:
+    """Collect exact files/trees consumed by validated artifact schemas."""
     files: set[Path] = set()
+    trees: set[Path] = set()
     direct_file_fields = {
         'annotation', 'annotation_archive', 'checkpoint', 'config',
-        'data_inventory', 'image_prefix', 'inventory', 'policy',
-        'train_archive',
+        'data_inventory', 'inventory', 'policy', 'train_archive',
     }
 
     def visit(item: object) -> None:
@@ -312,7 +319,9 @@ def _artifact_references(value: object) -> set[Path]:
                 files.add(reference)
             for name, child in item.items():
                 relative = _dependency_relative(child)
-                if relative is not None and (
+                if name == 'image_prefix' and relative is not None:
+                    trees.add(relative)
+                elif relative is not None and (
                         name in direct_file_fields or name.endswith('_path')):
                     files.add(relative)
                 visit(child)
@@ -321,7 +330,7 @@ def _artifact_references(value: object) -> set[Path]:
                 visit(child)
 
     visit(value)
-    return files
+    return files, trees
 
 
 def _dependency_json(root: Path, relative: Path) -> object | None:
@@ -378,6 +387,7 @@ def _config_dependency_scope(
         value = snapshot.reference.get(field)
         if isinstance(value, str):
             files.add(Path(value))
+    trees: set[Path] = set()
     if snapshot.reference.get('kind') in {
             'pwl-convert-runtime-v1', 'materialized-evaluation-v1'}:
         pending = list(files)
@@ -390,7 +400,9 @@ def _config_dependency_scope(
             artifact = _dependency_json(root, relative)
             if artifact is None:
                 continue
-            for dependency in _artifact_references(artifact):
+            artifact_files, artifact_trees = _artifact_references(artifact)
+            trees.update(artifact_trees)
+            for dependency in artifact_files:
                 if dependency not in files:
                     files.add(dependency)
                     pending.append(dependency)
@@ -399,9 +411,10 @@ def _config_dependency_scope(
             Path('data/coco/annotations/person_keypoints_train2017.json'),
         })
         files.update(_inventory_archive_dependencies(root))
-        files.add(Path('data/coco/train2017'))
+        trees.add(Path('data/coco/train2017'))
     return _ConfigDependencyScope(
-        files=tuple(sorted(files, key=lambda item: item.as_posix())))
+        files=tuple(sorted(files, key=lambda item: item.as_posix())),
+        trees=tuple(sorted(trees, key=lambda item: item.as_posix())))
 
 
 def _authority_state_seal(
@@ -411,6 +424,7 @@ def _authority_state_seal(
         ('pid', os.getpid()), ('git', _git_state_seal(root)),
         ('paths', tuple(
             _relative_path_seal(root, path) for path in scope.files)),
+        ('trees', tuple(_tree_seal(root, path) for path in scope.trees)),
     )
 
 
