@@ -92,6 +92,12 @@ def numeric_stage_plan(
         return (
             'calibrate', 'pwl-selection', 'convert', 'smoke-stage-a',
             'profile', 'evaluate', 'latency')
+    if kind == 'pwl-combined':
+        if not conditional:
+            raise ValueError(f'{kind} requires explicit conditional admission')
+        return (
+            'calibrate', 'convert', 'smoke-stage-a', 'profile', 'evaluate',
+            'latency')
     if kind == 'binary-qk':
         if not conditional:
             raise ValueError(f'{kind} requires explicit conditional admission')
@@ -231,7 +237,7 @@ def apply_numeric_runtime(
     if not isinstance(numeric_optimization, Mapping):
         raise NumericBindingError('numeric runtime config must be a mapping')
     kind = numeric_optimization.get('candidate_kind')
-    if kind == 'pwl':
+    if kind in {'pwl', 'pwl-combined'}:
         return _install_pwl_runtime(model, numeric_optimization)
     if kind not in {'weight-only', 'w8a8'}:
         return None
@@ -381,8 +387,9 @@ def _install_pwl_runtime(
             'enabled_function', 'source', 'roles', 'domain', 'segments',
             'grid_points', 'saturation', 'qat_form', 'selection_policy')}
     try:
-        from mambapose_opt.pwl_selection import load_pwl_selection_reference
-        selection = load_pwl_selection_reference(
+        from mambapose_opt.combined_candidate import (
+            load_pwl_admission_reference)
+        selection = load_pwl_admission_reference(
             value['selection_artifact'], repository_root=REPOSITORY_ROOT,
             manifest_path=REPOSITORY_ROOT / 'optimization/candidates.json')
         if selection.get('selected_candidate_id') != candidate_id:

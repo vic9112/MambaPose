@@ -122,6 +122,25 @@
       "features": {"numeric_kind": "pwl", "pwl_function": "exp", "auto_run": false, "conditional": true}
     },
     {
+      "id": "no-pif-pwl-softplus-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "pwl",
+      "config": "configs/optimization/numeric/no_pif_pwl_softplus.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1-no-pif/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "28cd02405e58d619896a0430f91936684084ef7e3423d507c7a10b743759a5fb",
+      "seed": 0,
+      "features": {
+        "numeric_kind": "pwl-combined",
+        "pwl_function": "softplus",
+        "pif_mode": "disabled",
+        "calibration_source_candidate": "no-pif-s-v1",
+        "combined_parent_authority": "optimization/no_pif_softplus_parent_authority.json",
+        "auto_run": false,
+        "conditional": true,
+        "prune_disabled_pif": true
+      }
+    },
+    {
       "id": "binary-qk-s-v1",
       "route": "ssm-quant-pwl",
       "kind": "binary-qk",

@@ -1,0 +1,58 @@
+{
+  "artifact_kind": "no-pif-tail-aware-softplus-parent-authority",
+  "candidate_id": "no-pif-pwl-softplus-s-v1",
+  "claim_limits": {
+    "combined_accuracy_measured": false,
+    "fpga_speedup_claimed": false,
+    "hardware_latency_claimed": false,
+    "interaction_effect_measured": false,
+    "isolated_deltas_additive": false
+  },
+  "combination": {
+    "pif_mode": "disabled",
+    "pwl_function": "softplus",
+    "pwl_role_count": 5,
+    "pwl_roles": [
+      "backbone.layers.0.blocks.0.op",
+      "backbone.layers.1.blocks.0.op",
+      "backbone.layers.2.blocks.0.op",
+      "backbone.layers.2.blocks.1.op",
+      "backbone.layers.3.blocks.0.op"
+    ],
+    "tail_policy": "continuous-asymptotic-tail-v1"
+  },
+  "comparator": {
+    "candidate_id": "full-s-v1",
+    "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+    "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+    "config": "configs/reproduction/coco_s_v1.py"
+  },
+  "parents": {
+    "no_pif": {
+      "candidate_id": "no-pif-s-v1",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1-no-pif/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "28cd02405e58d619896a0430f91936684084ef7e3423d507c7a10b743759a5fb",
+      "config": "configs/reproduction/ablations/coco_s_v1_no_pif.py",
+      "config_sha256": "706eaa316934d89a446510651d3d7dc3b34278436fa8caa47bdf3c228d1209e1",
+      "role": "structural-and-checkpoint-parent",
+      "source_commit": "d938530bad75fa6a8ac515b2c313792d8150da49"
+    },
+    "tail_aware_softplus_pwl": {
+      "candidate_id": "pwl-softplus-s-v1",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "config": "configs/optimization/numeric/pwl_softplus.py",
+      "config_sha256": "60ec03d3f74520e20694901ff257ee6a3ea8902460f7c34cffe2c189dc1595d3",
+      "isolated_evidence": {
+        "evaluate_artifact_sha256": "1726918fdd96402698b6b4d7b1ac347a45491d6df19a41631ff1ccdba908887e",
+        "flip_ap": 72.84823479948885,
+        "no_flip_ap": 72.2877400382553,
+        "selection_artifact_sha256": "be8e07f4b65dcc95137c7357e7621192aff5252ef5a0ebd0888dbed3d7bb23e8",
+        "smoke_artifact_sha256": "6dcb4b8b52defd7fe4d087fd79b067d1651d1bf456fb9392b86be6df1ed6a666"
+      },
+      "role": "function-policy-and-isolated-evidence-parent",
+      "source_commit": "f71fcff33bebe32241d0825eb2b736605a926183"
+    }
+  },
+  "schema_version": 1
+}

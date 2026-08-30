@@ -55,16 +55,17 @@ def validate_numeric_convert_artifact(
             or not isinstance(value.get('result'), Mapping)):
         raise NumericRuntimeError('numeric convert envelope identity is invalid')
     kind = candidate.features.get('numeric_kind')
-    if kind not in {'weight-only', 'w8a8', 'pwl'}:
+    pwl_kinds = {'pwl', 'pwl-combined'}
+    if kind not in {'weight-only', 'w8a8', *pwl_kinds}:
         raise NumericRuntimeError('numeric convert candidate kind is invalid')
-    if kind in {'w8a8', 'pwl'}:
+    if kind in {'w8a8', *pwl_kinds}:
         artifact_path = _repository_artifact_path(
             repository_root, artifact_path)
     result = value['result']
     expected_fields = (
         {'source', 'runtime_bindings', 'runtime_config', 'installation',
          'selection', 'operation_manifest', 'latency_claim'}
-        if kind == 'pwl' else
+        if kind in pwl_kinds else
         {'source', 'runtime_bindings', 'conversion', 'precision_invariants',
          'latency_claim'})
     if kind == 'w8a8':
@@ -75,7 +76,7 @@ def validate_numeric_convert_artifact(
         raise NumericRuntimeError('numeric convert result fields are invalid')
     expected_latency_claim = (
         'none-pwl-pytorch-runtime-is-not-fpga-proof'
-        if kind == 'pwl' else
+        if kind in pwl_kinds else
         'none-fake-quant-is-not-an-integer-kernel')
     if result.get('latency_claim') != expected_latency_claim:
         raise NumericRuntimeError('numeric latency claim is invalid')
@@ -84,9 +85,9 @@ def validate_numeric_convert_artifact(
         candidate=candidate, manifest_path=manifest_path)
     bindings = result['runtime_bindings']
     expected_roles = {'config', 'checkpoint', 'policy'}
-    if kind in {'w8a8', 'pwl'}:
+    if kind in {'w8a8', *pwl_kinds}:
         expected_roles.add('calibration')
-    if kind == 'pwl':
+    if kind in pwl_kinds:
         expected_roles.add('selection')
     if not isinstance(bindings, Mapping) or set(bindings) != expected_roles:
         raise NumericRuntimeError('numeric runtime bindings are incomplete')
@@ -115,7 +116,7 @@ def validate_numeric_convert_artifact(
         'converted', 'skipped', 'original_weight_bytes',
         'simulated_weight_bytes', 'simulated_coverage', 'simulation_only',
         'integer_kernel_latency_claimed'}
-    if kind != 'pwl' and (not isinstance(conversion, Mapping)
+    if kind not in pwl_kinds and (not isinstance(conversion, Mapping)
             or set(conversion) != conversion_fields
             or not isinstance(conversion.get('converted'), list)
             or not conversion['converted']
@@ -139,7 +140,7 @@ def validate_numeric_convert_artifact(
     if not isinstance(numeric, Mapping):
         raise NumericRuntimeError('numeric policy config is missing')
     policy = numeric.get('quant_policy')
-    if kind != 'pwl' and (
+    if kind not in pwl_kinds and (
             not isinstance(policy, Mapping)
             or conversion['converted'] != list(policy.get('allow', ()))
             or conversion['skipped'] != list(policy.get('deny', ()))
@@ -147,7 +148,7 @@ def validate_numeric_convert_artifact(
                 numeric.get('precision_invariants', {}))):
         raise NumericRuntimeError(
             'numeric conversion report disagrees with policy')
-    if kind in {'w8a8', 'pwl'}:
+    if kind in {'w8a8', *pwl_kinds}:
         expected_calibration = (
             artifact_path.parent.parent / 'calibrate/calibrate.json')
         try:
@@ -205,13 +206,13 @@ def validate_numeric_convert_artifact(
                     'segments', 'grid_points', 'saturation', 'qat_form',
                     'selection_policy')}
             try:
-                from .pwl_selection import load_pwl_selection_reference
+                from .combined_candidate import load_pwl_admission_reference
                 selection_reference = result.get('selection')
                 if (not isinstance(selection_reference, Mapping)
                         or bindings.get('selection') != selection_reference):
                     raise NumericRuntimeError(
                         'PWL selection binding is incomplete')
-                selection = load_pwl_selection_reference(
+                selection = load_pwl_admission_reference(
                     selection_reference, repository_root=repository_root,
                     manifest_path=manifest_path)
                 if selection.get('selected_candidate_id') != candidate.id:
@@ -852,7 +853,8 @@ def resolve_numeric_runtime(
             'checkpoint_sha256': candidate.checkpoint_sha256,
             'train': None,
         }
-    if candidate.features.get('numeric_kind') in {'w8a8', 'pwl'} \
+    if candidate.features.get('numeric_kind') in {
+            'w8a8', 'pwl', 'pwl-combined'} \
             and candidate.features.get('recovery_candidate') is not True:
         conversion_path = downstream_output.parent.parent / 'convert/convert.json'
         try:
@@ -873,7 +875,8 @@ def resolve_numeric_runtime(
         bindings = result.get('runtime_bindings')
         expected_binding_roles = {
             'config', 'checkpoint', 'policy', 'calibration'}
-        if candidate.features.get('numeric_kind') == 'pwl':
+        if candidate.features.get('numeric_kind') in {
+                'pwl', 'pwl-combined'}:
             expected_binding_roles.add('selection')
         if (not isinstance(bindings, Mapping)
                 or set(bindings) != expected_binding_roles):
@@ -897,7 +900,8 @@ def resolve_numeric_runtime(
             'checkpoint_sha256': candidate.checkpoint_sha256,
             'train': None,
         }
-        if candidate.features.get('numeric_kind') == 'pwl':
+        if candidate.features.get('numeric_kind') in {
+                'pwl', 'pwl-combined'}:
             runtime['pwl_installation'] = dict(result['installation'])
             try:
                 from .pwl_smoke import pwl_stage_a_binding

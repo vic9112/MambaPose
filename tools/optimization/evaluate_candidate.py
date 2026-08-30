@@ -111,7 +111,7 @@ def _evaluate_mode(
     materialized_authority_path = (
         output.parent / f'resolved-{mode}.config-authority.json')
     materialized = None
-    if candidate.features.get('numeric_kind') == 'pwl':
+    if candidate.features.get('numeric_kind') in {'pwl', 'pwl-combined'}:
         if manifest_path is None or config_authority is None:
             raise ValueError(
                 'PWL evaluation requires manifest and runtime ConfigAuthority')
@@ -147,7 +147,7 @@ def _evaluate_mode(
         '--work-dir', str(work_dir),
         '--out', str(raw_metrics),
     ]
-    if candidate.features.get('numeric_kind') == 'pwl':
+    if candidate.features.get('numeric_kind') in {'pwl', 'pwl-combined'}:
         if manifest_path is None:
             raise ValueError('PWL evaluation requires its candidate manifest')
         command.extend([
@@ -211,7 +211,8 @@ def evaluate(
         authorize_pwl_runtime_config(
             REPO_ROOT, manifest, candidate,
             conversion_path=config_path.parent / 'convert.json')
-        if candidate.features.get('numeric_kind') == 'pwl' else None)
+        if candidate.features.get('numeric_kind') in {
+            'pwl', 'pwl-combined'} else None)
     rows = {
         mode: _evaluate_mode(
             candidate, output, flip_test=mode == 'flip',
@@ -232,7 +233,7 @@ def evaluate(
         'modes': rows,
         'source': source,
     }
-    if candidate.features.get('numeric_kind') == 'pwl':
+    if candidate.features.get('numeric_kind') in {'pwl', 'pwl-combined'}:
         result['pwl_stage_a'] = dict(runtime['pwl_stage_a'])
     return stage_envelope(candidate.id, 'evaluate', result)
 

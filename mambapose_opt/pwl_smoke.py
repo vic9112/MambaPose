@@ -23,8 +23,12 @@ from .latency import (
     LatencyError, validate_gpu_lease, validate_refreshed_gpu_lease)
 from .pwl_artifacts import (
     load_pwl_fit_reference, load_pwl_installation_reference)
-from .pwl_selection import load_pwl_selection_reference
+from .combined_candidate import load_pwl_admission_reference
 from .pwl_paths import canonical_path, canonical_relative_path
+
+
+# Preserve the existing patch seam while admitting either selection schema.
+load_pwl_selection_reference = load_pwl_admission_reference
 
 
 _SHA256 = re.compile(r'^[0-9a-f]{64}$')
@@ -444,7 +448,8 @@ def _production_dependencies(
     authorized = authorize_manifest_candidate(
         root, manifest_path, candidate_id)
     candidate = authorized.candidate
-    if candidate.features.get('numeric_kind') != 'pwl':
+    if candidate.features.get('numeric_kind') not in {
+            'pwl', 'pwl-combined'}:
         raise ValueError('PWL Stage-A candidate kind is invalid')
     config = authorize_tracked_config(
         root, manifest_path, candidate).load_config()
@@ -465,12 +470,16 @@ def _production_dependencies(
         manifest_path=manifest_path)
     if selection.get('selected_candidate_id') != candidate.id:
         raise ValueError('PWL Stage-A candidate is not selected')
-    selected_rows = [
-        row for row in selection.get('candidates', ())
-        if isinstance(row, Mapping) and row.get('candidate_id') == candidate.id]
-    if (len(selected_rows) != 1
-            or selected_rows[0].get('calibration_artifact') != fit_reference):
-        raise ValueError('PWL Stage-A fit differs from selected calibration')
+    if selection.get('admission_kind') != 'combined-parent-authority-v1':
+        selected_rows = [
+            row for row in selection.get('candidates', ())
+            if isinstance(row, Mapping)
+            and row.get('candidate_id') == candidate.id]
+        if (len(selected_rows) != 1
+                or selected_rows[0].get(
+                    'calibration_artifact') != fit_reference):
+            raise ValueError(
+                'PWL Stage-A fit differs from selected calibration')
     installation_reference = _binding(
         value.get('installation'), label='PWL installation')
     expected_installation = (
@@ -844,6 +853,10 @@ def _build_model(config_authority, state, device, *, install: bool):
     safe_config = neutralize_model_initializers(config)
     model = MODELS.build(safe_config.model)
     load_tensor_state_strict(model, state)
+    if config.numeric_optimization.get(
+            'candidate_kind') == 'pwl-combined':
+        from .combined_candidate import prune_disabled_pif
+        prune_disabled_pif(model)
     if install:
         NumericRuntimeHook.apply_to_model(
             model, config.numeric_optimization)
@@ -903,7 +916,8 @@ def run_pwl_stage_a_smoke(
 
     authorized = authorize_manifest_candidate(root, manifest_path, candidate_id)
     candidate = authorized.candidate
-    if candidate.features.get('numeric_kind') != 'pwl':
+    if candidate.features.get('numeric_kind') not in {
+            'pwl', 'pwl-combined'}:
         raise ValueError('PWL smoke requires a PWL candidate')
     expected_output = (Path('work_dirs/optimization') / candidate.route /
                        candidate.id / str(candidate.seed) / 'smoke-stage-a')

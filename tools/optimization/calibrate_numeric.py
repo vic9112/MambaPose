@@ -47,6 +47,25 @@ def _candidate(path: Path, identifier: str):
     return candidates[0]
 
 
+def _calibration_source(target, candidates):
+    target_features = getattr(target, 'features', {})
+    identifier = target_features.get(
+        'calibration_source_candidate',
+        'full-s-v1' if target.route == 'ssm-quant-pwl' else target.id)
+    matches = tuple(item for item in candidates if item.id == identifier)
+    if len(matches) != 1:
+        raise ValueError(
+            f'calibration source must resolve exactly once: {identifier}')
+    source = matches[0]
+    if target_features.get('numeric_kind') == 'pwl-combined' and (
+            identifier != 'no-pif-s-v1'
+            or source.checkpoint != target.checkpoint
+            or source.checkpoint_sha256 != target.checkpoint_sha256):
+        raise ValueError(
+            'combined calibration must use its exact no-PIF checkpoint parent')
+    return source
+
+
 def _git_commit(*, require_clean: bool) -> str:
     commit = subprocess.check_output(
         ['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY_ROOT,
@@ -111,7 +130,8 @@ def audit(
     if authorized.candidate != candidate:
         raise ValueError('calibration candidate differs from authorized manifest')
     identity = _identity(candidate, policy)
-    if getattr(target, 'features', {}).get('numeric_kind') == 'pwl':
+    if getattr(target, 'features', {}).get('numeric_kind') in {
+            'pwl', 'pwl-combined'}:
         model_config_authority = authorize_tracked_config(
             REPOSITORY_ROOT, manifest, candidate)
         policy_config_authority = authorize_tracked_config(
@@ -372,11 +392,13 @@ def calibrate(
     from mmengine.runner import Runner
     model_config_authority = (
         authorize_tracked_config(REPOSITORY_ROOT, manifest, candidate)
-        if getattr(target, 'features', {}).get('numeric_kind') == 'pwl'
+        if getattr(target, 'features', {}).get('numeric_kind') in {
+            'pwl', 'pwl-combined'}
         else None)
     policy_config_authority = (
         authorize_tracked_config(REPOSITORY_ROOT, manifest, target)
-        if getattr(target, 'features', {}).get('numeric_kind') == 'pwl'
+        if getattr(target, 'features', {}).get('numeric_kind') in {
+            'pwl', 'pwl-combined'}
         else None)
     config = (
         model_config_authority.load_config()
@@ -386,7 +408,8 @@ def calibrate(
     loader_config.update(batch_size=1, num_workers=0, persistent_workers=False)
     loader_config['sampler'] = dict(type='DefaultSampler', shuffle=False)
     root_determinism = seed_deterministic_root(candidate.seed)
-    if getattr(target, 'features', {}).get('numeric_kind') == 'pwl':
+    if getattr(target, 'features', {}).get('numeric_kind') in {
+            'pwl', 'pwl-combined'}:
         model = build_manifest_authorized_model(
             REPOSITORY_ROOT, manifest, candidate,
             config_authority=model_config_authority, device=device)
@@ -411,7 +434,8 @@ def calibrate(
     target_features = getattr(target, 'features', {})
     raw_pwl_policy = (
         target_numeric.get('pwl')
-        if target_features.get('numeric_kind') == 'pwl' else None)
+        if target_features.get('numeric_kind') in {
+            'pwl', 'pwl-combined'} else None)
     pwl_policy = ({
         name: raw_pwl_policy[name] for name in (
             'enabled_function', 'source', 'roles', 'domain', 'segments',
@@ -505,9 +529,11 @@ def main() -> int:
         policy = args.policy.resolve()
         policy.relative_to(REPOSITORY_ROOT.resolve())
         target = _candidate(args.manifest, args.candidate)
-        source = (
-            _candidate(args.manifest, 'full-s-v1')
-            if target.route == 'ssm-quant-pwl' else target)
+        source_id = getattr(target, 'features', {}).get(
+            'calibration_source_candidate',
+            'full-s-v1' if target.route == 'ssm-quant-pwl' else target.id)
+        source = _calibration_source(
+            target, (_candidate(args.manifest, source_id), target))
         if args.audit_only:
             value = audit(
                 source, policy, target_candidate=target,

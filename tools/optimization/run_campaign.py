@@ -156,14 +156,20 @@ class SubprocessStageRunner:
                 '--manifest', str(self.manifest_path),
                 '--output', self._relative(artifact),
             ]
-            if candidate.features.get('numeric_kind') in {'w8a8', 'pwl'}:
+            if candidate.features.get('numeric_kind') in {
+                    'w8a8', 'pwl', 'pwl-combined'}:
                 calibration = artifact.parent.parent / 'calibrate/calibrate.json'
                 command.extend([
                     '--calibration-artifact', self._relative(calibration)])
-            if candidate.features.get('numeric_kind') == 'pwl':
-                selection = (
-                    self.campaign_root / candidate.route /
-                    'pwl-selection/selection.json')
+            if candidate.features.get('numeric_kind') in {
+                    'pwl', 'pwl-combined'}:
+                if candidate.features.get('numeric_kind') == 'pwl-combined':
+                    selection = REPO_ROOT / candidate.features[
+                        'combined_parent_authority']
+                else:
+                    selection = (
+                        self.campaign_root / candidate.route /
+                        'pwl-selection/selection.json')
                 command.extend([
                     '--selection-artifact', self._relative(selection)])
             return command

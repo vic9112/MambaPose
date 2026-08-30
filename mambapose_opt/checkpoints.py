@@ -879,7 +879,8 @@ def _pwl_runtime_config_snapshot(
     authorized = authorize_manifest_candidate(root, manifest_path, candidate_id)
     if isinstance(candidate, CandidateSpec) and authorized.candidate != candidate:
         raise ValueError('candidate differs from the authorized manifest entry')
-    if authorized.candidate.features.get('numeric_kind') != 'pwl':
+    if authorized.candidate.features.get('numeric_kind') not in {
+            'pwl', 'pwl-combined'}:
         raise ValueError('runtime ConfigAuthority requires a PWL candidate')
     conversion_relative = _repository_relative(
         root, conversion_path, label='PWL conversion artifact')
@@ -1308,6 +1309,9 @@ def _build_authorized_model(
     safe_config = neutralize_model_initializers(source_config)
     model = init_model(safe_config, None, device=device)
     load_tensor_state_strict(model, tensor_state(authorized.checkpoint_path))
+    if authorized.candidate.features.get('prune_disabled_pif') is True:
+        from .combined_candidate import prune_disabled_pif
+        prune_disabled_pif(model)
     config_authority.verify()
     return model
 

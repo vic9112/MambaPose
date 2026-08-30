@@ -361,7 +361,8 @@ class OptimizationController:
                 base_required | {'device', 'parent', 'runtime'})
             if self.candidate.route == 'ssm-quant-pwl':
                 required.add('source')
-                if self.candidate.features.get('numeric_kind') == 'pwl':
+                if self.candidate.features.get('numeric_kind') in {
+                        'pwl', 'pwl-combined'}:
                     required.add('pwl_stage_a')
             if set(value) != required:
                 raise ArtifactValidationError(
@@ -398,7 +399,8 @@ class OptimizationController:
                     expected_config_sha = runtime['config_sha256']
                     expected_checkpoint = runtime['checkpoint_name']
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
-                    if (self.candidate.features.get('numeric_kind') == 'pwl'
+                    if (self.candidate.features.get('numeric_kind') in {
+                            'pwl', 'pwl-combined'}
                             and value.get('pwl_stage_a') !=
                             runtime.get('pwl_stage_a')):
                         raise ValueError(
@@ -524,9 +526,11 @@ class OptimizationController:
                     f'numeric stage canonical output is invalid: {error}') from error
             bindings = result.get('runtime_bindings')
             expected_bindings = {'config', 'checkpoint', 'policy'}
-            if self.candidate.features.get('numeric_kind') in {'w8a8', 'pwl'}:
+            if self.candidate.features.get('numeric_kind') in {
+                    'w8a8', 'pwl', 'pwl-combined'}:
                 expected_bindings.add('calibration')
-            if self.candidate.features.get('numeric_kind') == 'pwl':
+            if self.candidate.features.get('numeric_kind') in {
+                    'pwl', 'pwl-combined'}:
                 expected_bindings.add('selection')
             if not isinstance(bindings, dict) or set(bindings) != expected_bindings:
                 raise ArtifactValidationError(
@@ -555,12 +559,14 @@ class OptimizationController:
                         f'numeric {role} binding hash mismatch')
             expected_latency_claim = (
                 'none-pwl-pytorch-runtime-is-not-fpga-proof'
-                if self.candidate.features.get('numeric_kind') == 'pwl'
+                if self.candidate.features.get('numeric_kind') in {
+                    'pwl', 'pwl-combined'}
                 else 'none-fake-quant-is-not-an-integer-kernel')
             if result.get('latency_claim') != expected_latency_claim:
                 raise ArtifactValidationError(
                     'numeric stage made an invalid latency claim')
-            if self.candidate.features.get('numeric_kind') in {'w8a8', 'pwl'}:
+            if self.candidate.features.get('numeric_kind') in {
+                    'w8a8', 'pwl', 'pwl-combined'}:
                 runtime_config = result.get('runtime_config')
                 if not isinstance(runtime_config, dict) or set(runtime_config) != {
                         'path', 'sha256'}:

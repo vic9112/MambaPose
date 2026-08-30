@@ -392,10 +392,17 @@ def calibration_identity(
         checkpoint: Path, expected_checkpoint_sha256: str, policy: Path,
         split: str, annotation: Path, image_prefix: Path) -> dict[str, Any]:
     root = Path(repository_root).resolve()
-    if candidate_id != 'full-s-v1':
-        raise CalibrationContractError('calibration source must be full-s-v1')
-    if config.as_posix() != 'configs/reproduction/coco_s_v1.py':
-        raise CalibrationContractError('calibration config must be full S-V1')
+    expected_configs = {
+        'full-s-v1': 'configs/reproduction/coco_s_v1.py',
+        'no-pif-s-v1': (
+            'configs/reproduction/ablations/coco_s_v1_no_pif.py'),
+    }
+    if candidate_id not in expected_configs:
+        raise CalibrationContractError(
+            'calibration source must be an admitted S-V1 parent')
+    if config.as_posix() != expected_configs[candidate_id]:
+        raise CalibrationContractError(
+            'calibration config must match its admitted S-V1 parent')
     if split != 'train2017':
         raise CalibrationContractError('numeric calibration requires train2017')
     if annotation.as_posix() != (
@@ -537,8 +544,10 @@ def validate_calibration_artifact(
         'git_commit'}
     if (not isinstance(identity, Mapping) or set(identity) != identity_fields
             or identity.get('split') != 'train2017'
-            or identity.get('candidate_id') != 'full-s-v1'
-            or identity.get('config') != 'configs/reproduction/coco_s_v1.py'
+            or (identity.get('candidate_id'), identity.get('config')) not in {
+                ('full-s-v1', 'configs/reproduction/coco_s_v1.py'),
+                ('no-pif-s-v1',
+                 'configs/reproduction/ablations/coco_s_v1_no_pif.py')}
             or not isinstance(identity.get('git_commit'), str)
             or not re.fullmatch(r'[0-9a-f]{40}', identity['git_commit'])
             or any(not isinstance(identity.get(field), str)
@@ -849,12 +858,14 @@ def validate_calibration_provenance(
         raise CalibrationContractError(
             'calibration identity disagrees with tracked train authority')
     from .schema import load_candidate_manifest
+    source_candidate_id = expected_candidate.features.get(
+        'calibration_source_candidate', 'full-s-v1')
     baselines = tuple(
         item for item in load_candidate_manifest(manifest_path)
-        if item.id == 'full-s-v1')
+        if item.id == source_candidate_id)
     if len(baselines) != 1:
         raise CalibrationContractError(
-            'calibration requires one manifest full-s-v1 source')
+            'calibration requires exactly one manifest source parent')
     baseline = baselines[0]
     expected_identity = calibration_identity(
         repository_root=repository_root, candidate_id=baseline.id,
@@ -869,7 +880,7 @@ def validate_calibration_provenance(
         raise CalibrationContractError(
             'calibration identity disagrees with canonical production inputs')
     kind = expected_candidate.features.get('numeric_kind')
-    if kind == 'pwl':
+    if kind in {'pwl', 'pwl-combined'}:
         if value['schema_version'] != 3:
             raise CalibrationContractError(
                 'PWL calibration requires measured fit schema v3')

@@ -220,7 +220,7 @@ def measure_candidate(
         manifest_path=manifest,
         git_commit=admission['git_commit'])
     config_authority = None
-    if candidate.features.get('numeric_kind') == 'pwl':
+    if candidate.features.get('numeric_kind') in {'pwl', 'pwl-combined'}:
         config_authority = authorize_pwl_runtime_config(
             REPO_ROOT, manifest, candidate,
             conversion_path=config_path.parent / 'convert.json')
@@ -239,7 +239,7 @@ def measure_candidate(
     torch.cuda.manual_seed_all(candidate.seed)
     torch.use_deterministic_algorithms(True)
 
-    if candidate.features.get('numeric_kind') == 'pwl':
+    if candidate.features.get('numeric_kind') in {'pwl', 'pwl-combined'}:
         model = build_manifest_authorized_model(
             REPO_ROOT, manifest, candidate,
             config_authority=config_authority,
@@ -280,7 +280,7 @@ def measure_candidate(
         },
         'source': source,
     })
-    if candidate.features.get('numeric_kind') == 'pwl':
+    if candidate.features.get('numeric_kind') in {'pwl', 'pwl-combined'}:
         result['pwl_stage_a'] = dict(runtime['pwl_stage_a'])
     result['protocol']['data'] = data_protocol
     result['protocol'].update({

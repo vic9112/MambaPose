@@ -136,7 +136,7 @@ def profile(
 
     config_path = runtime['config_path']
     config_authority = None
-    if candidate.features.get('numeric_kind') == 'pwl':
+    if candidate.features.get('numeric_kind') in {'pwl', 'pwl-combined'}:
         conversion_path = config_path.parent / 'convert.json'
         config_authority = authorize_pwl_runtime_config(
             REPOSITORY_ROOT, manifest_path, candidate,
@@ -144,7 +144,7 @@ def profile(
         config = config_authority.load_config()
     else:
         config = Config.fromfile(config_path)
-    if candidate.features.get('numeric_kind') == 'pwl':
+    if candidate.features.get('numeric_kind') in {'pwl', 'pwl-combined'}:
         model = build_manifest_authorized_model(
             REPOSITORY_ROOT, manifest_path, candidate,
             config_authority=config_authority,
@@ -213,7 +213,8 @@ def profile(
             manifest_path=manifest_path,
             policy_path=REPOSITORY_ROOT / candidate.config,
             git_commit=commit)
-        if candidate.features.get('numeric_kind') == 'pwl':
+        if candidate.features.get('numeric_kind') in {
+                'pwl', 'pwl-combined'}:
             result['pwl_stage_a'] = dict(runtime['pwl_stage_a'])
     return result
 

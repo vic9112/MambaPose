@@ -34,10 +34,14 @@ from mambapose_opt.numeric_source import build_numeric_source_binding
 from mambapose_opt.pwl_artifacts import (
     build_pwl_installation_manifest, validate_pwl_fit_report,
     validate_pwl_installation_manifest)
-from mambapose_opt.pwl_selection import load_pwl_selection_reference
+from mambapose_opt.combined_candidate import load_pwl_admission_reference
 from mambapose_opt.schema import load_candidate_manifest
 from mmpose.models.utils.hardware_friendly import (
     convert_for_fake_quant, export_int8_state)
+
+
+# Preserve the public patch seam used by producer-contract tests.
+load_pwl_selection_reference = load_pwl_admission_reference
 
 
 def _sha256(path: Path) -> str:
@@ -99,16 +103,17 @@ def convert(
         calibration_artifact: Path | None = None,
         selection_artifact: Path | None = None) -> dict:
     kind = candidate.features.get('numeric_kind')
+    pwl_kinds = {'pwl', 'pwl-combined'}
     if candidate.route != 'ssm-quant-pwl' \
-            or kind not in {'weight-only', 'w8a8', 'pwl'}:
+            or kind not in {'weight-only', 'w8a8', *pwl_kinds}:
         raise ValueError(
             'deterministic Stage A conversion admits W8/W8A8/PWL only')
-    if kind == 'pwl' and calibration_artifact is None:
+    if kind in pwl_kinds and calibration_artifact is None:
         raise ValueError('PWL conversion requires completed calibration fit artifact')
-    if kind == 'pwl' and selection_artifact is None:
+    if kind in pwl_kinds and selection_artifact is None:
         raise ValueError(
-            'PWL conversion requires hash-bound four-candidate selection')
-    if kind == 'pwl' and stage != 'convert':
+            'PWL conversion requires hash-bound selection or parent admission')
+    if kind in pwl_kinds and stage != 'convert':
         raise ValueError('PWL conversion has one install stage and no packed export')
     authorized = authorize_manifest_candidate(
         REPOSITORY_ROOT, manifest_path, candidate.id)
@@ -124,13 +129,13 @@ def convert(
     config_authority = (
         authorize_tracked_config(
             REPOSITORY_ROOT, manifest_path, candidate)
-        if kind == 'pwl' else None)
+        if kind in pwl_kinds else None)
     config = (
         config_authority.load_config() if config_authority is not None
         else Config.fromfile(config_path))
     calibration = None
     selection_reference = None
-    if kind == 'pwl':
+    if kind in pwl_kinds:
         selection_artifact = _strict_input(
             selection_artifact, label='PWL selection artifact')
         selection_reference = {
@@ -144,8 +149,8 @@ def convert(
         if (selection.get('decision') != 'selected'
                 or selection.get('selected_candidate_id') != candidate.id):
             raise ValueError(
-                'PWL candidate is not admitted by four-candidate selection')
-    if kind in {'w8a8', 'pwl'}:
+                'PWL candidate is not admitted by its authority artifact')
+    if kind in {'w8a8', *pwl_kinds}:
         if calibration_artifact is None:
             raise ValueError(
                 f'{kind} conversion requires --calibration-artifact')
@@ -167,7 +172,7 @@ def convert(
         quant_policy_from_config(
             config.numeric_optimization.quant_policy,
             calibration_artifact=calibration)
-        if kind != 'pwl' else None)
+        if kind not in pwl_kinds else None)
     runtime_paths = {
         'config': config_path,
         'checkpoint': checkpoint_path,
@@ -180,14 +185,14 @@ def convert(
     binding = bind_numeric_inputs(runtime_paths)
     verify_numeric_inputs(binding)
 
-    if kind == 'pwl':
+    if kind in pwl_kinds:
         model = build_manifest_authorized_model(
             REPOSITORY_ROOT, manifest_path, candidate,
             config_authority=config_authority, device='cpu')
     else:
         from mmpose.apis import init_model
         model = init_model(str(config_path), str(checkpoint_path), device='cpu')
-    if kind == 'pwl':
+    if kind in pwl_kinds:
         pwl_policy = config.numeric_optimization.pwl
         if pwl_policy.get('candidate_id') != candidate.id:
             raise ValueError('PWL policy candidate identity is invalid')
@@ -220,7 +225,7 @@ def convert(
     else:
         report = convert_for_fake_quant(model, policy)
     verify_numeric_inputs(binding)
-    if kind == 'pwl':
+    if kind in pwl_kinds:
         runtime_config = output.parent / 'resolved-runtime.py'
         config.dump(runtime_config)
         return {
