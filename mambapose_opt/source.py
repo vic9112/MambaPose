@@ -17,21 +17,33 @@ _SOURCE_CAPABLE_SUFFIXES = frozenset({
 })
 
 
+class SourceIntegrityError(RuntimeError, ValueError):
+    """Raised when ignored runtime state can influence executable behavior."""
+
+
 def _approved_shared_link(root: Path, relative: Path) -> bool:
     """Allow only the checkout's explicit environment/asset link boundaries."""
     if relative.parts in {('.venv',), ('data',), ('pretrained',),
-                          ('work_dirs', 'reproduction')}:
+                          ('work_dirs', 'reproduction'),
+                          ('work_dirs', 'optimization', 'prior-stage-b')}:
         return (root / relative).is_symlink()
     return False
 
 
 def _approved_generated_config(relative: Path) -> bool:
-    """Allow evaluator configs that are atomically regenerated before use."""
-    return (
-        len(relative.parts) >= 4
-        and relative.parts[:2] == ('work_dirs', 'optimization')
-        and relative.name in {'resolved-flip.py', 'resolved-no-flip.py'}
-    )
+    """Allow only canonical, authority-checked generated runtime configs."""
+    if (
+            len(relative.parts) < 4
+            or relative.parts[:2] != ('work_dirs', 'optimization')):
+        return False
+    allowed_parent_by_name = {
+        'resolved-flip.py': 'evaluate',
+        'resolved-no-flip.py': 'evaluate',
+        'resolved-runtime.py': 'convert',
+        'resolved-train.py': 'train',
+        'resolved-binary-qk-recovery.py': 'recovery',
+    }
+    return relative.parent.name == allowed_parent_by_name.get(relative.name)
 
 
 def _ignored_entry_is_source_capable(root: Path, relative: Path) -> bool:
@@ -87,9 +99,9 @@ def clean_git_commit(repository_root: Path) -> str:
             'source files')
     unsafe_ignored = _unsafe_ignored_paths(root)
     if unsafe_ignored:
-        raise RuntimeError(
-            'formal optimization rejects ignored source-capable, executable, '
-            'or out-of-scope runtime/asset entries: '
+        raise SourceIntegrityError(
+            'formal optimization rejects noncanonical ignored source-capable, '
+            'executable, or symlink entries: '
             + ', '.join(unsafe_ignored))
     return subprocess.check_output(
         ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()

@@ -146,3 +146,58 @@ def test_clean_source_allows_exact_shared_environment_symlinks(tmp_path):
         (tmp_path / name).symlink_to(external, target_is_directory=True)
 
     assert len(clean_git_commit(tmp_path)) == 40
+
+
+@pytest.mark.parametrize('relative', [
+    ('work_dirs/optimization/ssm-quant-pwl/candidate/0/'
+     'convert/resolved-runtime.py'),
+    ('work_dirs/optimization/ssm-quant-pwl/candidate/0/'
+     'train/resolved-train.py'),
+    ('work_dirs/optimization/binary-qk-scaled-s-v1/'
+     'recovery/resolved-binary-qk-recovery.py'),
+    ('work_dirs/optimization/ssm-quant-pwl/candidate/0/'
+     'evaluate/resolved-flip.py'),
+    ('work_dirs/optimization/ssm-quant-pwl/candidate/0/'
+     'evaluate/resolved-no-flip.py'),
+])
+def test_clean_source_allows_only_canonical_generated_runtime_configs(
+        tmp_path, relative):
+    from mambapose_opt.source import clean_git_commit
+
+    _commit_ignore_rules(tmp_path, '/work_dirs/\n')
+    generated = tmp_path / relative
+    generated.parent.mkdir(parents=True)
+    generated.write_text('model = dict()\n')
+
+    assert len(clean_git_commit(tmp_path)) == 40
+
+
+@pytest.mark.parametrize('relative', [
+    'work_dirs/optimization/alternate/resolved-runtime.py',
+    'work_dirs/optimization/candidate/convert/injected.py',
+    'work_dirs/optimization/candidate/train/resolved-runtime.py',
+])
+def test_clean_source_rejects_generated_config_names_outside_canonical_stage(
+        tmp_path, relative):
+    from mambapose_opt.source import clean_git_commit
+
+    _commit_ignore_rules(tmp_path, '/work_dirs/\n')
+    generated = tmp_path / relative
+    generated.parent.mkdir(parents=True)
+    generated.write_text('model = dict()\n')
+
+    with pytest.raises(RuntimeError, match='ignored|source'):
+        clean_git_commit(tmp_path)
+
+
+def test_clean_source_allows_exact_formal_prior_link_only(tmp_path):
+    from mambapose_opt.source import clean_git_commit
+
+    _commit_ignore_rules(tmp_path, '/work_dirs/\n')
+    external = tmp_path.parent / f'{tmp_path.name}-prior-stage-b'
+    external.mkdir()
+    link = tmp_path / 'work_dirs/optimization/prior-stage-b'
+    link.parent.mkdir(parents=True)
+    link.symlink_to(external, target_is_directory=True)
+
+    assert len(clean_git_commit(tmp_path)) == 40
