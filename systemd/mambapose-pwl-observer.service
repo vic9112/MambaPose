@@ -1,0 +1,14 @@
+[Unit]
+Description=Observe the exact MambaPose PWL campaign without controlling it
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/vicchen/workspace/MambaPose/.worktrees/algo-ssm-quant-pwl-frozen
+Environment=PYTHONNOUSERSITE=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/vicchen/workspace/MambaPose/.worktrees/algo-ssm-quant-pwl-frozen/.venv/bin/python -B /home/vicchen/workspace/MambaPose/.worktrees/algo-ssm-quant-pwl-frozen/tools/optimization/observe.py --campaign-root /home/vicchen/workspace/MambaPose/.worktrees/algo-ssm-quant-pwl-frozen/work_dirs/optimization
+UMask=0027
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=yes

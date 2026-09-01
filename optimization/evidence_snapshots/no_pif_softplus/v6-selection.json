@@ -1,0 +1,194 @@
+{
+  "artifact_kind": "pwl-four-candidate-selection",
+  "candidates": [
+    {
+      "admission": {
+        "decision": "passed",
+        "reasons": []
+      },
+      "calibration_artifact": {
+        "path": "work_dirs/optimization/ssm-quant-pwl/pwl-silu-s-v1/0/calibrate/calibrate.json",
+        "sha256": "409979f24a6fc3c40814770f47b0d70c0aa28921311bdcfbf742ee44568354d0"
+      },
+      "candidate_id": "pwl-silu-s-v1",
+      "domain_coverage": {
+        "above": 8193206,
+        "below": 18999427,
+        "handling": "continuous-asymptotic-tail-v1",
+        "ratio": 0.0211870226205564,
+        "total": 1283457024
+      },
+      "exact_comparator": null,
+      "fit_sha256": "486c156181afbc31f02f8eb25e9032e9a5a2d59e5a94bf27622eee7fc6193995",
+      "function_name": "silu",
+      "observed_range_error": {
+        "max": 0.03245000800719877,
+        "mean": 0.012871194182894133,
+        "samples": 4097
+      },
+      "selection_status": "eligible"
+    },
+    {
+      "admission": {
+        "decision": "passed",
+        "reasons": []
+      },
+      "calibration_artifact": {
+        "path": "work_dirs/optimization/ssm-quant-pwl/pwl-gelu-s-v1/0/calibrate/calibrate.json",
+        "sha256": "eda44c32a3a2d98bd1e8f951291468a9a127aaff48e4ce7ff0faf2aee41ac1bf"
+      },
+      "candidate_id": "pwl-gelu-s-v1",
+      "domain_coverage": {
+        "above": 18453,
+        "below": 14553474,
+        "handling": "continuous-asymptotic-tail-v1",
+        "ratio": 0.005676827009986429,
+        "total": 2566914048
+      },
+      "exact_comparator": null,
+      "fit_sha256": "fddb50ff6ffadd11608fc1dac173894fd1146b7c9f02f5c9f7de6b2210838115",
+      "function_name": "gelu",
+      "observed_range_error": {
+        "max": 0.03483049615652922,
+        "mean": 0.001543660672749718,
+        "samples": 4097
+      },
+      "selection_status": "eligible"
+    },
+    {
+      "admission": {
+        "decision": "passed",
+        "reasons": []
+      },
+      "calibration_artifact": {
+        "path": "work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/calibrate/calibrate.json",
+        "sha256": "8d1336a8cf9fe9fd5de5db5371579eaf182cde7450c29618be97da04a1ed8149"
+      },
+      "candidate_id": "pwl-softplus-s-v1",
+      "domain_coverage": {
+        "above": 421890070,
+        "below": 905233418,
+        "handling": "continuous-asymptotic-tail-v1",
+        "ratio": 0.25850563423306333,
+        "total": 5133828096
+      },
+      "exact_comparator": null,
+      "fit_sha256": "9543110685b2e27c8e2de2c0bd5ed6074b57702497f55c2bf8b633b91e326a52",
+      "function_name": "softplus",
+      "observed_range_error": {
+        "max": 0.02886961751845818,
+        "mean": 0.00042792352622031887,
+        "samples": 4097
+      },
+      "selection_status": "eligible"
+    },
+    {
+      "admission": {
+        "decision": "rejected",
+        "reasons": [
+          "clamp-count-nonzero",
+          "observed-range-outside-domain"
+        ]
+      },
+      "calibration_artifact": {
+        "path": "work_dirs/optimization/ssm-quant-pwl/pwl-exp-s-v1/0/calibrate/calibrate.json",
+        "sha256": "a566f767accfcbb2222f34f208d7c90e2f7d0b13dbf40d261a5856eb1de9ba23"
+      },
+      "candidate_id": "pwl-exp-s-v1",
+      "domain_coverage": {
+        "above": 4096,
+        "below": 12288,
+        "handling": "clamp",
+        "ratio": 0.0010964912280701754,
+        "total": 14942208
+      },
+      "exact_comparator": {
+        "applicable_source": "static-parameter",
+        "kind": "exact-export-time-constant-folding",
+        "max_error": 0.0,
+        "mean_error": 0.0,
+        "preferred_over_pwl_when_exportable": true,
+        "runtime_nonlinear_operations": 0
+      },
+      "fit_sha256": "a2fb59f11ad41b307d5ce7e1e0d5b9084ac0e76979ba34c92eb468d36939d181",
+      "function_name": "exp",
+      "observed_range_error": {
+        "max": 89.1174547544685,
+        "mean": 3.645966228159739,
+        "samples": 4097
+      },
+      "selection_status": "excluded-exact-constant-fold"
+    }
+  ],
+  "claim_limits": {
+    "fastmamba_composite_mechanisms_inherited": false,
+    "fpga_speedup_claimed": false,
+    "hardware_latency_claimed": false,
+    "note": "PWL-only evidence does not inherit Hadamard, SSM/conv quantization, nonlinear-unit, or FPGA claims."
+  },
+  "decision": "selected",
+  "identity_authority": {
+    "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+    "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+    "config": "configs/reproduction/coco_s_v1.py",
+    "config_sha256": "7aa78c2b8394b57b16517380a479adb5c3b3161cadb802c26c2d2f66583a6b34",
+    "dataset": {
+      "annotation": "data/coco/annotations/person_keypoints_train2017.json",
+      "annotation_archive": "work_dirs/reproduction/downloads/annotations_trainval2017.zip",
+      "annotation_archive_sha256": "113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268",
+      "annotation_member": "annotations/person_keypoints_train2017.json",
+      "annotation_member_sha256": "7fc1549d934547c470384d8a207c38707ca33fc016d00e33b795e408603af83e",
+      "annotation_sha256": "7fc1549d934547c470384d8a207c38707ca33fc016d00e33b795e408603af83e",
+      "image_content_aggregate_sha256": "80986f811f17f99ea41b2395ddcb9287f3dc0fd3179666471f8a2386ce34774d",
+      "image_content_algorithm": "sha256-zip-member-bytes-v1",
+      "image_count": 118287,
+      "image_order_algorithm": "sha256-zip-central-directory-order-v1",
+      "image_order_sha256": "992cb8a605f359a1338c207fd995abde6c8b88da9af45b7e16fd59c89c6482c7",
+      "image_prefix": "data/coco/train2017",
+      "inventory": "data/inventory.json",
+      "inventory_sha256": "2a82ab3cfe05a514d141c17921463e72f22741d67eaf978d93317155bbeaf0ed",
+      "train_archive": "work_dirs/reproduction/downloads/train2017.zip",
+      "train_archive_sha256": "69a8bb58ea5f8f99d24875f21416de2e9ded3178e903f1f7603e283b9e06d929"
+    },
+    "git_commit": "f71fcff33bebe32241d0825eb2b736605a926183",
+    "split": "train2017"
+  },
+  "manifest": {
+    "path": "optimization/candidates.json",
+    "sha256": "f5d5e02bd085637e952b7c7f96c28b91957434099211360af25fbf4c19faf30e"
+  },
+  "protocol": {
+    "grad_enabled": false,
+    "model_mode": "eval",
+    "root_determinism": {
+      "cudnn_benchmark": false,
+      "cudnn_deterministic": true,
+      "numpy_seed": 0,
+      "python_seed": 0,
+      "seed": 0,
+      "torch_cuda_seed": 0,
+      "torch_deterministic_algorithms": true,
+      "torch_seed": 0
+    },
+    "sample_count": 512,
+    "sample_order_sha256": "efd19d81e7109ad9bc3a0ebcffcaa3f9991ed8ec0d0310b0ff0c98e6f435d181",
+    "shuffle": false,
+    "worker_count": 0
+  },
+  "ranking": [
+    "pwl-softplus-s-v1",
+    "pwl-silu-s-v1",
+    "pwl-gelu-s-v1"
+  ],
+  "schema_version": 2,
+  "selected_candidate_id": "pwl-softplus-s-v1",
+  "source_authority": {
+    "authority_path": "optimization/coco_train2017_authority.json",
+    "authority_sha256": "553fead03ae77990049e6ae87fb45d6afa999aec8f4d9a2b7f40c7f6d5255d3a",
+    "checkpoint_path": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+    "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+    "git_commit": "f71fcff33bebe32241d0825eb2b736605a926183",
+    "manifest_path": "optimization/candidates.json",
+    "manifest_sha256": "f5d5e02bd085637e952b7c7f96c28b91957434099211360af25fbf4c19faf30e"
+  }
+}

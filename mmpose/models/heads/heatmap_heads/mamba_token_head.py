@@ -58,7 +58,9 @@ class MambaTokenHead(BaseHead):
                                            pos_embedding_type=tokenpose_cfg.pos_embedding_type,
                                            apply_init=tokenpose_cfg.apply_init,
                                            pif_mode=tokenpose_cfg.get(
-                                               'pif_mode', 'full'))
+                                               'pif_mode', 'full'),
+                                           qk_mode=tokenpose_cfg.get(
+                                               'qk_mode', 'float'))
 
     def forward(self, x):
         # (b,32,64,48)

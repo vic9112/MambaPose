@@ -16,6 +16,8 @@ import sys
 import time
 from typing import Any
 
+sys.dont_write_bytecode = True
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -32,6 +34,7 @@ from mambapose_repro.orchestrator import (
 from mambapose_repro.calibration import materialize_resolved_configs
 from mambapose_repro.gates import GateError, GateRunner
 from mambapose_repro.state import StateStore
+from mambapose_opt.source import clean_git_commit
 
 
 CAMPAIGN_DIR = REPO_ROOT / 'work_dirs/reproduction'
@@ -57,16 +60,10 @@ def _combined_hash(paths: list[Path]) -> str:
 
 
 def _repo_commit() -> str:
-    dirty = subprocess.run(
-        ['git', 'status', '--porcelain', '--untracked-files=no'],
-        cwd=REPO_ROOT, check=True, capture_output=True, text=True)
-    if dirty.stdout.strip():
-        raise PermanentFailure(
-            'formal campaign requires a clean tracked Git worktree')
-    result = subprocess.run(
-        ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, check=True,
-        capture_output=True, text=True)
-    return result.stdout.strip()
+    try:
+        return clean_git_commit(REPO_ROOT)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        raise PermanentFailure(str(error)) from error
 
 
 def _provenance(config_path: Path) -> dict[str, str]:
@@ -145,6 +142,7 @@ def _run_command(
     environment = os.environ.copy()
     environment.update({
         'PYTHONNOUSERSITE': '1',
+        'PYTHONDONTWRITEBYTECODE': '1',
         'CUDA_VISIBLE_DEVICES': '0',
         'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD': '1',
     })

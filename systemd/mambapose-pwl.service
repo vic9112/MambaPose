@@ -1,0 +1,26 @@
+[Unit]
+Description=MambaPose exact offline PWL candidate campaign
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+WorkingDirectory=/home/vicchen/workspace/MambaPose/.worktrees/algo-ssm-quant-pwl-frozen
+Environment=PYTHONNOUSERSITE=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=CUBLAS_WORKSPACE_CONFIG=:4096:8
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=TORCH_FORCE_WEIGHTS_ONLY_LOAD=1
+ExecStart=/home/vicchen/workspace/MambaPose/.worktrees/algo-ssm-quant-pwl-frozen/.venv/bin/python -B /home/vicchen/workspace/MambaPose/.worktrees/algo-ssm-quant-pwl-frozen/tools/optimization/run_campaign.py --run --manifest /home/vicchen/workspace/MambaPose/.worktrees/algo-ssm-quant-pwl-frozen/optimization/candidates.json --campaign-root /home/vicchen/workspace/MambaPose/.worktrees/algo-ssm-quant-pwl-frozen/work_dirs/optimization --candidate pwl-silu-s-v1 --candidate pwl-gelu-s-v1 --candidate pwl-softplus-s-v1 --candidate pwl-exp-s-v1 --admit-conditional
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=30s
+KillMode=control-group
+TimeoutStopSec=5min
+UMask=0027
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

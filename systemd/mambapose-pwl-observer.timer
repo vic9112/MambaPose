@@ -1,0 +1,12 @@
+[Unit]
+Description=Record exact MambaPose PWL campaign health every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=mambapose-pwl-observer.service
+
+[Install]
+WantedBy=timers.target

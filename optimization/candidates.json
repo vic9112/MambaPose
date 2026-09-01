@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "candidates": [
+    {
+      "id": "full-s-v1",
+      "route": "baseline",
+      "kind": "float",
+      "config": "configs/reproduction/coco_s_v1.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {
+        "pif_mode": "full"
+      }
+    },
+    {
+      "id": "no-pif-s-v1",
+      "route": "structural-pif",
+      "kind": "structural",
+      "config": "configs/reproduction/ablations/coco_s_v1_no_pif.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1-no-pif/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "28cd02405e58d619896a0430f91936684084ef7e3423d507c7a10b743759a5fb",
+      "seed": 0,
+      "features": {
+        "pif_mode": "disabled"
+      }
+    },
+    {
+      "id": "coco-b-teacher",
+      "route": "baseline",
+      "kind": "float",
+      "config": "configs/reproduction/coco_b.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-b/best_coco_AP_epoch_290.pth",
+      "checkpoint_sha256": "38b5e5b1bccfdf7b8b153d91837f7f1bfe371a14f12f6e417a52ebb893efb9b2",
+      "seed": 0,
+      "features": {
+        "role": "teacher",
+        "pif_mode": "full"
+      }
+    },
+    {
+      "id": "numeric-observer-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "fake-quant",
+      "config": "configs/optimization/numeric/observer_only.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {
+        "numeric_kind": "observer",
+        "auto_run": false,
+        "calibration_split": "train2017"
+      }
+    },
+    {
+      "id": "w8-weight-only-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "fake-quant",
+      "config": "configs/optimization/numeric/w8_weight_only.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {
+        "numeric_kind": "weight-only",
+        "auto_run": false,
+        "simulation_only": true
+      }
+    },
+    {
+      "id": "w8a8-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "fake-quant",
+      "config": "configs/optimization/numeric/w8a8.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {
+        "numeric_kind": "w8a8",
+        "auto_run": false,
+        "conditional": true,
+        "calibration_split": "train2017"
+      }
+    },
+    {
+      "id": "pwl-silu-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "pwl",
+      "config": "configs/optimization/numeric/pwl_silu.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {"numeric_kind": "pwl", "pwl_function": "silu", "auto_run": false, "conditional": true}
+    },
+    {
+      "id": "pwl-gelu-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "pwl",
+      "config": "configs/optimization/numeric/pwl_gelu.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {"numeric_kind": "pwl", "pwl_function": "gelu", "auto_run": false, "conditional": true}
+    },
+    {
+      "id": "pwl-softplus-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "pwl",
+      "config": "configs/optimization/numeric/pwl_softplus.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {"numeric_kind": "pwl", "pwl_function": "softplus", "auto_run": false, "conditional": true}
+    },
+    {
+      "id": "pwl-exp-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "pwl",
+      "config": "configs/optimization/numeric/pwl_exp.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {"numeric_kind": "pwl", "pwl_function": "exp", "auto_run": false, "conditional": true}
+    },
+    {
+      "id": "no-pif-pwl-softplus-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "pwl",
+      "config": "configs/optimization/numeric/no_pif_pwl_softplus.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1-no-pif/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "28cd02405e58d619896a0430f91936684084ef7e3423d507c7a10b743759a5fb",
+      "seed": 0,
+      "features": {
+        "numeric_kind": "pwl-combined",
+        "pwl_function": "softplus",
+        "pif_mode": "disabled",
+        "calibration_source_candidate": "no-pif-s-v1",
+        "combined_parent_authority": "optimization/no_pif_softplus_parent_authority.json",
+        "auto_run": false,
+        "conditional": true,
+        "prune_disabled_pif": true
+      }
+    },
+    {
+      "id": "binary-qk-s-v1",
+      "route": "ssm-quant-pwl",
+      "kind": "binary-qk",
+      "config": "configs/optimization/numeric/binary_qk.py",
+      "checkpoint": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+      "checkpoint_sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2",
+      "seed": 0,
+      "features": {"numeric_kind": "binary-qk", "auto_run": false, "conditional": true}
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "candidate_id": "pwl-softplus-s-v1",
+  "fit_artifact": {
+    "path": "work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/calibrate/calibrate.json",
+    "sha256": "8d1336a8cf9fe9fd5de5db5371579eaf182cde7450c29618be97da04a1ed8149"
+  },
+  "operation_manifest": {
+    "domain_handling": {
+      "kind": "continuous-asymptotic-tail-v1",
+      "left": "constant-endpoint",
+      "right": "identity-plus-endpoint-offset"
+    },
+    "exact_input_roles": [
+      "backbone.layers.0.blocks.0.op.transition_softplus_input",
+      "backbone.layers.1.blocks.0.op.transition_softplus_input",
+      "backbone.layers.2.blocks.0.op.transition_softplus_input",
+      "backbone.layers.2.blocks.1.op.transition_softplus_input",
+      "backbone.layers.3.blocks.0.op.transition_softplus_input"
+    ],
+    "function": "softplus",
+    "hardware_latency_claimed": false,
+    "operation_roles": [
+      "backbone.layers.0.blocks.0.op",
+      "backbone.layers.1.blocks.0.op",
+      "backbone.layers.2.blocks.0.op",
+      "backbone.layers.2.blocks.1.op",
+      "backbone.layers.3.blocks.0.op"
+    ],
+    "segments_per_role": 16,
+    "source": "ss2d-transition"
+  },
+  "report": {
+    "domain": [
+      -8.0,
+      8.0
+    ],
+    "exact_comparator": null,
+    "fit_artifact_path": "work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/calibrate/calibrate.json",
+    "fit_artifact_sha256": "8d1336a8cf9fe9fd5de5db5371579eaf182cde7450c29618be97da04a1ed8149",
+    "function_name": "softplus",
+    "hardware_latency_claimed": false,
+    "in_domain_max_error": 0.02913877648172608,
+    "in_domain_mean_error": 0.005203546767530158,
+    "input_roles": [
+      "backbone.layers.0.blocks.0.op.transition_softplus_input",
+      "backbone.layers.1.blocks.0.op.transition_softplus_input",
+      "backbone.layers.2.blocks.0.op.transition_softplus_input",
+      "backbone.layers.2.blocks.1.op.transition_softplus_input",
+      "backbone.layers.3.blocks.0.op.transition_softplus_input"
+    ],
+    "observed_range": [
+      -170.34832763671875,
+      659.1333618164062
+    ],
+    "observed_range_max_error": 0.02886961751845818,
+    "observed_range_mean_error": 0.00042792352622031887,
+    "out_of_domain_ratio": 0.25850563423306333,
+    "qat_form": "differentiable",
+    "roles": [
+      "backbone.layers.0.blocks.0.op",
+      "backbone.layers.1.blocks.0.op",
+      "backbone.layers.2.blocks.0.op",
+      "backbone.layers.2.blocks.1.op",
+      "backbone.layers.3.blocks.0.op"
+    ],
+    "saturation": "continuous-asymptotic-tail-v1",
+    "segments": 16,
+    "source": "ss2d-transition"
+  },
+  "schema_version": 2
+}
