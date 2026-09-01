@@ -31,7 +31,7 @@ def test_clean_source_rejects_untracked_source_but_allows_ignored_runtime(
     (tmp_path / 'work_dirs/runtime.json').parent.mkdir()
     (tmp_path / 'work_dirs/runtime.json').write_text('{}\n')
     (tmp_path / 'data').mkdir()
-    (tmp_path / 'data/asset.py').write_text('external asset payload\n')
+    (tmp_path / 'data/asset.json').write_text('{}\n')
 
     assert len(clean_git_commit(tmp_path)) == 40
 
@@ -121,15 +121,28 @@ def test_clean_source_rejects_nul_delimited_weird_ignored_names(
         clean_git_commit(tmp_path)
 
 
-def test_clean_source_allows_only_exact_approved_ignored_roots(tmp_path):
+def test_clean_source_rejects_executable_drift_inside_asset_roots(tmp_path):
     from mambapose_opt.source import clean_git_commit
 
-    approved = ('.venv', 'data', 'pretrained', 'work_dirs', '.pytest_cache')
+    approved = ('data', 'pretrained', 'work_dirs')
     _commit_ignore_rules(
         tmp_path, ''.join(f'/{root}/\n' for root in approved))
     for root in approved:
         payload = tmp_path / root / 'nested/settings.py'
         payload.parent.mkdir(parents=True)
         payload.write_text('external runtime or asset payload\n')
+
+    with pytest.raises(RuntimeError, match='ignored|executable|source'):
+        clean_git_commit(tmp_path)
+
+
+def test_clean_source_allows_exact_shared_environment_symlinks(tmp_path):
+    from mambapose_opt.source import clean_git_commit
+
+    _commit_ignore_rules(tmp_path, '/.venv\n/data\n/pretrained\n')
+    external = tmp_path.parent / f'{tmp_path.name}-assets'
+    external.mkdir()
+    for name in ('.venv', 'data', 'pretrained'):
+        (tmp_path / name).symlink_to(external, target_is_directory=True)
 
     assert len(clean_git_commit(tmp_path)) == 40
