@@ -526,6 +526,32 @@ def test_candidate_result_validates_nested_evaluation_and_artifact_identity(
     assert no_flip.provenance['config_sha256'] == '9' * 64
 
 
+def test_formal_mode_authority_accepts_exact_public_candidate_result_protocol(
+        tmp_path, monkeypatch):
+    """Pareto must consume the schema already validated by CandidateResult."""
+    from mambapose_opt.evaluation import CandidateResult
+    from mambapose_opt.pareto import _result_mode_authority
+
+    root = _bound_artifacts(tmp_path, monkeypatch)
+    flip = CandidateResult.from_artifacts(root, mode='flip')
+    no_flip = CandidateResult.from_artifacts(root, mode='no_flip')
+
+    assert set(flip.protocol) == set(_evaluation()['result']['modes'][
+        'flip']['protocol'])
+    public_flip = json.loads(
+        (root / 'evaluate/evaluate.json').read_text(encoding='utf-8'))[
+            'result']['modes']['flip']
+    assert _result_mode_authority(flip, mode='flip') == {
+        'protocol_sha256': hashlib.sha256(json.dumps(
+            public_flip['protocol'], sort_keys=True, separators=(',', ':'),
+            allow_nan=False).encode()).hexdigest(),
+        'determinism_sha256': hashlib.sha256(json.dumps(
+            public_flip['determinism'], sort_keys=True, separators=(',', ':'),
+            allow_nan=False).encode()).hexdigest(),
+    }
+    assert _result_mode_authority(no_flip, mode='no_flip')
+
+
 def test_candidate_result_rejects_self_attested_candidate_without_manifest(
         tmp_path):
     """Removing external manifest binding must make this counterfeit pass."""

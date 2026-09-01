@@ -142,8 +142,17 @@ class SubprocessStageRunner:
                     f'{item.id}={self._relative(calibration)}'])
             return command
         if stage == 'smoke-stage-a':
+            if candidate.kind == 'binary-qk':
+                smoke_tool = 'smoke_binary_qk.py'
+            elif candidate.features.get('numeric_kind') in {
+                    'pwl', 'pwl-combined'}:
+                smoke_tool = 'smoke_pwl.py'
+            else:
+                raise CandidateManifestError(
+                    f'unsupported Stage-A smoke candidate: {candidate.id}')
             return [
-                python, str(REPO_ROOT / 'tools/optimization/smoke_pwl.py'),
+                python,
+                str(REPO_ROOT / 'tools/optimization' / smoke_tool),
                 '--candidate', candidate.id,
                 '--manifest', str(self.manifest_path),
                 '--output-root', self._relative(artifact.parent),
@@ -287,17 +296,21 @@ def _status(root: Path) -> int:
 def _select(
         candidates: Sequence[CandidateSpec],
         identifiers: Sequence[str], *,
-        admit_conditional: bool = False) -> tuple[CandidateSpec, ...]:
+        admit_conditional: bool = False,
+        repository_root: Path = REPO_ROOT,
+        manifest_path: Path = MANIFEST_PATH,
+        ) -> tuple[CandidateSpec, ...]:
     if not identifiers:
-        return tuple(
+        selected = tuple(
             candidate for candidate in candidates
             if candidate.features.get('auto_run', True) is not False)
-    wanted = set(identifiers)
-    selected = tuple(item for item in candidates if item.id in wanted)
-    missing = wanted - {item.id for item in selected}
-    if missing:
-        raise CandidateManifestError(
-            f'candidate not found: {sorted(missing)}')
+    else:
+        wanted = set(identifiers)
+        selected = tuple(item for item in candidates if item.id in wanted)
+        missing = wanted - {item.id for item in selected}
+        if missing:
+            raise CandidateManifestError(
+                f'candidate not found: {sorted(missing)}')
     conditional = tuple(
         item.id for item in selected
         if item.features.get('conditional') is True)
@@ -305,6 +318,23 @@ def _select(
         raise CandidateManifestError(
             f'conditional candidates require --admit-conditional: '
             f'{list(conditional)}')
+    invalid_pwl_dependency = []
+    for item in selected:
+        if item.kind != 'binary-qk':
+            continue
+        try:
+            from mambapose_opt.binary_readiness import (
+                validate_binary_qk_admission)
+            validate_binary_qk_admission(
+                item, repository_root=repository_root,
+                manifest_path=manifest_path)
+        except (OSError, RuntimeError, ValueError) as error:
+            invalid_pwl_dependency.append(item.id)
+            invalid_detail = str(error)
+    if invalid_pwl_dependency:
+        raise CandidateManifestError(
+            'binary Q/K candidates require a public-valid Stage-B PWL '
+            f'dependency: {invalid_pwl_dependency}: {invalid_detail}')
     return selected
 
 
@@ -458,7 +488,8 @@ def main() -> int:
     try:
         candidates = _select(
             load_candidate_manifest(args.manifest), args.candidate,
-            admit_conditional=args.admit_conditional)
+            admit_conditional=args.admit_conditional,
+            manifest_path=args.manifest)
     except CandidateManifestError as error:
         print(str(error), file=sys.stderr)
         return PERMANENT_EXIT

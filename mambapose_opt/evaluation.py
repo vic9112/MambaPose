@@ -1161,12 +1161,24 @@ def validate_evaluation_envelope(
     expected_result_fields = {'route', 'calibration_split', 'modes', 'source'}
     if expected_pwl_stage_a is not None:
         expected_result_fields.add('pwl_stage_a')
+    allowed_result_fields = (
+        expected_result_fields,
+        expected_result_fields - {'source'},
+        expected_result_fields | {'binary_qk_profile'},
+        (expected_result_fields | {'binary_qk_profile'}) - {'source'},
+    )
     if (
             not isinstance(result, Mapping)
-            or set(result) not in (
-                expected_result_fields,
-                expected_result_fields - {'source'})):
+            or set(result) not in allowed_result_fields):
         raise MetricError('evaluation result has invalid fields')
+    binary_profile = result.get('binary_qk_profile')
+    if binary_profile is not None:
+        try:
+            from .binary_operation import validate_binary_profile_binding
+            validate_binary_profile_binding(binary_profile)
+        except ValueError as error:
+            raise MetricError(
+                f'evaluation binary profile binding is invalid: {error}') from error
     source = result.get('source')
     if require_source_binding and source is None:
         raise MetricError('evaluation source manifest binding is required')
@@ -1272,6 +1284,8 @@ def validate_evaluation_envelope(
         'source': _freeze(source) if source is not None else None,
         **({'pwl_stage_a': _freeze(pwl_stage_a)}
            if pwl_stage_a is not None else {}),
+        **({'binary_qk_profile': _freeze(binary_profile)}
+           if binary_profile is not None else {}),
     })
 
 
@@ -1280,7 +1294,9 @@ class CandidateResult:
     """Immutable, validated normalized row from an evaluation artifact."""
 
     candidate_id: str
+    candidate_kind: str
     route: str
+    seed: int
     metrics: CocoMetrics
     flip_test: bool
     provenance: Mapping[str, str]
@@ -1289,6 +1305,10 @@ class CandidateResult:
     calibration_split: str | None
     profile: Mapping[str, Any] | None
     latency: Mapping[str, Any] | None
+    binary_operation: Mapping[str, Any] | None
+    source: Mapping[str, Any]
+    numeric_source: Mapping[str, Any] | None
+    pwl_authority: Mapping[str, Any] | None
     gpu_lease: Mapping[str, Any] | None
     pwl_stage_a: Mapping[str, str] | None
     comparison: Mapping[str, str] | None
@@ -1326,6 +1346,7 @@ class CandidateResult:
         expected_profile_parent: Mapping[str, str] | None = None
         expected_profile_source: Mapping[str, Any] | None = None
         expected_pwl_stage_a: Mapping[str, str] | None = None
+        pwl_authority: Mapping[str, Any] | None = None
         if candidate.route == 'ssm-quant-pwl':
             try:
                 from .numeric_runtime import resolve_numeric_runtime
@@ -1360,6 +1381,72 @@ class CandidateResult:
                     'checkpoint_sha256': candidate.checkpoint_sha256,
                 })
                 expected_pwl_stage_a = numeric_runtime.get('pwl_stage_a')
+                if candidate.kind == 'pwl':
+                    from .numeric_source import validate_numeric_config_closure
+
+                    installation_reference = numeric_runtime.get(
+                        'pwl_installation')
+                    if not isinstance(installation_reference, Mapping):
+                        raise ValueError(
+                            'PWL runtime installation reference is missing')
+                    installation_path = repository_root / str(
+                        installation_reference.get('path'))
+                    installation = json.loads(
+                        installation_path.read_text(encoding='utf-8'))
+                    fit_reference = installation.get('fit_artifact') \
+                        if isinstance(installation, Mapping) else None
+                    if not isinstance(fit_reference, Mapping):
+                        raise ValueError('PWL runtime fit reference is missing')
+                    calibration_path = repository_root / str(
+                        fit_reference.get('path'))
+                    calibration = json.loads(
+                        calibration_path.read_text(encoding='utf-8'))
+                    fit = calibration.get('pwl_fit') \
+                        if isinstance(calibration, Mapping) else None
+                    protocol = calibration.get('protocol') \
+                        if isinstance(calibration, Mapping) else None
+                    if (
+                            not isinstance(calibration, Mapping)
+                            or calibration.get('schema_version') != 3
+                            or not isinstance(fit, Mapping)
+                            or fit.get('selection_policy') !=
+                            'observed-range-max-then-mean-v1'
+                            or not isinstance(protocol, Mapping)
+                            or not isinstance(
+                                protocol.get('sample_order_sha256'), str)
+                            or not re.fullmatch(
+                                r'[0-9a-f]{64}',
+                                protocol['sample_order_sha256'])):
+                        raise ValueError(
+                            'PWL schema-v3 fit selection/order is invalid')
+                    operation_manifest = installation.get(
+                        'operation_manifest')
+                    if not isinstance(operation_manifest, Mapping):
+                        raise ValueError(
+                            'PWL installation operation manifest is invalid')
+                    pwl_authority = MappingProxyType({
+                        **dict(expected_profile_source),
+                        'seed': candidate.seed,
+                        'config_closure': tuple(
+                            validate_numeric_config_closure(
+                                repository_root, candidate.config,
+                                git_commit=expected_profile_source[
+                                    'git_commit'])),
+                        'calibration': MappingProxyType({
+                            **dict(fit_reference),
+                            'schema_version': 3,
+                            'sample_order_sha256': protocol[
+                                'sample_order_sha256'],
+                        }),
+                        'selection_policy': fit['selection_policy'],
+                        'installation': MappingProxyType(
+                            dict(installation_reference)),
+                        'operation_manifest_sha256': _bytes_sha256(
+                            json.dumps(
+                                operation_manifest, sort_keys=True,
+                                separators=(',', ':'), allow_nan=False,
+                            ).encode('utf-8')),
+                    })
             except (OSError, json.JSONDecodeError, ValueError) as error:
                 raise MetricError(
                     f'numeric profile authority is invalid: {error}') from error
@@ -1421,6 +1508,26 @@ class CandidateResult:
             expected_runtime=expected_runtime, authority=authority,
             expected_pwl_stage_a=expected_pwl_stage_a,
             expected_comparison=expected_comparison)
+        binary_operation: Mapping[str, Any] | None = None
+        if candidate.kind == 'binary-qk':
+            try:
+                from .binary_operation import validate_binary_artifact_bundle
+                binary_operation = _freeze(validate_binary_artifact_bundle(
+                    profile_path=profile_path.relative_to(repository_root),
+                    evaluation_path=path.relative_to(repository_root),
+                    latency_path=latency_path.relative_to(repository_root),
+                    repository_root=repository_root,
+                    candidate_id=candidate_id))
+            except ValueError as error:
+                raise MetricError(
+                    f'binary CandidateResult binding is invalid: {error}') from error
+        elif (
+                profile.get('binary_qk_operation') is not None
+                or profile.get('binary_qk_smoke') is not None
+                or validated.get('binary_qk_profile') is not None
+                or latency.get('binary_qk_profile') is not None):
+            raise MetricError(
+                'non-binary CandidateResult contains Binary Q/K evidence')
         if (
                 profile['schema_version'] == 2
                 and profile['device']['physical_index'] !=
@@ -1470,6 +1577,10 @@ class CandidateResult:
                 raise MetricError(
                     'combined comparison differs across terminal artifacts')
             artifact_paths['comparison'] = comparison_path.resolve()
+        if candidate.kind == 'binary-qk':
+            smoke_binding = profile.get('binary_qk_smoke')
+            smoke_path = repository_root / str(smoke_binding['path'])
+            artifact_paths['smoke'] = smoke_path.resolve()
         try:
             for artifact in artifact_paths.values():
                 artifact.relative_to(root.resolve())
@@ -1477,7 +1588,9 @@ class CandidateResult:
             raise MetricError('candidate artifact path escapes its directory') from error
         return cls(
             candidate_id=candidate_id,
+            candidate_kind=candidate.kind,
             route=route,
+            seed=candidate.seed,
             metrics=metrics,
             flip_test=mode == 'flip',
             provenance=MappingProxyType(provenance),
@@ -1486,6 +1599,13 @@ class CandidateResult:
             calibration_split=calibration_split,
             profile=profile,
             latency=latency,
+            binary_operation=binary_operation,
+            source=_freeze(source),
+            numeric_source=(
+                _freeze(expected_profile_source)
+                if expected_profile_source is not None else None),
+            pwl_authority=(
+                _freeze(pwl_authority) if pwl_authority is not None else None),
             gpu_lease=gpu_lease,
             pwl_stage_a=(
                 _freeze(expected_pwl_stage_a)
@@ -1520,11 +1640,18 @@ def _load_profile(
         runtime_fields.add('source')
     if expected_pwl_stage_a is not None:
         runtime_fields.add('pwl_stage_a')
+    binary_legacy_fields = legacy_fields | {
+        'binary_qk_operation', 'binary_qk_smoke'}
+    binary_runtime_fields = runtime_fields | {
+        'binary_qk_operation', 'binary_qk_smoke'}
     if (
             not isinstance(value, Mapping)
-            or set(value) not in (legacy_fields, runtime_fields)):
+            or set(value) not in (
+                legacy_fields, runtime_fields,
+                binary_legacy_fields, binary_runtime_fields)):
         raise MetricError('profile artifact has invalid fields')
-    expected_schema = 2 if set(value) == runtime_fields else 1
+    expected_schema = (
+        2 if set(value) in (runtime_fields, binary_runtime_fields) else 1)
     if (
             value['schema_version'] != expected_schema
             or value['candidate'] != candidate_id):
@@ -1616,6 +1743,13 @@ def _load_profile(
         raise MetricError('profile config identity is invalid')
     if not isinstance(value['checkpoint'], str) or not value['checkpoint']:
         raise MetricError('profile checkpoint identity is invalid')
+    if value.get('binary_qk_operation') is not None:
+        try:
+            from .binary_operation import validate_binary_operation_manifest
+            validate_binary_operation_manifest(value['binary_qk_operation'])
+        except ValueError as error:
+            raise MetricError(
+                f'profile binary operation is invalid: {error}') from error
     return _freeze(value)
 
 
@@ -1681,7 +1815,8 @@ def validate_latency_envelope(
     result = envelope['result']
     base_result_fields = {
         'route', 'provenance', 'protocol', 'modes', 'gpu_lease'}
-    optional_result_fields = {'source', 'pwl_stage_a', 'comparison'}
+    optional_result_fields = {
+        'source', 'pwl_stage_a', 'comparison', 'binary_qk_profile'}
     if (
             not isinstance(result, Mapping)
             or not base_result_fields.issubset(result)
@@ -1690,6 +1825,13 @@ def validate_latency_envelope(
             or not isinstance(result['route'], str)
             or not result['route']):
         raise MetricError('latency artifact provenance or route mismatch')
+    if result.get('binary_qk_profile') is not None:
+        try:
+            from .binary_operation import validate_binary_profile_binding
+            validate_binary_profile_binding(result['binary_qk_profile'])
+        except ValueError as error:
+            raise MetricError(
+                f'latency binary profile binding is invalid: {error}') from error
     source = result.get('source')
     if require_source_binding and source is None:
         raise MetricError('latency source manifest binding is required')

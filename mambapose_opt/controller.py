@@ -38,7 +38,10 @@ from .schema import CandidateSpec
 STAGES = ('profile', 'calibrate', 'train', 'evaluate', 'latency', 'compare')
 _KNOWN_STAGES = frozenset(STAGES) | {
     'convert', 'export', 'pwl-selection', 'smoke-stage-a'}
-CUDA_STAGES = (frozenset(STAGES) - {'compare'}) | {'smoke-stage-a'}
+# Binary Q/K smoke owns and records its canonical GPU lease. PWL smoke instead
+# uses the controller lease; that route-dependent exception is handled by the
+# controller.
+CUDA_STAGES = frozenset(STAGES) - {'compare'}
 StageRunner = Callable[[CandidateSpec, str, Path, int], 'StageOutcome']
 ArtifactValidator = Callable[[str, 'StageOutcome'], bool]
 
@@ -256,6 +259,12 @@ class OptimizationController:
             self.root / self.candidate.route / self.candidate.id /
             str(self.candidate.seed) / stage)
 
+    def _controller_owns_cuda_stage(self, stage: str) -> bool:
+        return (
+            stage in CUDA_STAGES
+            or (stage == 'smoke-stage-a'
+                and self.candidate.kind != 'binary-qk'))
+
     def _next_stage(self) -> str | None:
         runs = self.store.read().get('runs', {})
         for stage in self.stages:
@@ -318,6 +327,21 @@ class OptimizationController:
                     f'PWL selection artifact is invalid: {error}') from error
             return 'pwl-four-candidate-selection-v1'
         if stage == 'smoke-stage-a':
+            if self.candidate.kind == 'binary-qk':
+                try:
+                    from .binary_smoke import validate_binary_stage_a_artifact
+                    validate_binary_stage_a_artifact(
+                        path.relative_to(self.repository_root),
+                        repository_root=self.repository_root)
+                except ValueError as error:
+                    raise ArtifactValidationError(
+                        'binary Stage-A smoke artifact is invalid: '
+                        f'{error}') from error
+                return 'binary-qk-stage-a-full-model-smoke-v2'
+            if self.candidate.features.get('numeric_kind') not in {
+                    'pwl', 'pwl-combined'}:
+                raise ArtifactValidationError(
+                    'Stage-A smoke candidate kind is unsupported')
             try:
                 from .pwl_smoke import validate_pwl_stage_a_artifact
                 validated_smoke = validate_pwl_stage_a_artifact(
@@ -364,6 +388,8 @@ class OptimizationController:
                 if self.candidate.features.get('numeric_kind') in {
                         'pwl', 'pwl-combined'}:
                     required.add('pwl_stage_a')
+            if self.candidate.kind == 'binary-qk':
+                required.update({'binary_qk_operation', 'binary_qk_smoke'})
             if set(value) != required:
                 raise ArtifactValidationError(
                     'profile artifact fields do not match its schema version')
@@ -494,6 +520,24 @@ class OptimizationController:
                         for record in modules)):
                 raise ArtifactValidationError(
                     'profile artifact modules list is invalid')
+            if self.candidate.kind == 'binary-qk':
+                try:
+                    from .binary_operation import (
+                        binary_smoke_binding_for_profile,
+                        validate_binary_operation_manifest)
+                    operation = validate_binary_operation_manifest(
+                        value.get('binary_qk_operation'))
+                    expected_smoke = binary_smoke_binding_for_profile(
+                        path.relative_to(self.repository_root),
+                        repository_root=self.repository_root,
+                        candidate_id=self.candidate.id,
+                        operation=operation)
+                    if value.get('binary_qk_smoke') != expected_smoke:
+                        raise ValueError(
+                            'binary profile Stage-A smoke binding mismatch')
+                except ValueError as error:
+                    raise ArtifactValidationError(
+                        f'binary profile operation is invalid: {error}') from error
             return f'optimization-profile-v{version}'
 
         required = {'schema_version', 'candidate_id', 'stage', 'result'}
@@ -625,13 +669,6 @@ class OptimizationController:
                 expected_checkpoint_sha = self.candidate.checkpoint_sha256
                 runtime_config_path = self.repository_root / self.candidate.config
                 if self.candidate.route == 'ssm-quant-pwl':
-                    if (
-                            any(part in {'.', '..'} for part in Path(path).parts)
-                            or Path(path).absolute() !=
-                            (self._stage_dir(stage) / f'{stage}.json')):
-                        raise MetricError(
-                            'PWL evaluate artifact path is not canonical')
-                    from .checkpoints import authorize_pwl_runtime_config
                     from .numeric_runtime import resolve_numeric_runtime
                     runtime = resolve_numeric_runtime(
                         self.candidate, repository_root=self.repository_root,
@@ -643,19 +680,31 @@ class OptimizationController:
                     expected_checkpoint = runtime['checkpoint_name']
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
                     expected_pwl_stage_a = runtime.get('pwl_stage_a')
-                    config_authority = authorize_pwl_runtime_config(
-                        self.repository_root, self.manifest_path,
-                        self.candidate,
-                        conversion_path=(
-                            path.parent.parent / 'convert/convert.json'))
-                    if (
-                            config_authority.path !=
-                            runtime_config_path.resolve(strict=True)
-                            or config_authority.sha256 !=
-                            runtime['config_sha256']):
-                        raise ValueError(
-                            'PWL runtime ConfigAuthority differs from '
-                            'resolved stage runtime')
+                    if self.candidate.features.get('numeric_kind') in {
+                            'pwl', 'pwl-combined'}:
+                        if (
+                                any(part in {'.', '..'}
+                                    for part in Path(path).parts)
+                                or Path(path).absolute() !=
+                                (self._stage_dir(stage) / f'{stage}.json')):
+                            raise MetricError(
+                                'PWL evaluate artifact path is not canonical')
+                        from .checkpoints import authorize_pwl_runtime_config
+                        config_authority = authorize_pwl_runtime_config(
+                            self.repository_root, self.manifest_path,
+                            self.candidate,
+                            conversion_path=(
+                                path.parent.parent / 'convert/convert.json'))
+                        if (
+                                config_authority.path !=
+                                runtime_config_path.resolve(strict=True)
+                                or config_authority.sha256 !=
+                                runtime['config_sha256']):
+                            raise ValueError(
+                                'PWL runtime ConfigAuthority differs from '
+                                'resolved stage runtime')
+                    else:
+                        config_authority = None
                 else:
                     expected_pwl_stage_a = None
                     config_authority = None
@@ -684,6 +733,16 @@ class OptimizationController:
                     config=config, repository_root=self.repository_root)
                 if config_authority is not None:
                     config_authority.verify()
+                if self.candidate.kind == 'binary-qk':
+                    from .binary_operation import validate_binary_stage_binding
+                    validate_binary_stage_binding(
+                        profile_path=(path.parent.parent /
+                                      'profile/profile.json').relative_to(
+                                          self.repository_root),
+                        stage_path=path.relative_to(self.repository_root),
+                        repository_root=self.repository_root,
+                        candidate_id=self.candidate.id,
+                        stage='evaluate')
             except (MetricError, OSError, ValueError) as error:
                 raise ArtifactValidationError(
                     f'evaluate artifact is invalid: {error}') from error
@@ -716,13 +775,6 @@ class OptimizationController:
                 expected_config_sha = source['config_sha256']
                 runtime_config_path = self.repository_root / self.candidate.config
                 if self.candidate.route == 'ssm-quant-pwl':
-                    if (
-                            any(part in {'.', '..'} for part in Path(path).parts)
-                            or Path(path).absolute() !=
-                            (self._stage_dir(stage) / f'{stage}.json')):
-                        raise MetricError(
-                            'PWL latency artifact path is not canonical')
-                    from .checkpoints import authorize_pwl_runtime_config
                     from .numeric_runtime import resolve_numeric_runtime
                     runtime = resolve_numeric_runtime(
                         self.candidate, repository_root=self.repository_root,
@@ -735,19 +787,31 @@ class OptimizationController:
                     expected_checkpoint_sha = runtime['checkpoint_sha256']
                     expected_config_sha = runtime['config_sha256']
                     expected_pwl_stage_a = runtime.get('pwl_stage_a')
-                    config_authority = authorize_pwl_runtime_config(
-                        self.repository_root, self.manifest_path,
-                        self.candidate,
-                        conversion_path=(
-                            path.parent.parent / 'convert/convert.json'))
-                    if (
-                            config_authority.path !=
-                            runtime_config_path.resolve(strict=True)
-                            or config_authority.sha256 !=
-                            expected_config_sha):
-                        raise ValueError(
-                            'PWL runtime ConfigAuthority differs from '
-                            'resolved stage runtime')
+                    if self.candidate.features.get('numeric_kind') in {
+                            'pwl', 'pwl-combined'}:
+                        if (
+                                any(part in {'.', '..'}
+                                    for part in Path(path).parts)
+                                or Path(path).absolute() !=
+                                (self._stage_dir(stage) / f'{stage}.json')):
+                            raise MetricError(
+                                'PWL latency artifact path is not canonical')
+                        from .checkpoints import authorize_pwl_runtime_config
+                        config_authority = authorize_pwl_runtime_config(
+                            self.repository_root, self.manifest_path,
+                            self.candidate,
+                            conversion_path=(
+                                path.parent.parent / 'convert/convert.json'))
+                        if (
+                                config_authority.path !=
+                                runtime_config_path.resolve(strict=True)
+                                or config_authority.sha256 !=
+                                expected_config_sha):
+                            raise ValueError(
+                                'PWL runtime ConfigAuthority differs from '
+                                'resolved stage runtime')
+                    else:
+                        config_authority = None
                 else:
                     expected_pwl_stage_a = None
                     config_authority = None
@@ -796,6 +860,16 @@ class OptimizationController:
                     repository_root=self.repository_root)
                 if config_authority is not None:
                     config_authority.verify()
+                if self.candidate.kind == 'binary-qk':
+                    from .binary_operation import validate_binary_stage_binding
+                    validate_binary_stage_binding(
+                        profile_path=(path.parent.parent /
+                                      'profile/profile.json').relative_to(
+                                          self.repository_root),
+                        stage_path=path.relative_to(self.repository_root),
+                        repository_root=self.repository_root,
+                        candidate_id=self.candidate.id,
+                        stage='latency')
             except (MetricError, OSError, ValueError) as error:
                 raise ArtifactValidationError(
                     f'latency artifact is invalid: {error}') from error
@@ -886,10 +960,10 @@ class OptimizationController:
         try:
             stored_lease = (
                 self._stored_gpu_lease(run)
-                if stage in {'latency', 'smoke-stage-a'} else None)
+                if self._controller_owns_cuda_stage(stage) else None)
             lease_validated_at = (
                 self._stored_lease_validated_at(run)
-                if stage in {'latency', 'smoke-stage-a'} else None)
+                if self._controller_owns_cuda_stage(stage) else None)
             for record in evidence:
                 if not isinstance(record, dict):
                     return False
@@ -1148,7 +1222,7 @@ class OptimizationController:
         stage_dir.mkdir(parents=True, exist_ok=True)
         lease: GpuLease | None = None
         try:
-            if stage in CUDA_STAGES:
+            if self._controller_owns_cuda_stage(stage):
                 with exclusive_cuda_stage(
                         self.gpu_lock_path, self.device_index,
                         self.allowed_pids, stage_id=stage_id) as acquired:
@@ -1193,7 +1267,7 @@ class OptimizationController:
             return normalized
         try:
             lease_validated_at = (
-                self.now() if stage in {'latency', 'smoke-stage-a'} else None)
+                self.now() if self._controller_owns_cuda_stage(stage) else None)
             evidence = self._validate_artifacts(
                 stage, outcome, lease_validated_at=lease_validated_at)
         except Exception as error:

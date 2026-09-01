@@ -235,6 +235,11 @@ def evaluate(
     }
     if candidate.features.get('numeric_kind') in {'pwl', 'pwl-combined'}:
         result['pwl_stage_a'] = dict(runtime['pwl_stage_a'])
+    if candidate.kind == 'binary-qk':
+        from mambapose_opt.binary_operation import (
+            binary_profile_binding_for_stage)
+        result['binary_qk_profile'] = binary_profile_binding_for_stage(
+            output.relative_to(REPO_ROOT), repository_root=REPO_ROOT)
     return stage_envelope(candidate.id, 'evaluate', result)
 
 

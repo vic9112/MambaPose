@@ -232,7 +232,7 @@ def test_route3_stage_plans_follow_numeric_admission_order():
     with pytest.raises(ValueError, match='conditional admission'):
         numeric_stage_plan('binary-qk', conditional=False)
     assert numeric_stage_plan('binary-qk', conditional=True) == (
-        'profile', 'evaluate', 'latency')
+        'smoke-stage-a', 'profile', 'evaluate', 'latency')
     assert all(
         'compare' not in numeric_stage_plan(kind, conditional=conditional)
         for kind, conditional in (
@@ -2083,8 +2083,9 @@ def test_campaign_does_not_auto_select_opt_in_numeric_candidates():
     assert _select((baseline, opt_in), (), admit_conditional=False) == (baseline,)
     with pytest.raises(ValueError, match='conditional'):
         _select((baseline, opt_in), ('binary',), admit_conditional=False)
-    assert _select(
-        (baseline, opt_in), ('binary',), admit_conditional=True) == (opt_in,)
+    with pytest.raises(ValueError, match='Stage-B PWL dependency'):
+        _select(
+            (baseline, opt_in), ('binary',), admit_conditional=True)
 
 
 def test_campaign_uses_route_specific_numeric_stage_plan():

@@ -7,8 +7,11 @@ numeric_optimization = dict(
     qk_ste=True, preserve_scale=True, softmax='floating', value='floating',
     attention_accumulation='floating', output_projection='floating',
     report='theoretical-changed-multiplies-separate-from-latency',
-    stage_order=('profile', 'evaluate', 'latency'),
+    stage_order=('smoke-stage-a', 'profile', 'evaluate', 'latency'),
+    reference_scope='mechanism-inspired-sign-only-qk-preliminary',
+    learnable_attention_bias=False, binaryattention_reproduction=False,
     train_envelope=dict(
-        recovery='one-bounded-qat-and-distillation-run',
-        requires_attributed_error=True, max_preliminary_ap_drop=0.3),
+        recovery='one-bounded-qat-self-distillation-after-stage-b-only',
+        requires_stage_b_pass=True, requires_attributed_error=True,
+        max_preliminary_ap_drop=0.3),
 )

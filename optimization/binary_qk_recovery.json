@@ -1,0 +1,121 @@
+{
+  "artifact_kind": "binary-qk-recovery-operation-readiness",
+  "base_training_epochs": 300,
+  "checkpoint": {
+    "path": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
+    "role": "strict-full-s-v1-initialization-for-teacher-and-student",
+    "sha256": "a6f76dae86db4d92c445f26a428b61911e8b42c4de2119348997e9537cc7cdd2"
+  },
+  "config": {
+    "config_closure": [
+      {
+        "path": "configs/_base_/default_runtime.py",
+        "sha256": "bb7df18270b1ca337192faae7a416b2dea23b45e798e832caab5781f41189d06"
+      },
+      {
+        "path": "configs/body_2d_keypoint/tokenpose/mamba_tokenpose_T2_coco_256x192_300ep.py",
+        "sha256": "f04bba18bc32e5eec64173f9e1106a3bd9d0f19ed07e9a8db83f66d5ddda905b"
+      },
+      {
+        "path": "configs/optimization/coco_s_v1_deterministic.py",
+        "sha256": "ef286266687db91059d3e4cc830c394cf166baa5762e1cb19db36de5e9dfdc48"
+      },
+      {
+        "path": "configs/optimization/recovery/binary_qk_s_v1.py",
+        "sha256": "505b98379110c9c0c84c0c9b5fe7415941f78781cded07b3f9133ea0639e7092"
+      },
+      {
+        "path": "configs/reproduction/coco_s_v1.py",
+        "sha256": "7aa78c2b8394b57b16517380a479adb5c3b3161cadb802c26c2d2f66583a6b34"
+      }
+    ],
+    "path": "configs/optimization/recovery/binary_qk_s_v1.py",
+    "sha256": "505b98379110c9c0c84c0c9b5fe7415941f78781cded07b3f9133ea0639e7092"
+  },
+  "deployment": {
+    "cpu_smoke_scope": "binary-qk-transformer",
+    "config": {
+      "config_closure": [
+        {
+          "path": "configs/_base_/default_runtime.py",
+          "sha256": "bb7df18270b1ca337192faae7a416b2dea23b45e798e832caab5781f41189d06"
+        },
+        {
+          "path": "configs/body_2d_keypoint/tokenpose/mamba_tokenpose_T2_coco_256x192_300ep.py",
+          "sha256": "f04bba18bc32e5eec64173f9e1106a3bd9d0f19ed07e9a8db83f66d5ddda905b"
+        },
+        {
+          "path": "configs/optimization/coco_s_v1_deterministic.py",
+          "sha256": "ef286266687db91059d3e4cc830c394cf166baa5762e1cb19db36de5e9dfdc48"
+        },
+        {
+          "path": "configs/optimization/recovery/binary_qk_s_v1_deploy.py",
+          "sha256": "a22340fc79cd49284c68946c13563f578372f11c31d2e90211e1aa6786fe85df"
+        },
+        {
+          "path": "configs/reproduction/coco_s_v1.py",
+          "sha256": "7aa78c2b8394b57b16517380a479adb5c3b3161cadb802c26c2d2f66583a6b34"
+        }
+      ],
+      "path": "configs/optimization/recovery/binary_qk_s_v1_deploy.py",
+      "sha256": "a22340fc79cd49284c68946c13563f578372f11c31d2e90211e1aa6786fe85df"
+    },
+    "qk_mode": "binary_scaled"
+  },
+  "loss": {
+    "distillation_target": "final-heatmap-mse",
+    "distillation_weight": 0.25,
+    "supervised": "heatmap-mse-with-target-weight"
+  },
+  "operation": {
+    "bitwise_kernel_present": false,
+    "head_dim_scale": "original head_dim^-0.5 after scaled signed dot",
+    "k_scale": "abs(k).mean(token).mean(channel) per batch/head",
+    "pure_bitwise_cost_claim": false,
+    "q_scale": "abs(q).mean(token).mean(channel) per batch/head",
+    "qk_mode": "binary_scaled",
+    "runtime_operations": [
+      "q_abs",
+      "q_token_mean",
+      "q_channel_mean",
+      "k_abs",
+      "k_token_mean",
+      "k_channel_mean",
+      "signed_dot_scale_multiply_q",
+      "signed_dot_scale_multiply_k",
+      "original_head_dim_scale_multiply"
+    ],
+    "signed_dot_backend": "torch-einsum-float-proxy",
+    "softmax": "floating",
+    "ste": "identity-gradient-sign-with-zero-positive",
+    "value_and_output_projection": "floating"
+  },
+  "optional_extensions": {
+    "relative_attention_bias": {
+      "enabled": false,
+      "reason": "DeiT 2-D relative bias does not transfer directly to the mixed 17 keypoint and spatial token sequence"
+    }
+  },
+  "schedule": {
+    "deterministic": true,
+    "epochs": 60,
+    "fraction_of_base_training": 0.2,
+    "schedule_extensible": true,
+    "seed": 0
+  },
+  "schema_version": 2,
+  "student": {
+    "learnable_attention_bias": false,
+    "new_checkpoint_parameters": [],
+    "qk_mode": "binary_scaled"
+  },
+  "teacher": {
+    "frozen": true,
+    "qk_mode": "float",
+    "uses_same_checkpoint_as_student": true
+  },
+  "verification_commands": {
+    "cpu_tests": "PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -o addopts='' -q tests/test_optimization/test_binary_qk.py tests/test_optimization/test_binary_qk_recovery.py tests/test_optimization/test_binary_readiness.py",
+    "prepare": "PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python tools/optimization/train_binary_qk_recovery.py --prepare-only"
+  }
+}

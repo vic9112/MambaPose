@@ -231,10 +231,20 @@ Candidates progress from least to most invasive:
    a declared domain, saturation behavior, segment count, maximum/mean error,
    and differentiable QAT form. `exp`, `softplus`, SiLU, and GELU are not
    replaced as a group; each is evaluated separately.
-5. Deterministic Binary Q/K in the six Transformer layers, with QAT and
-   distillation. V and attention accumulation remain multi-bit. Because this
-   affects only the small head, it is retained only if it removes meaningful
-   multiplies without consuming the AP budget.
+5. A mechanism-inspired deterministic sign-only Q/K candidate in the exact six
+   Transformer layers. This preliminary path uses zero-to-positive sign,
+   identity STE, the original floating scale, and floating softmax, V, AV, and
+   output projection. It intentionally omits BinaryAttention's learnable
+   attention bias and is therefore not a reproduction of the full
+   BinaryAttention method. QAT plus self-distillation is a single bounded
+   recovery option only after the candidate passes the Stage-B admission gate.
+   Because this affects only the small head, it is retained only if its exact
+   operation inventory removes meaningful QK multiplications without consuming
+   the AP budget.
+
+The Binary Q/K PyTorch path is a software proxy. BinaryAttention's reported
+speedup depends on a dedicated bitwise A100 kernel; this candidate has no such
+kernel and makes no latency, bitwise-kernel, FPGA-resource, or speedup claim.
 
 PTQ is a screening mechanism. A candidate outside the recoverable preliminary
 band may not proceed to a long QAT run without an identified error source.
@@ -254,6 +264,21 @@ Before dataset evaluation, every candidate must pass:
 - deterministic fixed-index tables and no validation-set calibration;
 - serialization/resume and clean-export tests;
 - operation inventory proving the claimed dynamic operation or precision change.
+
+For Binary Q/K, Stage A is an explicit full-model one-batch smoke before any
+profile or evaluation. All six canonical `to_qkv.weight` targets must have
+finite, non-zero Q/K-slice gradients, changed Q/K parameters, and finite Adam
+state after the optimizer step. The exported restricted state must rebuild
+with all implicit pretrained initializers neutralized and reproduce state and
+output exactly. Profile, evaluation, and latency artifacts are hash-bound to
+this smoke artifact and its exact six-layer operation manifest.
+
+Binary admission additionally inherits one public-valid passed PWL Stage-B
+result. Its source commit, current candidate-row identity, complete inherited
+config closure, checkpoint, schema-v3 fit and sample order, selection policy,
+installation report, and installed operation hash must all agree across flip
+and no-flip evidence. Missing, stale, alternate, or symlink-aliased authority
+fails closed.
 
 ### Stage B: Preliminary Screen
 
@@ -341,7 +366,10 @@ A retained candidate must also provide a concrete hardware-facing improvement:
 - store at least 80% of MAC-bearing weights at 8 bits or below with a measured
   model-byte reduction; or
 - replace a declared nonlinear operator with a bounded PWL implementation that
-  survives the AP gate.
+  survives the AP gate; or
+- provide the canonical six-layer Binary Q/K manifest proving 6,489,600
+  theoretical floating QK multiplications are replaced, while explicitly
+  recording that no bitwise kernel or measured speedup exists.
 
 Among passing candidates, selection prefers the simplest exported graph first,
 then lower model bytes and greater low-bit MAC coverage. GPU latency breaks ties

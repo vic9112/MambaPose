@@ -149,6 +149,14 @@ class MambaTokenHead(BaseHead):
             dict: A dictionary of losses.
         """
         pred_fields = self.forward(feats)
+        return self.loss_from_output(
+            pred_fields, batch_data_samples, train_cfg=train_cfg)
+
+    def loss_from_output(
+            self, pred_fields: Tensor,
+            batch_data_samples: OptSampleList,
+            train_cfg: ConfigType = {}) -> dict:
+        """Calculate supervised loss without repeating the model forward."""
         gt_heatmaps = torch.stack(
             [d.gt_fields.heatmaps for d in batch_data_samples])
         keypoint_weights = torch.cat([

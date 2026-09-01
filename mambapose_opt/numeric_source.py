@@ -118,11 +118,14 @@ def resolve_numeric_file(
 
 
 def validate_numeric_config_closure(
-        repository_root: Path, config_path: Path, *, git_commit: str,
+        repository_root: Path, config_path: Path, *,
+        git_commit: str | None = None,
         ) -> tuple[dict[str, str], ...]:
-    """Reconstruct and bind every Python config inherited at one commit."""
+    """Reconstruct every inherited config, optionally binding one commit."""
     root = Path(repository_root).resolve(strict=True)
-    if not isinstance(git_commit, str) or not _COMMIT.fullmatch(git_commit):
+    if git_commit is not None and (
+            not isinstance(git_commit, str)
+            or not _COMMIT.fullmatch(git_commit)):
         raise NumericSourceError('numeric config commit is invalid')
     start = _relative(root, config_path, 'config')
     visited: dict[str, str] = {}
@@ -140,8 +143,11 @@ def validate_numeric_config_closure(
             return
         current = resolve_numeric_file(
             root, Path(normalized), 'numeric config dependency')
-        blob = _blob(root, git_commit, normalized)
-        if current.read_bytes() != blob:
+        current_bytes = current.read_bytes()
+        blob = (
+            _blob(root, git_commit, normalized)
+            if git_commit is not None else current_bytes)
+        if current_bytes != blob:
             raise NumericSourceError(
                 f'numeric config dependency differs from clean commit: '
                 f'{normalized}')
