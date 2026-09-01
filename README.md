@@ -124,7 +124,9 @@ CPU-only publication verification can be run without starting a training job:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B -m pytest \
-  tests/test_optimization tests/test_reproduction -q
+  tests/test_optimization -q
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B -m pytest \
+  tests/test_reproduction -q
 ```
 
 Training and evaluation commands are deliberately not started by importing the
