@@ -949,7 +949,9 @@ def run_pwl_stage_a_smoke(
     if selection['selected_candidate_id'] != candidate.id:
         raise ValueError('PWL smoke candidate is not selected')
     loader_config = _smoke_dataloader(config.train_dataloader)
-    state = tensor_state(authorized.checkpoint_path)
+    state = tensor_state(
+        authorized.checkpoint_path,
+        expected_sha256=authorized.candidate.checkpoint_sha256)
     _prepare_smoke_output_directory(output)
     try:
         lease_value = _active_controller_lease(

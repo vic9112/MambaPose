@@ -60,18 +60,9 @@ def load_hash_validated_checkpoint(
         raise ValueError('expected_sha256 must be a lowercase sha256')
     if not path.is_file():
         raise FileNotFoundError(f'teacher checkpoint does not exist: {path}')
-    actual = _sha256(path)
-    if actual != expected_sha256:
-        raise ValueError(
-            f'checkpoint sha256 mismatch: expected '
-            f'{expected_sha256}, got {actual}')
+    from mambapose_opt.checkpoints import tensor_state
 
-    payload = torch.load(path, map_location='cpu', weights_only=False)
-    if not isinstance(payload, Mapping):
-        raise ValueError('teacher checkpoint must contain a mapping')
-    state_dict = payload.get('state_dict', payload.get('model', payload))
-    if not isinstance(state_dict, Mapping) or not state_dict:
-        raise ValueError('teacher checkpoint state_dict must be non-empty')
+    state_dict = tensor_state(path, expected_sha256=expected_sha256)
     model.load_state_dict(state_dict, strict=strict)
 
 

@@ -54,9 +54,9 @@ The acceptance target requested for algorithm optimization is less than
 
 | Direction | What is changed | Current accuracy evidence | Compute/resource implication | Decision |
 | --- | --- | --- | --- | --- |
-| 1. Structural pruning / lower compute: no-PIF | Remove the PIF branch, including 38 tensors, 3 head Mamba blocks, 2 LayerNorms, the scalar gate, and dynamic top-k/gather/scan work | Frozen matched evaluation: 73.076 AP vs 72.832 baseline, or +0.244 AP. A separate formal seed-0 retrain completed at 72.968 AP with flip test, but its paired full arm was paused before completion | Parameters 22.029M → 20.713M (-5.97%); RTX 5090 batch-1 median latency improved 29.361 → 26.367 ms with flip (-10.20%) and 24.989 → 23.323 ms without flip (-6.67%) | **Primary recommendation** |
+| 1. Structural pruning / lower compute: no-PIF | Remove the PIF branch, including 38 tensors, 3 head Mamba blocks, 2 LayerNorms, the scalar gate, and dynamic top-k/gather/scan work | Frozen matched evaluation: 73.076 AP vs 72.832 baseline, or +0.244 AP. A separate config-matched local seed-0 run reached 72.968 AP with flip test; it is not an admitted arm of the merged formal contract | Parameters 22.029M → 20.713M (-5.97%); local RTX 5090 batch-1 median latency improved 29.361 → 26.367 ms with flip (-10.20%) and 24.989 → 23.323 ms without flip (-6.67%) | **Primary recommendation** |
 | 2. Hardware-friendly nonlinear approximation: PWL Softplus | Replace the five SS2D transition Softplus roles with a 16-segment PWL function on [-8, 8] and continuous asymptotic tails | Flip AP 72.848 vs 72.832 (+0.016); no-flip AP 72.288 vs 72.313 (-0.025). Both satisfy the 0.1 AP target on the frozen checkpoint | Parameters and checkpoint bytes are unchanged. It removes these five exact Softplus evaluations, but current PyTorch median latency does not prove a speedup | **Complementary candidate** after direct no-PIF+PWL validation |
-| 3. Low-bit attention plus QAT/self-distillation: Binary Q/K | Deterministic scaled sign Q/K with STE, 60-epoch QAT, frozen float teacher, and final-heatmap distillation | Flip AP 71.078, a 1.754 AP drop; no-flip AP 69.487, a 2.826 AP drop | Only 6,489,600 of 115,418,160 attention multiplications (5.62%) are replaced in the modeled operation; softmax, V path, projections, and the Mamba backbone remain floating point. The current implementation is a float proxy, not a bit-packed FPGA kernel | **Reject for the current accuracy target** |
+| 3. Low-bit attention plus QAT/self-distillation: Binary Q/K | Deterministic scaled sign Q/K with STE, 60-epoch QAT, frozen float teacher, and final-heatmap distillation | Local post-QAT evaluation: flip AP 71.078, a 1.754 AP drop; no-flip AP 69.487, a 2.826 AP drop | Only 6,489,600 of 115,418,160 attention multiplications (5.62%) are replaced in the modeled operation; softmax, V path, projections, and the Mamba backbone remain floating point. The current implementation is a float proxy, not a bit-packed FPGA kernel | **Reject for the current accuracy target** |
 
 ### Direction 1: no-PIF
 
@@ -65,16 +65,22 @@ dynamic branch and reduced both model size and measured end-to-end CUDA latency
 without an observed AP penalty. The published inference checkpoint is
 `mambapose-coco-s-v1-no-pif-best.pth`, SHA-256
 `28cd02405e58d619896a0430f91936684084ef7e3423d507c7a10b743759a5fb`.
+The parameter counts and RTX latency values above come from preserved local
+profile/latency artifacts; those small artifacts have not been promoted into a
+tracked public evidence bundle.
 
 The newer formal paired campaign is defined by
-[`optimization/formal_stage_c.json`](optimization/formal_stage_c.json). Its
-no-PIF seed-0 arm completed 300 epochs and selected epoch 280 (flip AP 72.968,
-no-flip AP 72.326; checkpoint SHA-256
-`0c71efb40a0daeabc215ad3b772b4de440311b95310f4c5739986cc539824eb4`).
-The matched full seed-0 arm was paused during epoch 66, after a valid epoch-65
-health evaluation, so the formal paired delta and multi-seed confidence interval
-do not yet exist. The formal checkpoint remains local and is intentionally not
-committed as a large optimizer-state artifact.
+[`optimization/formal_stage_c.json`](optimization/formal_stage_c.json). A
+separate config-matched local no-PIF seed-0 run completed 300 epochs and selected
+epoch 280 (flip AP 72.968, no-flip AP 72.326; checkpoint SHA-256
+`0c71efb40a0daeabc215ad3b772b4de440311b95310f4c5739986cc539824eb4`). That run
+predates the merged formal artifact contract and does not contain the required
+`run-init.json` and `train-result.json`, so the current formal loader does not
+admit it as a completed campaign arm. The matched full seed-0 run was paused
+during epoch 66, after an epoch-65 health evaluation. Consequently, no formal
+paired delta or multi-seed confidence interval exists. These run artifacts and
+the formal checkpoint are local/non-public and are intentionally not committed
+as optimizer-state artifacts.
 
 ### Direction 2: PWL Softplus
 
@@ -96,7 +102,9 @@ The recovery design and exact operation declaration are recorded in
 [`optimization/binary_qk_recovery.json`](optimization/binary_qk_recovery.json).
 QAT/self-distillation recovered part of the direct binarization loss but remained
 far outside the 0.1 AP budget. It also attacks a small fraction of this model's
-workload, so it is a poor first FPGA optimization for MambaPose.
+workload, so it is a poor first FPGA optimization for MambaPose. The post-QAT
+metric artifacts are local/non-public; the tracked repository publishes the
+design, admission contracts, tests, and this explicitly qualified result summary.
 
 ## Recommended algorithm before FPGA work
 

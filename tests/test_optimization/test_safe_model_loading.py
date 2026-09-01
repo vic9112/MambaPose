@@ -161,6 +161,27 @@ def test_manifest_authorized_builder_rejects_hostile_pickle_without_execution(
     assert not marker.exists()
 
 
+def test_hash_validated_tensor_state_is_immutable_during_deserialization(
+        tmp_path, monkeypatch):
+    from mambapose_opt.checkpoints import tensor_state
+
+    checkpoint = tmp_path / 'authorized.pth'
+    replacement = tmp_path / 'replacement.pth'
+    torch.save({'state_dict': {'weight': torch.tensor([1.0])}}, checkpoint)
+    torch.save({'state_dict': {'weight': torch.tensor([9.0])}}, replacement)
+    expected_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    original_load = torch.load
+
+    def mutate_same_inode_then_load(source, **kwargs):
+        checkpoint.write_bytes(replacement.read_bytes())
+        return original_load(source, **kwargs)
+
+    monkeypatch.setattr(torch, 'load', mutate_same_inode_then_load)
+    state = tensor_state(checkpoint, expected_sha256=expected_sha256)
+
+    torch.testing.assert_close(state['weight'], torch.tensor([1.0]))
+
+
 def test_manifest_authorized_builder_rejects_naked_alternate_config(
         tmp_path, monkeypatch):
     from mambapose_opt.checkpoints import build_manifest_authorized_model

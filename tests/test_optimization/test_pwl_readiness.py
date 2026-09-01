@@ -1031,7 +1031,9 @@ def test_pwl_producer_controller_and_all_downstream_share_install_provenance(
     subprocess.run(
         ['git', 'commit', '-qm', 'pwl fixture'], cwd=tmp_path, check=True)
     candidate = load_candidate_manifest(manifest)[0]
-    root = tmp_path / 'work_dirs/optimization/pwl-silu-s-v1'
+    root = (
+        tmp_path / 'work_dirs/optimization/ssm-quant-pwl/'
+        'pwl-silu-s-v1/0')
     calibration_path = root / 'calibrate/calibrate.json'
     calibration_path.parent.mkdir(parents=True)
     from mambapose_opt.pwl_artifacts import fit_pwl_observations

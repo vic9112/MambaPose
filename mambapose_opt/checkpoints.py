@@ -6,6 +6,7 @@ import copy
 from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -1193,10 +1194,23 @@ def _reconstruct_config_snapshot(
     return snapshot
 
 
-def tensor_state(checkpoint: Path) -> dict[str, Tensor]:
-    """Load the known MMPose mapping with PyTorch's restricted unpickler."""
+def tensor_state(
+        checkpoint: Path, *, expected_sha256: str | None = None,
+        ) -> dict[str, Tensor]:
+    """Load one opened checkpoint with PyTorch's restricted unpickler.
+
+    Hashing and deserialization use one independent temporary snapshot, so
+    pathname replacement or in-place mutation after capture cannot substitute a
+    different checkpoint.
+    """
     from mmengine.logging.history_buffer import HistoryBuffer
 
+    if (
+            expected_sha256 is not None
+            and (len(expected_sha256) != 64
+                 or any(character not in '0123456789abcdef'
+                        for character in expected_sha256))):
+        raise ValueError('expected_sha256 must be a lowercase sha256')
     safe: list[object] = [
         np.core.multiarray._reconstruct,
         np.core.multiarray.scalar,
@@ -1209,10 +1223,23 @@ def tensor_state(checkpoint: Path) -> dict[str, Tensor]:
         value for value in vars(np.dtypes).values()
         if isinstance(value, type))
     try:
-        with torch.serialization.safe_globals(safe):
-            payload = torch.load(
-                checkpoint, map_location='cpu', weights_only=True)
+        with Path(checkpoint).open('rb') as stream:
+            snapshot = stream.read()
+            actual = hashlib.sha256(snapshot).hexdigest()
+            if (
+                    expected_sha256 is not None
+                    and actual != expected_sha256):
+                raise ValueError(
+                    f'checkpoint sha256 mismatch: expected '
+                    f'{expected_sha256}, got {actual}')
+            immutable = io.BytesIO(snapshot)
+            with torch.serialization.safe_globals(safe):
+                payload = torch.load(
+                    immutable, map_location='cpu', weights_only=True)
     except Exception as error:
+        if isinstance(error, ValueError) and str(error).startswith(
+                'checkpoint sha256 mismatch:'):
+            raise
         raise ValueError(
             f'authorized checkpoint is not weights-only compatible: {error}') from error
     if isinstance(payload, dict) and isinstance(payload.get('state_dict'), dict):
@@ -1308,7 +1335,9 @@ def _build_authorized_model(
     source_config = config_authority.load_config()
     safe_config = neutralize_model_initializers(source_config)
     model = init_model(safe_config, None, device=device)
-    load_tensor_state_strict(model, tensor_state(authorized.checkpoint_path))
+    load_tensor_state_strict(model, tensor_state(
+        authorized.checkpoint_path,
+        expected_sha256=authorized.candidate.checkpoint_sha256))
     if authorized.candidate.features.get('prune_disabled_pif') is True:
         from .combined_candidate import prune_disabled_pif
         prune_disabled_pif(model)

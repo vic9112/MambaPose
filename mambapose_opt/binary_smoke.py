@@ -728,7 +728,9 @@ def run_binary_stage_a_smoke(
         git_commit=str(authorized.source.get('git_commit')))
     config = Config.fromfile(authorized.config_path)
     loader_config = _smoke_dataloader(config.train_dataloader)
-    state = tensor_state(authorized.checkpoint_path)
+    state = tensor_state(
+        authorized.checkpoint_path,
+        expected_sha256=authorized.candidate.checkpoint_sha256)
     lock = _canonical_gpu_lock(root)
     stage_id = f'binary-smoke:{candidate.id}'
     try:

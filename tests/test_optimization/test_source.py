@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import os
 import subprocess
 
@@ -9,6 +10,62 @@ def _commit_ignore_rules(repository: Path, rules: str) -> None:
     subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
     (repository / '.gitignore').write_text(rules)
     subprocess.run(['git', 'add', '.gitignore'], cwd=repository, check=True)
+    subprocess.run(
+        ['git', '-c', 'user.name=Fixture', '-c',
+         'user.email=fixture@example.com', 'commit', '-qm', 'fixture'],
+        cwd=repository, check=True)
+
+
+def _commit_runtime_authority(repository: Path) -> None:
+    subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
+    (repository / '.gitignore').write_text('/work_dirs/\n')
+    optimization = repository / 'optimization'
+    optimization.mkdir()
+    (optimization / 'candidates.json').write_text(json.dumps({
+        'schema_version': 1,
+        'candidates': [
+            {
+                'id': 'full-s-v1', 'route': 'baseline', 'seed': 0,
+                'kind': 'float', 'features': {},
+            },
+            {
+                'id': 'no-pif-s-v1', 'route': 'structural-pif', 'seed': 0,
+                'kind': 'structural', 'features': {},
+            },
+            {
+                'id': 'pwl-softplus-s-v1', 'route': 'ssm-quant-pwl',
+                'seed': 0, 'kind': 'pwl',
+                'features': {'numeric_kind': 'pwl'},
+            },
+        ],
+    }))
+    (optimization / 'formal_stage_c.json').write_text(json.dumps({
+        'schema_version': 2,
+        'runs': [
+            {
+                'output_root': (
+                    'work_dirs/optimization/formal-stage-c/full-seed0'),
+                'config': 'configs/optimization/formal_stage_c/full_seed0.py',
+            },
+            {
+                'output_root': (
+                    'work_dirs/optimization/formal-stage-c/no-pif-seed0'),
+                'config': (
+                    'configs/optimization/formal_stage_c/no_pif_seed0.py'),
+            },
+        ],
+    }))
+    (optimization / 'recovery-candidates.json').write_text(json.dumps({
+        'schema_version': 1,
+        'candidates': [{
+            'id': 'w8a8-recovery', 'route': 'ssm-quant-pwl', 'seed': 0,
+            'kind': 'fake-quant', 'features': {'numeric_kind': 'w8a8'},
+        }],
+    }))
+    subprocess.run(
+        ['git', 'add', '.gitignore', 'optimization/candidates.json',
+         'optimization/formal_stage_c.json',
+         'optimization/recovery-candidates.json'], cwd=repository, check=True)
     subprocess.run(
         ['git', '-c', 'user.name=Fixture', '-c',
          'user.email=fixture@example.com', 'commit', '-qm', 'fixture'],
@@ -149,22 +206,49 @@ def test_clean_source_allows_exact_shared_environment_symlinks(tmp_path):
 
 
 @pytest.mark.parametrize('relative', [
-    ('work_dirs/optimization/ssm-quant-pwl/candidate/0/'
+    ('work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/'
      'convert/resolved-runtime.py'),
-    ('work_dirs/optimization/ssm-quant-pwl/candidate/0/'
+    ('work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/'
+     'train/resolved-train.py'),
+    ('work_dirs/optimization/ssm-quant-pwl/w8a8-recovery/0/'
      'train/resolved-train.py'),
     ('work_dirs/optimization/binary-qk-scaled-s-v1/'
      'recovery/resolved-binary-qk-recovery.py'),
-    ('work_dirs/optimization/ssm-quant-pwl/candidate/0/'
+    ('work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/'
      'evaluate/resolved-flip.py'),
-    ('work_dirs/optimization/ssm-quant-pwl/candidate/0/'
+    ('work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/'
      'evaluate/resolved-no-flip.py'),
+    ('work_dirs/optimization/structural-pif/no-pif-s-v1/0/evaluate/'
+     'mmpose-flip/resolved-flip.py'),
+    ('work_dirs/optimization/structural-pif/no-pif-s-v1/0/evaluate/'
+     'mmpose-flip/20260828_005047/vis_data/config.py'),
+    ('work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/evaluate/'
+     'mmpose-no-flip/tmplqkt_wwv.py'),
+    ('work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/evaluate/'
+     'mmpose-no-flip/20260830_230446/vis_data/config.py'),
+    ('work_dirs/optimization/binary-qk-scaled-s-v1/recovery/'
+     'binary_qk_s_v1.py'),
+    ('work_dirs/optimization/binary-qk-scaled-s-v1/recovery/'
+     '20260829_155406/vis_data/config.py'),
+    ('work_dirs/optimization/binary-qk-scaled-s-v1/post-qat/seed-0/flip/'
+     'mmpose/binary_qk_s_v1_deploy.py'),
+    ('work_dirs/optimization/binary-qk-scaled-s-v1/post-qat/seed-0/flip/'
+     'mmpose/20260829_235614/vis_data/config.py'),
+    ('work_dirs/optimization/direct-binary-qk-scaled-s-v1/seed-0/no-flip/'
+     'mmpose/binary_qk_s_v1_deploy.py'),
+    ('work_dirs/optimization/formal-stage-c/full-seed0/full_seed0.py'),
+    ('work_dirs/optimization/formal-stage-c/full-seed0/'
+     '20260901_092211/vis_data/config.py'),
+    ('work_dirs/optimization/formal-stage-c/no-pif-seed0/final-evaluation/'
+     'no-flip/mmpose/no_pif_seed0_no-flip.py'),
+    ('work_dirs/optimization/formal-stage-c/no-pif-seed0/final-evaluation/'
+     'no-flip/mmpose/20260901_092006/vis_data/config.py'),
 ])
 def test_clean_source_allows_only_canonical_generated_runtime_configs(
         tmp_path, relative):
     from mambapose_opt.source import clean_git_commit
 
-    _commit_ignore_rules(tmp_path, '/work_dirs/\n')
+    _commit_runtime_authority(tmp_path)
     generated = tmp_path / relative
     generated.parent.mkdir(parents=True)
     generated.write_text('model = dict()\n')
@@ -176,12 +260,33 @@ def test_clean_source_allows_only_canonical_generated_runtime_configs(
     'work_dirs/optimization/alternate/resolved-runtime.py',
     'work_dirs/optimization/candidate/convert/injected.py',
     'work_dirs/optimization/candidate/train/resolved-runtime.py',
+    ('work_dirs/optimization/structural-pif/no-pif-s-v1/0/evaluate/'
+     'mmpose-flip/resolved-no-flip.py'),
+    ('work_dirs/optimization/structural-pif/no-pif-s-v1/0/evaluate/'
+     'mmpose-flip/20260828-005047/vis_data/config.py'),
+    ('work_dirs/optimization/ssm-quant-pwl/pwl-softplus-s-v1/0/train/'
+     'mmpose-flip/tmp5wlnlazi.py'),
+    ('work_dirs/optimization/unrelated/recovery/binary_qk_s_v1.py'),
+    ('work_dirs/optimization/binary-qk-scaled-s-v1/post-qat/seed-0/flip/'
+     'mmpose/arbitrary.py'),
+    ('work_dirs/optimization/formal-stage-c/full-seed0/no_pif_seed0.py'),
+    ('work_dirs/optimization/formal-stage-c/no-pif-seed0/final-evaluation/'
+     'flip/mmpose/no_pif_seed1_flip.py'),
+    ('work_dirs/optimization/runtime/20260901_092211/vis_data/config.py'),
+    ('work_dirs/optimization/evil/candidate/0/evaluate/resolved-flip.py'),
+    ('work_dirs/optimization/evil/recovery/'
+     'resolved-binary-qk-recovery.py'),
+    ('work_dirs/optimization/ssm-quant-pwl/not-in-manifest/999/evaluate/'
+     'mmpose-flip/tmpattacker.py'),
+    ('work_dirs/optimization/formal-stage-c/full-seed999/full_seed999.py'),
+    ('work_dirs/optimization/direct-binary-qk-attacker/seed-0/flip/mmpose/'
+     'binary_qk_s_v1_deploy.py'),
 ])
 def test_clean_source_rejects_generated_config_names_outside_canonical_stage(
         tmp_path, relative):
     from mambapose_opt.source import clean_git_commit
 
-    _commit_ignore_rules(tmp_path, '/work_dirs/\n')
+    _commit_runtime_authority(tmp_path)
     generated = tmp_path / relative
     generated.parent.mkdir(parents=True)
     generated.write_text('model = dict()\n')

@@ -1381,7 +1381,7 @@ class CandidateResult:
                     'checkpoint_sha256': candidate.checkpoint_sha256,
                 })
                 expected_pwl_stage_a = numeric_runtime.get('pwl_stage_a')
-                if candidate.kind == 'pwl':
+                if candidate.features.get('numeric_kind') == 'pwl':
                     from .numeric_source import validate_numeric_config_closure
 
                     installation_reference = numeric_runtime.get(

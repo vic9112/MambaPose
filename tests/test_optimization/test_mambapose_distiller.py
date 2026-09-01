@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+
+
+def _write_marker(path: str) -> None:
+    Path(path).write_text('executed', encoding='utf-8')
+
+
+class _HostileCheckpointValue:
+
+    def __init__(self, marker: Path) -> None:
+        self.marker = marker
+
+    def __reduce__(self):
+        return _write_marker, (str(self.marker), )
 
 
 class _ToyHead(nn.Module):
@@ -144,6 +159,55 @@ def test_teacher_checkpoint_hash_is_checked_before_loading(tmp_path):
     with pytest.raises(ValueError, match='sha256 mismatch'):
         load_hash_validated_checkpoint(
             _ToyPoseEstimator(), checkpoint, expected_sha256='0' * 64)
+
+
+def test_teacher_checkpoint_uses_restricted_loader_on_open_stream(
+        tmp_path, monkeypatch):
+    import mmpose.models.distillers.mambapose_heatmap_distiller as distiller
+
+    checkpoint = tmp_path / 'teacher.pth'
+    state = _ToyPoseEstimator().state_dict()
+    torch.save({'state_dict': state}, checkpoint)
+    expected_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    observed = {}
+
+    def restricted_load(source, *, map_location, weights_only):
+        observed['source'] = source
+        observed['map_location'] = map_location
+        observed['weights_only'] = weights_only
+        return {'state_dict': state}
+
+    monkeypatch.setattr(torch, 'load', restricted_load)
+    distiller.load_hash_validated_checkpoint(
+        _ToyPoseEstimator(), checkpoint, expected_sha256=expected_sha256)
+
+    assert hasattr(observed['source'], 'read')
+    assert not isinstance(observed['source'], (str, Path))
+    assert observed['map_location'] == 'cpu'
+    assert observed['weights_only'] is True
+
+
+def test_teacher_checkpoint_rejects_hostile_pickle_without_execution(
+        tmp_path, monkeypatch):
+    from mmpose.models.distillers.mambapose_heatmap_distiller import \
+        load_hash_validated_checkpoint
+
+    marker = tmp_path / 'executed'
+    checkpoint = tmp_path / 'teacher.pth'
+    torch.save({
+        'state_dict': {
+            'backbone.weight': _HostileCheckpointValue(marker),
+        },
+    }, checkpoint)
+    expected_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    monkeypatch.setenv('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
+
+    with pytest.raises(ValueError, match='weights-only|restricted|checkpoint'):
+        load_hash_validated_checkpoint(
+            _ToyPoseEstimator(), checkpoint,
+            expected_sha256=expected_sha256)
+
+    assert not marker.exists()
 
 
 def test_production_config_binds_reproduced_teacher_and_student():
