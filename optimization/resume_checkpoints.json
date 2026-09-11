@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "format": "pytorch-training-resume-checkpoint",
+  "storage": "github-release",
+  "release_tag": "mambapose-optimization-resume-v1",
+  "release_url": "https://github.com/vic9112/MambaPose/releases/tag/mambapose-optimization-resume-v1",
+  "notes": [
+    "These assets contain model, optimizer, scheduler, message-hub, and training-progress state.",
+    "The formal Stage C files predate the merged run-init/train-result admission contract; they are valid MMEngine resume checkpoints but are not admitted as completed formal campaign arms.",
+    "The no-PIF and Binary Q/K schedules already reached their declared final epochs. Training beyond those epochs is a new experiment, not continuation of the published measurement protocol.",
+    "PWL Softplus is a checkpoint-free post-training operator replacement and reuses the published S-V1 or no-PIF checkpoint, so it has no separate optimizer-state asset.",
+    "Binary Q/K is published for audit and follow-up research even though its measured AP loss caused it to be rejected for the current deployment target."
+  ],
+  "checkpoints": [
+    {
+      "direction": "structural-no-pif-paired-control",
+      "run_id": "full-seed0",
+      "role": "matched-full-baseline",
+      "status": "paused",
+      "epoch": 65,
+      "iteration": 76115,
+      "bytes": 273693747,
+      "sha256": "bff1b1570ebcea8ad618be5f56baf297b4e3b0e616f8f382386bd1fa7adfbe9a",
+      "local_source_path": ".worktrees/algo-accuracy-first/work_dirs/optimization/formal-stage-c/full-seed0/epoch_65.pth",
+      "source_commit": "d938530bad75fa6a8ac515b2c313792d8150da49",
+      "config": "configs/optimization/formal_stage_c/full_seed0.py",
+      "config_sha256": "ed391fe0f135c335291eca792bf567acded68a71d0235802835477d7160fb405",
+      "paired_rng_state": true,
+      "release_asset": "mambapose-opt-full-seed0-resume-epoch65.pth",
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-optimization-resume-v1/mambapose-opt-full-seed0-resume-epoch65.pth"
+    },
+    {
+      "direction": "structural-no-pif",
+      "run_id": "no-pif-seed0",
+      "role": "no-pif-candidate",
+      "status": "completed-local-legacy-formal-run",
+      "epoch": 300,
+      "iteration": 351300,
+      "bytes": 296199767,
+      "sha256": "e6d8a5e76953e4d21120058c93264b09e564f6ec3a00081993a8fedbc3cc2dff",
+      "local_source_path": ".worktrees/algo-accuracy-first/work_dirs/optimization/formal-stage-c/no-pif-seed0/epoch_300.pth",
+      "source_commit": "d938530bad75fa6a8ac515b2c313792d8150da49",
+      "config": "configs/optimization/formal_stage_c/no_pif_seed0.py",
+      "config_sha256": "8ca068abb3a34ff68b07839198ec12c1a03aae29c855cb649df77c2898e14b23",
+      "paired_rng_state": true,
+      "release_asset": "mambapose-opt-no-pif-seed0-resume-epoch300.pth",
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-optimization-resume-v1/mambapose-opt-no-pif-seed0-resume-epoch300.pth"
+    },
+    {
+      "direction": "binary-qk-qat-self-distillation",
+      "run_id": "binary-qk-scaled-seed0",
+      "role": "rejected-candidate",
+      "status": "completed-rejected",
+      "epoch": 60,
+      "iteration": 70260,
+      "bytes": 362377326,
+      "sha256": "32fd473844291183bcd00b81d6d47fb35ec10a1cbfc9b0b30396774636c72ad5",
+      "local_source_path": ".worktrees/algo-binary-qk-scaled-frozen/work_dirs/optimization/binary-qk-scaled-s-v1/recovery/epoch_60.pth",
+      "source_commit": "2b3f6694c9926b47353301be0853ecc6e556652f",
+      "config": "configs/optimization/recovery/binary_qk_s_v1.py",
+      "config_sha256": "505b98379110c9c0c84c0c9b5fe7415941f78781cded07b3f9133ea0639e7092",
+      "paired_rng_state": false,
+      "release_asset": "mambapose-opt-binary-qk-seed0-resume-epoch60.pth",
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-optimization-resume-v1/mambapose-opt-binary-qk-seed0-resume-epoch60.pth"
+    }
+  ]
+}

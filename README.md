@@ -16,10 +16,15 @@ improvements.
 
 The main paper results were independently reproduced from VMamba pretrained
 backbones because the authors did not publish complete MambaPose pose
-checkpoints. Nine best inference checkpoints are available from the
+checkpoints. Nine best inference checkpoints and their nine full-state
+`epoch_300` resume checkpoints are available from the
 [`mambapose-icme2025-reproduction-v1`](https://github.com/vic9112/MambaPose/releases/tag/mambapose-icme2025-reproduction-v1)
 release; exact URLs and SHA-256 values are recorded in
 [`reproduction/checkpoints.json`](reproduction/checkpoints.json).
+The three available optimization training states are published separately in
+[`mambapose-optimization-resume-v1`](https://github.com/vic9112/MambaPose/releases/tag/mambapose-optimization-resume-v1)
+and catalogued in
+[`optimization/resume_checkpoints.json`](optimization/resume_checkpoints.json).
 
 | Dataset | Variant | Paper AP | Reproduced AP | Delta AP |
 | --- | --- | ---: | ---: | ---: |
@@ -78,9 +83,11 @@ predates the merged formal artifact contract and does not contain the required
 `run-init.json` and `train-result.json`, so the current formal loader does not
 admit it as a completed campaign arm. The matched full seed-0 run was paused
 during epoch 66, after an epoch-65 health evaluation. Consequently, no formal
-paired delta or multi-seed confidence interval exists. These run artifacts and
-the formal checkpoint are local/non-public and are intentionally not committed
-as optimizer-state artifacts.
+paired delta or multi-seed confidence interval exists. The large run trees stay
+outside Git, but the last full-state checkpoints for the paused full run and the
+completed no-PIF run are downloadable from the optimization resume release.
+Publishing them does not retroactively satisfy the formal campaign's missing
+`run-init.json` / `train-result.json` admission contract.
 
 ### Direction 2: PWL Softplus
 
@@ -105,6 +112,40 @@ far outside the 0.1 AP budget. It also attacks a small fraction of this model's
 workload, so it is a poor first FPGA optimization for MambaPose. The post-QAT
 metric artifacts are local/non-public; the tracked repository publishes the
 design, admission contracts, tests, and this explicitly qualified result summary.
+Its epoch-60 full-state checkpoint is available in the optimization resume
+release for audit or new research, but its publication does not change the
+rejected deployment decision.
+
+## Continue training from a published checkpoint
+
+Release assets whose names contain `resume` were restricted-loaded and verified
+to contain model, optimizer, scheduler, message-hub, epoch, and iteration state.
+For example, download the COCO S-V1 state and start a new 30-epoch continuation:
+
+```bash
+mkdir -p work_dirs/continuations/coco-s-v1
+gh release download mambapose-icme2025-reproduction-v1 \
+  --pattern mambapose-coco-s-v1-resume-epoch300.pth \
+  --dir work_dirs/continuations/coco-s-v1
+echo '61d543df733ec08c74bd295b6f5d0b8b6da88db9587411cdc2ab31f41de472e1  work_dirs/continuations/coco-s-v1/mambapose-coco-s-v1-resume-epoch300.pth' \
+  | sha256sum --check
+PYTHONNOUSERSITE=1 .venv/bin/python tools/train.py \
+  configs/reproduction/coco_s_v1.py \
+  --work-dir work_dirs/continuations/coco-s-v1 \
+  --resume work_dirs/continuations/coco-s-v1/mambapose-coco-s-v1-resume-epoch300.pth \
+  --cfg-options train_cfg.max_epochs=330
+```
+
+The original paper schedule ends at epoch 300, so this example is a new
+fine-tuning experiment and must not be reported as the original reproduction.
+Select the matching config, asset, and SHA-256 for other variants from
+`reproduction/checkpoints.json`. For the unfinished matched full seed-0
+optimization run, use the epoch-65 asset and its config listed in
+`optimization/resume_checkpoints.json`; this can continue to the existing
+300-epoch limit. The completed no-PIF and Binary Q/K assets require a deliberately
+revised schedule before they can take additional optimizer steps. PWL Softplus
+has no separate training state because it is a post-training operator
+replacement.
 
 ## Recommended algorithm before FPGA work
 

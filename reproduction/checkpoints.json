@@ -1,13 +1,14 @@
 {
-  "schema_version": 1,
-  "format": "pytorch-inference-checkpoint",
+  "schema_version": 2,
+  "format": "pytorch-checkpoint-catalog",
   "storage": "github-release",
   "release_tag": "mambapose-icme2025-reproduction-v1",
   "release_url": "https://github.com/vic9112/MambaPose/releases/tag/mambapose-icme2025-reproduction-v1",
   "training_source_commit": "1f4364d62279bf9fe3ac55e0e2d57339036aeb81",
   "notes": [
     "These best checkpoints are GitHub Release evaluation/inference assets and intentionally omit optimizer state.",
-    "The epoch_300 resumable checkpoints remain local and are not published in Git LFS.",
+    "Each resume asset is the epoch_300 checkpoint from the same run and contains state_dict, optimizer, param_schedulers, message_hub, and meta training state.",
+    "The original schedule ends at epoch 300; extending training beyond that point requires an explicit train_cfg.max_epochs override and is a new experimental continuation.",
     "Measured AP values are percentage points."
   ],
   "checkpoints": [
@@ -15,6 +16,7 @@
       "run_id": "coco-s-v1",
       "dataset": "coco",
       "split": "val2017",
+      "config": "configs/reproduction/coco_s_v1.py",
       "paper_ap": 72.8,
       "measured_ap": 72.83223444297235,
       "delta_ap": 0.032234442972352895,
@@ -24,12 +26,22 @@
       "resolved_config_sha256": "56d8fc12b088208ce2b99ef90eff81c52f4d0bfb1dbe88ff0bab6e603efe1797",
       "local_source_path": "work_dirs/reproduction/runs/coco-s-v1/best_coco_AP_epoch_300.pth",
       "release_asset": "mambapose-coco-s-v1-best.pth",
-      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-s-v1-best.pth"
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-s-v1-best.pth",
+      "resume": {
+        "epoch": 300,
+        "iteration": 351300,
+        "bytes": 306646585,
+        "sha256": "61d543df733ec08c74bd295b6f5d0b8b6da88db9587411cdc2ab31f41de472e1",
+        "local_source_path": "work_dirs/reproduction/runs/coco-s-v1/epoch_300.pth",
+        "release_asset": "mambapose-coco-s-v1-resume-epoch300.pth",
+        "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-s-v1-resume-epoch300.pth"
+      }
     },
     {
       "run_id": "coco-s-v2",
       "dataset": "coco",
       "split": "val2017",
+      "config": "configs/reproduction/coco_s_v2.py",
       "paper_ap": 74.2,
       "measured_ap": 74.2118039030916,
       "delta_ap": 0.011803903091603729,
@@ -39,12 +51,22 @@
       "resolved_config_sha256": "80e6451348c498d9365639e1919796bca1c38d89427ba96ea36637d18a37015c",
       "local_source_path": "work_dirs/reproduction/runs/coco-s-v2/best_coco_AP_epoch_300.pth",
       "release_asset": "mambapose-coco-s-v2-best.pth",
-      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-s-v2-best.pth"
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-s-v2-best.pth",
+      "resume": {
+        "epoch": 300,
+        "iteration": 351300,
+        "bytes": 428596220,
+        "sha256": "01a167d629b582ff9f414b63d8d22de2ddb6532eb2df12939d0c48d115083bc7",
+        "local_source_path": "work_dirs/reproduction/runs/coco-s-v2/epoch_300.pth",
+        "release_asset": "mambapose-coco-s-v2-resume-epoch300.pth",
+        "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-s-v2-resume-epoch300.pth"
+      }
     },
     {
       "run_id": "coco-b",
       "dataset": "coco",
       "split": "val2017",
+      "config": "configs/reproduction/coco_b.py",
       "paper_ap": 75.0,
       "measured_ap": 74.89483998452512,
       "delta_ap": -0.10516001547487974,
@@ -54,12 +76,22 @@
       "resolved_config_sha256": "9bf26e4400942b49727ca6e1f3f8a9c4b38f0251a74932d14bd8738d6e55c3ba",
       "local_source_path": "work_dirs/reproduction/runs/coco-b/best_coco_AP_epoch_290.pth",
       "release_asset": "mambapose-coco-b-best.pth",
-      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-b-best.pth"
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-b-best.pth",
+      "resume": {
+        "epoch": 300,
+        "iteration": 702300,
+        "bytes": 515387876,
+        "sha256": "79b3b60775edb110f89c794e4b5d424ec9bcc49be98347aa1590a6f28e57246c",
+        "local_source_path": "work_dirs/reproduction/runs/coco-b/epoch_300.pth",
+        "release_asset": "mambapose-coco-b-resume-epoch300.pth",
+        "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-b-resume-epoch300.pth"
+      }
     },
     {
       "run_id": "crowdpose-s-v1",
       "dataset": "crowdpose",
       "split": "test",
+      "config": "configs/reproduction/crowdpose_s_v1.py",
       "paper_ap": 65.6,
       "measured_ap": 65.42223239671598,
       "delta_ap": -0.17776760328401053,
@@ -69,12 +101,22 @@
       "resolved_config_sha256": "b2ce742e70b4fd50a11af3cc715ac0900d6f33a3e4ca6321da48027a421e824b",
       "local_source_path": "work_dirs/reproduction/runs/crowdpose-s-v1/best_crowdpose_AP_epoch_290.pth",
       "release_asset": "mambapose-crowdpose-s-v1-best.pth",
-      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-best.pth"
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-best.pth",
+      "resume": {
+        "epoch": 300,
+        "iteration": 200400,
+        "bytes": 286819513,
+        "sha256": "c8fefb7f991ae623932e2ea43e2d8837181590d247b7a8475741857038e9c707",
+        "local_source_path": "work_dirs/reproduction/runs/crowdpose-s-v1/epoch_300.pth",
+        "release_asset": "mambapose-crowdpose-s-v1-resume-epoch300.pth",
+        "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-resume-epoch300.pth"
+      }
     },
     {
       "run_id": "crowdpose-s-v2",
       "dataset": "crowdpose",
       "split": "test",
+      "config": "configs/reproduction/crowdpose_s_v2.py",
       "paper_ap": 67.0,
       "measured_ap": 67.06046536180129,
       "delta_ap": 0.060465361801291806,
@@ -84,12 +126,22 @@
       "resolved_config_sha256": "a541f3ae3de01ab0d6a7e7bbb6e14de71163f8e599fa1273060d642ff051e635",
       "local_source_path": "work_dirs/reproduction/runs/crowdpose-s-v2/best_crowdpose_AP_epoch_260.pth",
       "release_asset": "mambapose-crowdpose-s-v2-best.pth",
-      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v2-best.pth"
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v2-best.pth",
+      "resume": {
+        "epoch": 300,
+        "iteration": 100200,
+        "bytes": 397812092,
+        "sha256": "04bc3cf2bbf38cf7f76f023166f044085a6b7de212b7f289bd5113c514a7657f",
+        "local_source_path": "work_dirs/reproduction/runs/crowdpose-s-v2/epoch_300.pth",
+        "release_asset": "mambapose-crowdpose-s-v2-resume-epoch300.pth",
+        "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v2-resume-epoch300.pth"
+      }
     },
     {
       "run_id": "coco-s-v1-no-pif",
       "dataset": "coco",
       "split": "val2017",
+      "config": "configs/reproduction/ablations/coco_s_v1_no_pif.py",
       "paper_ap": 72.6,
       "measured_ap": 73.07620686556272,
       "delta_ap": 0.4762068655627303,
@@ -99,12 +151,22 @@
       "resolved_config_sha256": "b0d34ed19588564d57fe9418fe91ec20ba7eb89a75d59650508ea6ed0cd40508",
       "local_source_path": "work_dirs/reproduction/runs/coco-s-v1-no-pif/best_coco_AP_epoch_300.pth",
       "release_asset": "mambapose-coco-s-v1-no-pif-best.pth",
-      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-s-v1-no-pif-best.pth"
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-s-v1-no-pif-best.pth",
+      "resume": {
+        "epoch": 300,
+        "iteration": 351300,
+        "bytes": 296063197,
+        "sha256": "6447eb62afc3486961b9c6033fcedf3a191695f4c4521fa76cf3e4e45ca44abc",
+        "local_source_path": "work_dirs/reproduction/runs/coco-s-v1-no-pif/epoch_300.pth",
+        "release_asset": "mambapose-coco-s-v1-no-pif-resume-epoch300.pth",
+        "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-coco-s-v1-no-pif-resume-epoch300.pth"
+      }
     },
     {
       "run_id": "crowdpose-s-v1-no-pif",
       "dataset": "crowdpose",
       "split": "test",
+      "config": "configs/reproduction/ablations/crowdpose_s_v1_no_pif.py",
       "paper_ap": 65.3,
       "measured_ap": 65.49042798127276,
       "delta_ap": 0.19042798127276228,
@@ -114,12 +176,22 @@
       "resolved_config_sha256": "2bfa6cf18f0ced9f7768420ef63def4e8899759719589077ae26f108d9459062",
       "local_source_path": "work_dirs/reproduction/runs/crowdpose-s-v1-no-pif/best_crowdpose_AP_epoch_290.pth",
       "release_asset": "mambapose-crowdpose-s-v1-no-pif-best.pth",
-      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-no-pif-best.pth"
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-no-pif-best.pth",
+      "resume": {
+        "epoch": 300,
+        "iteration": 200400,
+        "bytes": 276292573,
+        "sha256": "8522406bf6fada966fe6045fabb70dbc4713373a916416d1ec1b97be180ef01c",
+        "local_source_path": "work_dirs/reproduction/runs/crowdpose-s-v1-no-pif/epoch_300.pth",
+        "release_asset": "mambapose-crowdpose-s-v1-no-pif-resume-epoch300.pth",
+        "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-no-pif-resume-epoch300.pth"
+      }
     },
     {
       "run_id": "crowdpose-s-v1-no-prior",
       "dataset": "crowdpose",
       "split": "test",
+      "config": "configs/reproduction/ablations/crowdpose_s_v1_no_prior.py",
       "paper_ap": 65.35,
       "measured_ap": 65.19708025044831,
       "delta_ap": -0.1529197495516854,
@@ -129,12 +201,22 @@
       "resolved_config_sha256": "c73c37eb1c94513966f3dd6c6b79a58218ade81944061ae7551eb32262971621",
       "local_source_path": "work_dirs/reproduction/runs/crowdpose-s-v1-no-prior/best_crowdpose_AP_epoch_300.pth",
       "release_asset": "mambapose-crowdpose-s-v1-no-prior-best.pth",
-      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-no-prior-best.pth"
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-no-prior-best.pth",
+      "resume": {
+        "epoch": 300,
+        "iteration": 200400,
+        "bytes": 286854201,
+        "sha256": "23f622d16b9c6a5b285cae6eae396b98acafbc56e1b7ab7f3d2fa2d652e64161",
+        "local_source_path": "work_dirs/reproduction/runs/crowdpose-s-v1-no-prior/epoch_300.pth",
+        "release_asset": "mambapose-crowdpose-s-v1-no-prior-resume-epoch300.pth",
+        "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-no-prior-resume-epoch300.pth"
+      }
     },
     {
       "run_id": "crowdpose-s-v1-no-cycling",
       "dataset": "crowdpose",
       "split": "test",
+      "config": "configs/reproduction/ablations/crowdpose_s_v1_no_cycling.py",
       "paper_ap": 65.49,
       "measured_ap": 65.37397732387387,
       "delta_ap": -0.11602267612612138,
@@ -144,7 +226,16 @@
       "resolved_config_sha256": "83694a28e95c23b4f7b845f6735441aca0263d3bfffb2e0d5edc1b4211e2f48b",
       "local_source_path": "work_dirs/reproduction/runs/crowdpose-s-v1-no-cycling/best_crowdpose_AP_epoch_290.pth",
       "release_asset": "mambapose-crowdpose-s-v1-no-cycling-best.pth",
-      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-no-cycling-best.pth"
+      "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-no-cycling-best.pth",
+      "resume": {
+        "epoch": 300,
+        "iteration": 200400,
+        "bytes": 286846073,
+        "sha256": "6a2ac535e654fa519e456f2093cf5ebabbafc2d024d9a7b3955ace5b90d252b1",
+        "local_source_path": "work_dirs/reproduction/runs/crowdpose-s-v1-no-cycling/epoch_300.pth",
+        "release_asset": "mambapose-crowdpose-s-v1-no-cycling-resume-epoch300.pth",
+        "download_url": "https://github.com/vic9112/MambaPose/releases/download/mambapose-icme2025-reproduction-v1/mambapose-crowdpose-s-v1-no-cycling-resume-epoch300.pth"
+      }
     }
   ]
 }

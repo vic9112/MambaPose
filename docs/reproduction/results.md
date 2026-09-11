@@ -14,7 +14,20 @@
 
 ## 取得 checkpoints
 
-9 個 best inference checkpoints 已發布為 [`mambapose-icme2025-reproduction-v1`](https://github.com/vic9112/MambaPose/releases/tag/mambapose-icme2025-reproduction-v1) GitHub Release assets。完整 asset 名稱、下載 URL、檔案大小、best epoch、AP、resolved-config SHA256 與 checkpoint SHA256 記錄在 [`reproduction/checkpoints.json`](../../reproduction/checkpoints.json)。這些 best checkpoints 是評估／推論格式，刻意不含 optimizer state；9 個較大的 `epoch_300.pth` 續訓檔未納入 GitHub。
+9 個 best inference checkpoints 與對應的 9 個 `epoch_300.pth` 續訓 checkpoints 已發布為 [`mambapose-icme2025-reproduction-v1`](https://github.com/vic9112/MambaPose/releases/tag/mambapose-icme2025-reproduction-v1) GitHub Release assets。完整 asset 名稱、下載 URL、檔案大小、epoch/iteration、AP、resolved-config SHA256 與 checkpoint SHA256 記錄在 [`reproduction/checkpoints.json`](../../reproduction/checkpoints.json)。best checkpoints 是刻意移除 optimizer state 的評估／推論格式；檔名含 `resume` 的資產則包含 `state_dict`、optimizer、兩組 schedulers、message hub 與訓練進度。
+
+例如下載並驗證 COCO S-V1 續訓檔：
+
+```bash
+mkdir -p work_dirs/continuations/coco-s-v1
+gh release download mambapose-icme2025-reproduction-v1 \
+  --pattern mambapose-coco-s-v1-resume-epoch300.pth \
+  --dir work_dirs/continuations/coco-s-v1
+echo '61d543df733ec08c74bd295b6f5d0b8b6da88db9587411cdc2ab31f41de472e1  work_dirs/continuations/coco-s-v1/mambapose-coco-s-v1-resume-epoch300.pth' \
+  | sha256sum --check
+```
+
+原 config 的 `train_cfg.max_epochs=300`，因此 epoch 300 已是論文 schedule 終點。要再訓練，必須明確開一個新的 continuation（例如加上 `--cfg-options train_cfg.max_epochs=330`）；這種延長訓練不可回報成原論文復現結果。若只需要評估或部署，應下載較小的 `best` asset。
 
 ## 主模型結果
 
